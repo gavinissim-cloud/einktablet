@@ -118,7 +118,7 @@ async function currentUser(req) {
 export async function requireUser(req, res, next) {
   try {
     const user = await currentUser(req);
-    if (!user) return res.status(401).json({ error: "יש להתחבר מחדש." });
+    if (!user) return res.status(401).json({ error: "Please log in again.", code: "auth_required" });
     req.user = { id: user.id, username: user.username };
     next();
   } catch (error) {
@@ -141,13 +141,13 @@ export function authRoutes(app, { onFirstUser } = {}) {
       const username = normalizeName(req.body?.username);
       const password = typeof req.body?.password === "string" ? req.body.password : "";
       if (SIGNUP_CODE && req.body?.code !== SIGNUP_CODE) {
-        return res.status(403).json({ error: "קוד ההרשמה שגוי." });
+        return res.status(403).json({ error: "That sign-up code is wrong.", code: "bad_code" });
       }
       if (username.length < 3 || username.length > 100 || /\s/.test(username)) {
-        return res.status(400).json({ error: "שם המשתמש צריך להיות 3–100 תווים, בלי רווחים." });
+        return res.status(400).json({ error: "Usernames need 3–100 characters and no spaces.", code: "bad_username" });
       }
       if (password.length < 8 || password.length > 200) {
-        return res.status(400).json({ error: "הסיסמה צריכה להיות לפחות 8 תווים." });
+        return res.status(400).json({ error: "Passwords need at least 8 characters.", code: "bad_password" });
       }
       const { salt, hash } = await hashPassword(password);
       const user = { id: crypto.randomUUID(), username, salt, hash, createdAt: new Date().toISOString() };
@@ -156,7 +156,7 @@ export function authRoutes(app, { onFirstUser } = {}) {
         all.push(user);
         return all.length === 1 ? "first" : "ok";
       });
-      if (result === "taken") return res.status(409).json({ error: "שם המשתמש הזה כבר תפוס." });
+      if (result === "taken") return res.status(409).json({ error: "That username is already taken.", code: "taken" });
       if (result === "first" && onFirstUser) await onFirstUser(user.id);
       await startSession(req, res, user);
       res.status(201).json({ user: { username } });
@@ -169,12 +169,12 @@ export function authRoutes(app, { onFirstUser } = {}) {
       const password = typeof req.body?.password === "string" ? req.body.password : "";
       const keys = [`ip:${req.ip}`, `user:${username}`];
       if (keys.some(isLocked)) {
-        return res.status(429).json({ error: "יותר מדי ניסיונות כושלים. נסו שוב בעוד רבע שעה." });
+        return res.status(429).json({ error: "Too many failed attempts. Try again in 15 minutes.", code: "locked" });
       }
       const user = (await users.load()).find((u) => u.username === username);
       if (!user || !(await checkPassword(user, password))) {
         keys.forEach(recordFailure);
-        return res.status(401).json({ error: "שם המשתמש או הסיסמה שגויים." });
+        return res.status(401).json({ error: "Wrong username or password.", code: "wrong_login" });
       }
       keys.forEach((k) => failures.delete(k));
       await startSession(req, res, user);

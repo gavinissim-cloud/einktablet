@@ -7,6 +7,7 @@ A web app that turns handwritten modern Hebrew (scans, phone photos, or PDFs) in
 - **Document view:** the full text as one editable document (Word-style).
 - **Words to check:** words the reader wasn't sure about are highlighted in yellow so you know where to look.
 - **Hebrew punctuation:** gershayim (״), geresh (׳), maqaf (־), parentheses, dashes, and quotes are kept. You can switch to plain keyboard punctuation (`" ' -`) when exporting.
+- **English or Hebrew interface:** buttons and messages are in English by default. The עברית button in the top corner switches to Hebrew, and each browser remembers the choice. The transcribed text is always Hebrew, written right to left.
 - **Accounts:** each person signs up and logs in, and sees only their own documents.
 - **Saved automatically:** every document is saved on the server about a second after each edit (the top bar shows "כל השינויים נשמרו ✓"). Reloading the page or coming back later reopens it, and the home screen lists all saved documents so you can reopen, rename or delete them. If a page was still being read when the browser closed, it is read again when the document is reopened.
 - **Export:** Word (.docx, right-to-left), Word with the handwriting image beside each line, plain text, or copy to clipboard.

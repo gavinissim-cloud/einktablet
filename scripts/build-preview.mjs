@@ -13,11 +13,9 @@ const out = process.argv[2] || path.join(root, "preview", "dist", "index.html");
 const html = read("public/index.html");
 const body = html
   .slice(html.indexOf("<body>") + 6, html.indexOf("</body>"))
-  .replace(/\s*<script src="app\.js"><\/script>/, "")
-  .replace(
-    '<p class="sub" dir="ltr">Hebrew handwriting → editable text</p>',
-    '<p class="sub" dir="ltr">Hebrew handwriting → editable text</p>\n      <p class="sub">תצוגה מקדימה · מתחברים עם חשבון claude.ai</p>'
-  );
+  .replace(/\s*<script src="(i18n|app)\.js"><\/script>/g, "")
+  .replace('id="previewNote" data-i18n="previewNote" hidden', 'id="previewNote" data-i18n="previewNote"');
+if (body.includes("<script src=")) throw new Error("public/index.html has a script the build does not inline");
 
 // Keep "</script>" inside inlined code from closing the tag early.
 const inline = (code) => code.replace(/<\/script/gi, "<\\/script");
@@ -26,8 +24,7 @@ const backend = read("preview/backend.js")
   .replace("const SCHEMA = __SCHEMA__;", () => `const SCHEMA = ${JSON.stringify(LINE_SCHEMA)};`);
 if (/= __(SYSTEM|SCHEMA)__;/.test(backend)) throw new Error("preview/backend.js placeholders not filled");
 
-const page = `<title>כתב יד לטקסט</title>
-<script>document.documentElement.lang = "he"; document.documentElement.dir = "rtl";</script>
+const page = `<title>Hebrew Handwriting to Text</title>
 <style>
 ${read("public/styles.css")}
 </style>
@@ -37,6 +34,9 @@ ${body.trim()}
 <script src="https://cdn.jsdelivr.net/npm/docx@9.7.1/dist/index.iife.js"></script>
 <script>
 ${inline(backend)}
+</script>
+<script>
+${inline(read("public/i18n.js"))}
 </script>
 <script>
 ${inline(read("public/app.js"))}

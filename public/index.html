@@ -1,76 +1,78 @@
 <!doctype html>
-<html lang="he" dir="rtl">
+<html lang="en" dir="ltr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>כתב יד לטקסט — Hebrew Handwriting to Text</title>
+  <title>Hebrew Handwriting to Text</title>
   <link rel="stylesheet" href="styles.css">
   <script src="vendor/pdfjs/pdf.min.js"></script>
 </head>
 <body>
   <header class="top">
     <div>
-      <h1>כתב יד לטקסט</h1>
-      <p class="sub" dir="ltr">Hebrew handwriting → editable text</p>
+      <h1 data-i18n="appName">Hebrew Handwriting to Text</h1>
+      <p class="sub" data-i18n="appSub">Turn handwritten Hebrew into editable text</p>
+      <p class="sub" id="previewNote" data-i18n="previewNote" hidden></p>
     </div>
-    <div id="account" class="account" hidden>
-      <span id="accountName" dir="auto"></span>
-      <button id="logout" class="secondary">התנתקות</button>
+    <div class="account">
+      <span id="accountName" dir="auto" hidden></span>
+      <button id="logout" class="secondary" data-i18n="logout" hidden>Log out</button>
+      <button id="langSwitch" class="secondary" data-i18n="switchLang" lang="he">עברית</button>
     </div>
   </header>
 
   <main>
     <section id="auth" class="auth" hidden>
       <form id="authForm" class="auth-card">
-        <h2 id="authTitle">התחברות</h2>
-        <label>שם משתמש או אימייל
+        <h2 id="authTitle">Log in</h2>
+        <label><span data-i18n="username">Username or email</span>
           <input id="authUser" name="username" autocomplete="username" dir="ltr" required>
         </label>
-        <label>סיסמה
+        <label><span data-i18n="password">Password</span>
           <input id="authPass" name="password" type="password" autocomplete="current-password" dir="ltr" required>
         </label>
-        <label id="authCodeRow" hidden>קוד הרשמה
+        <label id="authCodeRow" hidden><span data-i18n="signupCode">Sign-up code</span>
           <input id="authCode" name="code" dir="ltr" autocomplete="off">
         </label>
         <p id="authError" class="auth-error" role="alert"></p>
-        <button id="authSubmit" type="submit">התחברות</button>
+        <button id="authSubmit" type="submit">Log in</button>
         <p class="auth-switch">
-          <span id="authSwitchText">אין לכם חשבון?</span>
-          <a href="#" id="authSwitch">הרשמה</a>
+          <span id="authSwitchText">Don't have an account?</span>
+          <a href="#" id="authSwitch">Sign up</a>
         </p>
       </form>
+      <p id="signedOut" class="auth-card" data-i18n="signedOut" hidden></p>
     </section>
 
     <section id="upload" hidden>
       <label id="dropzone" class="dropzone" tabindex="0">
         <input id="fileInput" type="file" accept="image/*,application/pdf" multiple hidden>
         <div class="dz-icon" aria-hidden="true">⬆</div>
-        <div class="dz-title">גררו לכאן קובץ או לחצו לבחירה</div>
-        <div class="dz-hint">תמונה (JPG, PNG, WebP) או PDF · אפשר גם להדביק תמונה (Ctrl+V)</div>
-        <div class="dz-hint" dir="ltr">Drag a scan, photo or PDF here, click to choose, or paste an image</div>
+        <div class="dz-title" data-i18n="dropTitle">Drag a file here or click to choose</div>
+        <div class="dz-hint" data-i18n="dropHint">Image (JPG, PNG, WebP) or PDF · you can also paste an image (Ctrl+V)</div>
       </label>
       <div id="docList" class="doc-list"></div>
     </section>
 
     <section id="workspace" hidden>
       <div class="doc-bar">
-        <button id="backHome" class="secondary">→ המסמכים שלי</button>
-        <input id="docTitle" class="doc-title" dir="auto" aria-label="שם המסמך" placeholder="שם המסמך">
+        <button id="backHome" class="secondary" data-i18n="backHome">← My documents</button>
+        <input id="docTitle" class="doc-title" dir="auto" data-i18n-aria="docTitle" data-i18n-placeholder="docTitle">
         <span id="saveState" class="save-state"></span>
       </div>
       <div class="toolbar">
         <div class="tabs" role="tablist">
-          <button class="tab active" data-view="lines" role="tab">שורה מול שורה</button>
-          <button class="tab" data-view="doc" role="tab">מסמך</button>
+          <button class="tab active" data-view="lines" role="tab" data-i18n="tabLines">Line by line</button>
+          <button class="tab" data-view="doc" role="tab" data-i18n="tabDoc">Document</button>
         </div>
         <div class="status" id="status"></div>
         <div class="actions">
-          <label class="check"><input type="checkbox" id="plainPunct"> פיסוק מקלדת רגיל (" ' -)</label>
-          <button id="exportDocx">Word ⬇</button>
-          <button id="exportDocxImages">Word + כתב יד ⬇</button>
-          <button id="exportTxt">TXT ⬇</button>
-          <button id="copyAll">העתקה</button>
-          <button id="addMore" class="secondary">+ עמודים נוספים</button>
+          <label class="check"><input type="checkbox" id="plainPunct"> <span data-i18n="plainPunct">Plain keyboard punctuation (" ' -)</span></label>
+          <button id="exportDocx" data-i18n="exportWord">Word ⬇</button>
+          <button id="exportDocxImages" data-i18n="exportWordImages">Word + handwriting ⬇</button>
+          <button id="exportTxt" data-i18n="exportTxt">TXT ⬇</button>
+          <button id="copyAll" data-i18n="copy">Copy</button>
+          <button id="addMore" class="secondary" data-i18n="addPages">+ Add pages</button>
         </div>
       </div>
       <div id="pages"></div>
@@ -79,11 +81,12 @@
 
   <div id="lightbox" class="lightbox" hidden>
     <div class="lb-inner">
-      <button class="lb-close" aria-label="סגירה">✕</button>
+      <button class="lb-close" data-i18n-aria="close">✕</button>
       <div class="lb-stage"><img id="lbImg" alt=""><div id="lbBox" class="lb-box"></div></div>
     </div>
   </div>
 
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

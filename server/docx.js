@@ -38,15 +38,16 @@ const noBorders = {
 };
 
 /**
- * @param {{title?: string, pages: {lines: {text: string, image?: string, width?: number, height?: number}[]}[], withImages?: boolean}} input
+ * @param {{title?: string, pages: {heading?: string, lines: {text: string, image?: string, width?: number, height?: number}[]}[], withImages?: boolean}} input
  */
 export async function buildDocx({ title, pages, withImages }) {
   const children = [];
   if (title) children.push(hebrewParagraph(title, { size: 36, bold: true }));
 
-  pages.forEach((page, pageIndex) => {
-    if (pages.length > 1) {
-      children.push(hebrewParagraph(`עמוד ${pageIndex + 1}`, { size: 22, bold: true }));
+  pages.forEach((page) => {
+    // The heading ("Page 2" / "עמוד 2") comes from the browser, in the interface language.
+    if (typeof page.heading === "string" && page.heading) {
+      children.push(hebrewParagraph(page.heading.slice(0, 100), { size: 22, bold: true }));
     }
     if (!withImages) {
       for (const line of page.lines) children.push(hebrewParagraph(line.text));

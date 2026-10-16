@@ -19,7 +19,7 @@ const backend = window.HW_BACKEND || null;
 
 // ---------- In-page dialogs (instead of the browser's alert/confirm) ----------
 
-function dialog(message, { okLabel = "אישור", cancelLabel = null, danger = false } = {}) {
+function dialog(message, { okLabel = t("ok"), cancelLabel = null, danger = false } = {}) {
   return new Promise((resolve) => {
     const prev = document.activeElement;
     const wrap = document.createElement("div");
@@ -46,7 +46,7 @@ function dialog(message, { okLabel = "אישור", cancelLabel = null, danger = 
   });
 }
 const notify = (message) => dialog(message);
-const ask = (message, okLabel = "כן", opts = {}) => dialog(message, { okLabel, cancelLabel: "ביטול", ...opts });
+const ask = (message, okLabel = t("yes"), opts = {}) => dialog(message, { okLabel, cancelLabel: t("cancel"), ...opts });
 
 async function api(method, url, body, headers = { "Content-Type": "application/json" }) {
   if (backend) {
@@ -64,11 +64,11 @@ async function api(method, url, body, headers = { "Content-Type": "application/j
   });
   if (res.status === 401 && !url.startsWith("/api/auth/")) {
     showAuth();
-    throw Object.assign(new Error("יש להתחבר מחדש."), { status: 401 });
+    throw Object.assign(new Error(t("err.auth_required")), { status: 401, code: "auth_required" });
   }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw Object.assign(new Error(data.error || `Server error ${res.status}`), { status: res.status });
+    throw Object.assign(new Error(data.error || `Server error ${res.status}`), { status: res.status, code: data.code });
   }
   if (res.status === 204) return null;
   return (res.headers.get("Content-Type") || "").includes("json") ? res.json() : res.blob();
@@ -106,7 +106,7 @@ async function addFiles(files) {
   if (!state.user) return;
   const accepted = files.filter((f) => f && (f.type.startsWith("image/") || f.type === "application/pdf"));
   if (!accepted.length) {
-    if (files.length) notify("אפשר להעלות רק תמונות או קובצי PDF.");
+    if (files.length) notify(t("onlyImages"));
     return;
   }
   let doc = state.doc;
@@ -115,7 +115,7 @@ async function addFiles(files) {
       const created = await api("POST", "/api/documents", { title: accepted[0].name.replace(/\.[^.]+$/, "") });
       doc = adoptDoc(created, []);
     } catch (err) {
-      return notify(`לא הצלחנו ליצור מסמך חדש: ${err.message}`);
+      return notify(t("createFailed", { msg: errText(err) }));
     }
     showDoc(doc);
   }
@@ -125,7 +125,7 @@ async function addFiles(files) {
       for (const [i, canvas] of canvases.entries()) {
         const page = {
           id: crypto.randomUUID(),
-          name: canvases.length > 1 ? `${file.name} — עמוד ${i + 1}` : file.name,
+          name: canvases.length > 1 ? t("pageOfFile", { file: file.name, n: i + 1 }) : file.name,
           canvas,
           status: "queued",
           lines: [],
@@ -139,7 +139,7 @@ async function addFiles(files) {
       }
     } catch (err) {
       console.error(err);
-      notify(`לא הצלחנו להוסיף את הקובץ ${file.name}: ${err.message}. אם זו תמונת HEIC מאייפון, המירו אותה ל-JPG.`);
+      notify(t("addFailed", { file: file.name, msg: errText(err) }));
     }
   }
 }
@@ -244,9 +244,9 @@ function updateSaveState() {
   const doc = state.doc;
   if (!doc) return;
   el.classList.toggle("err", doc.failed);
-  if (doc.failed) el.textContent = "השמירה נכשלה — מנסה שוב…";
-  else if (hasUnsaved(doc)) el.textContent = "שומר…";
-  else el.textContent = "כל השינויים נשמרו ✓";
+  if (doc.failed) el.textContent = t("saveFailed");
+  else if (hasUnsaved(doc)) el.textContent = t("saving");
+  else el.textContent = t("saved");
 }
 
 async function loadCanvas(src) {
@@ -276,7 +276,7 @@ async function loadDoc(id) {
   try {
     data = await api("GET", `/api/documents/${id}`);
   } catch (err) {
-    if (err.status !== 401) notify(`לא הצלחנו לפתוח את המסמך: ${err.message}`);
+    if (err.status !== 401) notify(t("openFailed", { msg: errText(err) }));
     return showHome();
   }
   const doc = adoptDoc(data, []);
@@ -293,7 +293,7 @@ async function loadDoc(id) {
         page.canvas = null;
         if (page.status !== "done") {
           page.status = "error";
-          page.error = "תמונת העמוד לא נשמרה. הסירו את העמוד והעלו אותו שוב.";
+          page.error = t("imageMissing");
         }
       }
       return page;
@@ -311,7 +311,7 @@ function showDoc(doc) {
   $("#upload").hidden = true;
   $("#workspace").hidden = false;
   $("#docTitle").value = doc.title;
-  document.title = `${doc.title} — כתב יד לטקסט`;
+  document.title = `${doc.title || t("untitled")} — ${t("appName")}`;
   render();
   updateSaveState();
 }
@@ -320,7 +320,7 @@ async function showHome() {
   if (state.doc) flushSave(state.doc);
   state.doc = null;
   if (location.hash) history.pushState(null, "", location.pathname);
-  document.title = "כתב יד לטקסט — Hebrew Handwriting to Text";
+  document.title = t("appName");
   $("#upload").hidden = false;
   $("#workspace").hidden = true;
   $("#pages").innerHTML = "";
@@ -333,29 +333,29 @@ async function renderDocList() {
   try {
     docs = await api("GET", "/api/documents");
   } catch (err) {
-    list.innerHTML = `<p class="save-state err">לא הצלחנו לטעון את רשימת המסמכים: ${escapeHtml(err.message)}</p>`;
+    list.innerHTML = `<p class="save-state err">${escapeHtml(t("listFailed", { msg: errText(err) }))}</p>`;
     return;
   }
   list.innerHTML = "";
   if (!docs.length) return;
-  list.insertAdjacentHTML("beforeend", "<h2>המסמכים שלי</h2>");
+  list.insertAdjacentHTML("beforeend", `<h2>${escapeHtml(t("myDocs"))}</h2>`);
   for (const d of docs) {
     const item = document.createElement("div");
     item.className = "doc-item";
     const link = document.createElement("a");
     link.href = `#doc=${d.id}`;
-    link.textContent = d.title || "מסמך ללא שם";
+    link.textContent = d.title || t("untitled");
     link.dir = "auto";
     const meta = document.createElement("span");
     meta.className = "meta";
-    const when = new Date(d.updatedAt).toLocaleString("he-IL", { dateStyle: "short", timeStyle: "short" });
-    meta.textContent = `${d.pageCount} עמודים · עודכן ${when}`;
-    item.append(link, meta, button("מחיקה", "secondary", async () => {
-      if (!(await ask(`למחוק את המסמך "${d.title}"? אי אפשר לבטל את זה.`, "מחיקה", { danger: true }))) return;
+    const when = new Date(d.updatedAt).toLocaleString(lang === "he" ? "he-IL" : "en-GB", { dateStyle: "short", timeStyle: "short" });
+    meta.textContent = t("pagesUpdated", { n: d.pageCount, when });
+    item.append(link, meta, button(t("delete"), "secondary", async () => {
+      if (!(await ask(t("deleteDoc", { title: d.title || t("untitled") }), t("delete"), { danger: true }))) return;
       try {
         await api("DELETE", `/api/documents/${d.id}`);
       } catch (err) {
-        notify(`המחיקה נכשלה: ${err.message}`);
+        notify(t("deleteFailed", { msg: errText(err) }));
       }
       renderDocList();
     }));
@@ -380,7 +380,7 @@ $("#backHome").addEventListener("click", showHome);
 $("#docTitle").addEventListener("input", () => {
   if (!state.doc) return;
   state.doc.title = $("#docTitle").value;
-  document.title = `${state.doc.title} — כתב יד לטקסט`;
+  document.title = `${state.doc.title || t("untitled")} — ${t("appName")}`;
   scheduleSave(state.doc);
 });
 
@@ -392,30 +392,29 @@ let signupNeedsCode = false;
 function setAuthMode(mode) {
   authMode = mode;
   const register = mode === "register";
-  $("#authTitle").textContent = register ? "הרשמה" : "התחברות";
-  $("#authSubmit").textContent = register ? "יצירת חשבון" : "התחברות";
-  $("#authSwitchText").textContent = register ? "כבר יש לכם חשבון?" : "אין לכם חשבון?";
-  $("#authSwitch").textContent = register ? "התחברות" : "הרשמה";
+  $("#authTitle").textContent = t(register ? "register" : "login");
+  $("#authSubmit").textContent = t(register ? "createAccount" : "login");
+  $("#authSwitchText").textContent = t(register ? "haveAccount" : "noAccount");
+  $("#authSwitch").textContent = t(register ? "login" : "register");
   $("#authPass").autocomplete = register ? "new-password" : "current-password";
   $("#authCodeRow").hidden = !(register && signupNeedsCode);
   $("#authError").textContent = "";
 }
 
 function showAuth() {
+  $("#accountName").hidden = true;
+  $("#logout").hidden = true;
   if (backend?.externalAuth) {
-    $("#account").hidden = true;
+    // The preview signs in through claude.ai, so there is no form to show.
     $("#upload").hidden = true;
     $("#workspace").hidden = true;
+    $("#authForm").hidden = true;
+    $("#signedOut").hidden = false;
     $("#auth").hidden = false;
-    $("#authForm").innerHTML = "";
-    const msg = document.createElement("p");
-    msg.textContent = backend.signedOutMessage;
-    $("#authForm").append(msg);
     return;
   }
   state.user = null;
   state.doc = null;
-  $("#account").hidden = true;
   $("#upload").hidden = true;
   $("#workspace").hidden = true;
   $("#pages").innerHTML = "";
@@ -427,8 +426,8 @@ function showAuth() {
 function signedIn(user) {
   state.user = user;
   $("#auth").hidden = true;
-  $("#account").hidden = false;
-  $("#accountName").textContent = user.username;
+  $("#accountName").hidden = false;
+  $("#accountName").textContent = user.username || t("myAccount");
   $("#logout").hidden = Boolean(backend?.externalAuth);
   $("#authPass").value = "";
   $("#authCode").value = "";
@@ -451,7 +450,7 @@ $("#authForm").addEventListener("submit", async (e) => {
     const data = await api("POST", `/api/auth/${authMode}`, body);
     signedIn(data.user);
   } catch (err) {
-    $("#authError").textContent = err.message;
+    $("#authError").textContent = errText(err);
   } finally {
     submit.disabled = false;
   }
@@ -461,7 +460,7 @@ $("#logout").addEventListener("click", async () => {
   const doc = state.doc;
   if (doc && hasUnsaved(doc)) {
     await flushSave(doc);
-    if (hasUnsaved(doc) && !(await ask("יש שינויים שעדיין לא נשמרו. להתנתק בכל זאת?", "התנתקות"))) return;
+    if (hasUnsaved(doc) && !(await ask(t("logoutUnsaved"), t("logout")))) return;
   }
   await api("POST", "/api/auth/logout", {}).catch(() => {});
   if (location.hash) history.pushState(null, "", location.pathname);
@@ -477,7 +476,7 @@ async function start() {
     if (me.user) signedIn(me.user);
     else showAuth();
   } catch (err) {
-    notify(`השרת לא זמין: ${err.message}`);
+    notify(t("serverDown", { msg: errText(err) }));
   }
 }
 
@@ -550,7 +549,7 @@ function render() {
   const container = $("#pages");
   container.innerHTML = "";
   if (!currentPages().length) {
-    container.innerHTML = '<div class="page empty">אין עדיין עמודים במסמך. גררו לכאן קובץ או לחצו "+ עמודים נוספים".</div>';
+    container.innerHTML = `<div class="page empty">${escapeHtml(t("noPagesYet"))}</div>`;
   }
   for (const page of currentPages()) {
     const el = document.createElement("section");
@@ -575,29 +574,29 @@ function renderPage(page) {
   st.className = "state";
   head.append(title, st);
 
-  if (page.src) head.append(button("הצגת הדף", "secondary", () => openLightbox(page)));
+  if (page.src) head.append(button(t("viewPage"), "secondary", () => openLightbox(page)));
 
-  if (page.status === "queued") st.textContent = "ממתין…";
-  if (page.status === "working") st.innerHTML = '<span class="spinner"></span>קורא את כתב היד…';
+  if (page.status === "queued") st.textContent = t("queued");
+  if (page.status === "working") st.innerHTML = `<span class="spinner"></span>${escapeHtml(t("reading"))}`;
   if (page.status === "error") {
     st.classList.add("err");
-    st.textContent = `שגיאה: ${page.error}`;
+    st.textContent = t("errorPrefix", { msg: page.error });
   }
   if (page.status === "done") {
     const n = page.lines.filter((l) => l.unclear.length).length;
-    st.textContent = `${page.lines.length} שורות` + (n ? ` · ${n} לבדיקה` : "");
+    st.textContent = t("linesCount", { n: page.lines.length }) + (n ? ` · ${t("toCheck", { n })}` : "");
   }
   if (page.status === "done" || page.status === "error") {
-    head.append(button("קריאה מחדש", "secondary", async () => {
-      if (page.status === "done" && !(await ask("קריאה מחדש תחליף את התיקונים שעשיתם בעמוד הזה. להמשיך?", "קריאה מחדש"))) return;
+    head.append(button(t("reread"), "secondary", async () => {
+      if (page.status === "done" && !(await ask(t("rereadConfirm"), t("reread")))) return;
       page.status = "queued";
       renderPage(page);
       scheduleSave(state.doc);
       pump();
     }));
   }
-  head.append(button("הסרה", "secondary", async () => {
-    if (page.status === "done" && !(await ask("להסיר את העמוד הזה מהמסמך?", "הסרה", { danger: true }))) return;
+  head.append(button(t("remove"), "secondary", async () => {
+    if (page.status === "done" && !(await ask(t("removeConfirm"), t("remove"), { danger: true }))) return;
     state.doc.pages = state.doc.pages.filter((p) => p !== page);
     scheduleSave(state.doc);
     render();
@@ -606,7 +605,7 @@ function renderPage(page) {
 
   if (page.status !== "done") return;
   if (!page.lines.length) {
-    el.insertAdjacentHTML("beforeend", '<div class="empty">לא נמצא כתב יד בעמוד הזה.</div>');
+    el.insertAdjacentHTML("beforeend", `<div class="empty">${escapeHtml(t("noHandwriting"))}</div>`);
     return;
   }
   if (state.view === "lines") renderLines(page, el);
@@ -614,7 +613,7 @@ function renderPage(page) {
 }
 
 function renderLines(page, el) {
-  el.insertAdjacentHTML("beforeend", '<div class="col-head"><div>כתב היד</div><div>הטקסט (אפשר לערוך)</div></div>');
+  el.insertAdjacentHTML("beforeend", `<div class="col-head"><div>${escapeHtml(t("colHandwriting"))}</div><div>${escapeHtml(t("colText"))}</div></div>`);
   page.lines.forEach((line, i) => {
     const row = document.createElement("div");
     row.className = "row" + (line.unclear.length ? " unclear" : "");
@@ -623,7 +622,7 @@ function renderLines(page, el) {
       const img = document.createElement("img");
       img.className = "crop";
       img.src = line.crop;
-      img.alt = `כתב יד, שורה ${i + 1}`;
+      img.alt = t("lineAlt", { n: i + 1 });
       img.addEventListener("click", () => openLightbox(page, line));
       row.append(img);
     } else {
@@ -655,8 +654,8 @@ function renderLines(page, el) {
     if (line.unclear.length) {
       const flag = document.createElement("div");
       flag.className = "flag";
-      flag.append(`כדאי לבדוק: ${line.unclear.join(", ")}`);
-      flag.append(button("נבדק ✓", "", () => {
+      flag.append(t("checkWords", { words: line.unclear.join(", ") }));
+      flag.append(button(t("checked"), "", () => {
         line.unclear = [];
         scheduleSave(state.doc);
         renderPage(page);
@@ -699,7 +698,7 @@ function appendHighlighted(parent, text, unclear) {
     if (set.has(part)) {
       const m = document.createElement("mark");
       m.textContent = part;
-      m.title = "כדאי לבדוק";
+      m.title = t("pleaseCheck");
       parent.append(m);
     } else {
       parent.append(part);
@@ -721,9 +720,9 @@ function updateStatus() {
   const done = pages.filter((p) => p.status === "done").length;
   const working = pages.filter((p) => p.status === "working" || p.status === "queued").length;
   const errors = pages.filter((p) => p.status === "error").length;
-  let text = `${done}/${total} עמודים מוכנים`;
-  if (working) text += " · עובד…";
-  if (errors) text += ` · ${errors} שגיאות`;
+  let text = t("pagesReady", { done, total });
+  if (working) text += ` · ${t("working")}`;
+  if (errors) text += ` · ${t("errorsCount", { n: errors })}`;
   $("#status").textContent = text;
 }
 
@@ -780,7 +779,7 @@ $("#exportTxt").addEventListener("click", async () => {
   try {
     await download(new Blob(["﻿" + plainText()], { type: "text/plain;charset=utf-8" }), "transcription.txt");
   } catch (err) {
-    notify(`ההורדה נכשלה: ${err.message}`);
+    notify(t("downloadFailed", { msg: errText(err) }));
   }
 });
 
@@ -788,26 +787,28 @@ $("#copyAll").addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(plainText());
   } catch {
-    return notify("ההעתקה לא הצליחה בדפדפן הזה. עברו לתצוגת \"מסמך\", סמנו את הטקסט והעתיקו ידנית.");
+    return notify(t("copyFailed"));
   }
-  $("#copyAll").textContent = "הועתק ✓";
-  setTimeout(() => ($("#copyAll").textContent = "העתקה"), 1500);
+  $("#copyAll").textContent = t("copied");
+  setTimeout(() => ($("#copyAll").textContent = t("copy")), 1500);
 });
 
 async function exportDocx(withImages, btn) {
-  const pages = donePages().map((p) => ({
+  const done = donePages();
+  const pages = done.map((p, i) => ({
+    heading: done.length > 1 ? t("pageHeading", { n: i + 1 }) : undefined,
     lines: p.lines.map((l) => ({
       text: finalText(l.text),
       ...(withImages && l.crop ? { image: l.crop, width: l.cropW, height: l.cropH } : {}),
     })),
   }));
-  if (!pages.length) return notify("אין עדיין טקסט לייצוא.");
+  if (!pages.length) return notify(t("nothingToExport"));
   btn.disabled = true;
   try {
     const blob = await api("POST", "/api/export/docx", { pages, withImages });
     await download(blob, withImages ? "transcription-with-handwriting.docx" : "transcription.docx");
   } catch (err) {
-    if (err.status !== 401) notify(`הייצוא נכשל: ${err.message}`);
+    if (err.status !== 401) notify(t("exportFailed", { msg: errText(err) }));
   } finally {
     btn.disabled = false;
   }
@@ -830,4 +831,21 @@ window.addEventListener("resize", () => {
   });
 });
 
+// ---------- Interface language ----------
+
+$("#langSwitch").addEventListener("click", () => {
+  setLanguage(lang === "en" ? "he" : "en");
+  setAuthMode(authMode);
+  if (state.doc) {
+    document.title = `${state.doc.title || t("untitled")} — ${t("appName")}`;
+    render();
+    updateSaveState();
+  } else {
+    document.title = t("appName");
+    if (state.user) renderDocList();
+  }
+  if (state.user) $("#accountName").textContent = state.user.username || t("myAccount");
+});
+
+applyLanguage();
 start();

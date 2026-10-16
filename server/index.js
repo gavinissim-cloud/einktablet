@@ -46,19 +46,24 @@ app.post("/api/transcribe", async (req, res) => {
     console.error(error);
     let message = error.message || "Transcription failed.";
     let status = 500;
+    let code = "read_failed";
     if (error instanceof Anthropic.AuthenticationError) {
       message = "The server's Anthropic API key is missing or invalid.";
+      code = "api_key";
     } else if (error instanceof Anthropic.RateLimitError) {
-      message = "Too many requests right now — wait a minute and retry this page.";
+      message = "Too many requests right now. Wait a minute and retry this page.";
       status = 429;
+      code = "rate_limited";
     } else if (error instanceof Anthropic.BadRequestError) {
       message = `The page could not be processed: ${error.message}`;
       status = 400;
+      code = "bad_page";
     } else if (error instanceof Anthropic.APIError) {
       message = `Claude API error (${error.status}). Please retry.`;
       status = 502;
+      code = "api_error";
     }
-    res.status(status).json({ error: message });
+    res.status(status).json({ error: message, code });
   }
 });
 

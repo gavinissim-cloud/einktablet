@@ -13,7 +13,7 @@ window.HW_BACKEND = (() => {
   const SCHEMA = __SCHEMA__;
   const PASSES = 2;
 
-  const httpError = (status, message) => Object.assign(new Error(message), { status });
+  const httpError = (status, code, message = code) => Object.assign(new Error(message), { status, code });
 
   const ready = (async () => {
     const use = (name) => (window.claude ? window.claude.use(name).catch(() => null) : Promise.resolve(null));
@@ -30,7 +30,7 @@ window.HW_BACKEND = (() => {
 
   async function caps() {
     const c = await ready;
-    if (!c.db || !c.uid) throw httpError(401, "Not signed in");
+    if (!c.db || !c.uid) throw httpError(401, "auth_required", "Not signed in");
     return c;
   }
   // data/users/<id> is the viewer's private collection; "store" is one
@@ -107,16 +107,8 @@ You get ${blobs.length} images of the same page. Image 1 is the whole page: give
 Reply with only a JSON object matching this JSON Schema, and nothing else:
 ${JSON.stringify(SCHEMA)}`;
 
-  const SAMPLE_ERRORS = {
-    not_granted: "כדי לקרוא כתב יד צריך לאשר לדף הזה להשתמש ב-Claude. טענו את הדף מחדש ובחרו \"אישור\".",
-    sampling_disabled: "Claude לא זמין בחשבון הזה.",
-    rate_limited: "יותר מדי בקשות כרגע, או שהגעתם למגבלת השימוש. נסו שוב בעוד כמה דקות.",
-    session_expired: "צריך להתחבר מחדש ל-claude.ai.",
-    image_rejected: "התמונה לא התקבלה. נסו קובץ JPG או PNG אחר.",
-    images_unavailable: "בתצוגה הזו אי אפשר לשלוח תמונות ל-Claude.",
-    refused: "Claude סירב לקרוא את העמוד הזה.",
-    invalid_json: "התשובה של Claude הגיעה בצורה לא תקינה. לחצו \"קריאה מחדש\".",
-  };
+  // Claude's error codes that get their own message (see public/i18n.js "err.claude_*").
+  const SAMPLE_ERRORS = new Set(["not_granted", "sampling_disabled", "session_expired", "image_rejected", "refused", "invalid_json"]);
 
   async function ask(c, prompt, blobs) {
     try {
@@ -124,15 +116,17 @@ ${JSON.stringify(SCHEMA)}`;
       if (!data || !Array.isArray(data.lines)) throw { code: "invalid_json" };
       return data.lines.map(cleanLine).filter((l) => l.text);
     } catch (e) {
-      throw httpError(502, SAMPLE_ERRORS[e?.code] || "הקריאה נכשלה. לחצו \"קריאה מחדש\".");
+      if (e?.code === "rate_limited") throw httpError(429, "rate_limited");
+      if (e?.code === "images_unavailable") throw httpError(503, "read_unavailable");
+      throw httpError(502, SAMPLE_ERRORS.has(e?.code) ? `claude_${e.code}` : "read_failed", e?.message);
     }
   }
 
   async function transcribe(dataUrl) {
     const c = await caps();
-    if (!c.sample) throw httpError(503, "קריאת כתב יד לא זמינה בתצוגה הזו.");
+    if (!c.sample) throw httpError(503, "read_unavailable");
     const limits = await c.sample.limits().catch(() => null);
-    if (!limits?.images) throw httpError(503, SAMPLE_ERRORS.images_unavailable);
+    if (!limits?.images) throw httpError(503, "read_unavailable");
     const { blobs, note } = await pageImages(dataUrl, limits.images.maxCount);
 
     let lines = await ask(c, `${SYSTEM}${note}\n\nTranscribe all the handwriting on this page.${FORMAT}`, blobs);
@@ -160,7 +154,7 @@ ${draft}${FORMAT}`,
 
   async function buildDocx({ pages, withImages }) {
     const d = window.docx;
-    if (!d) throw httpError(503, "רכיב ה-Word לא נטען. טענו את הדף מחדש.");
+    if (!d) throw httpError(503, "word_unavailable");
     const FONT = "Arial";
     const para = (text, { size = 26, bold = false } = {}) =>
       new d.Paragraph({
@@ -172,8 +166,8 @@ ${draft}${FORMAT}`,
     const none = { style: d.BorderStyle.NONE, size: 0, color: "FFFFFF" };
     const borders = { top: none, left: none, right: none, bottom: { style: d.BorderStyle.SINGLE, size: 2, color: "DDDDDD" } };
     const children = [];
-    pages.forEach((page, i) => {
-      if (pages.length > 1) children.push(para(`עמוד ${i + 1}`, { size: 22, bold: true }));
+    pages.forEach((page) => {
+      if (page.heading) children.push(para(String(page.heading).slice(0, 100), { size: 22, bold: true }));
       if (!withImages) {
         page.lines.forEach((l) => children.push(para(l.text)));
         return;
@@ -209,7 +203,7 @@ ${draft}${FORMAT}`,
 
     if (route === "GET /api/auth/me") {
       const c = await ready;
-      return { user: c.db && c.uid ? { username: c.name || "החשבון שלי" } : null, signupNeedsCode: false };
+      return { user: c.db && c.uid ? { username: c.name } : null, signupNeedsCode: false };
     }
 
     if (route === "POST /api/transcribe") return transcribe(body.image);
@@ -227,14 +221,14 @@ ${draft}${FORMAT}`,
 
     if (route === "POST /api/documents") {
       const now = new Date().toISOString();
-      const doc = { id: crypto.randomUUID(), title: String(body?.title || "").slice(0, 200) || "מסמך ללא שם", createdAt: now, updatedAt: now, pages: [] };
+      const doc = { id: crypto.randomUUID(), title: String(body?.title || "").slice(0, 200), createdAt: now, updatedAt: now, pages: [] };
       await docsCol(c).doc(doc.id).set(doc);
       return doc;
     }
 
     if ((m = route.match(/^GET \/api\/documents\/([\w-]+)$/))) {
       const snap = await docsCol(c).doc(m[1]).get();
-      if (!snap.exists) throw httpError(404, "המסמך לא נמצא.");
+      if (!snap.exists) throw httpError(404, "doc_not_found");
       const imgs = (await imagesDoc(c, m[1]).get()).data() || {};
       for (const [pageId, assetId] of Object.entries(imgs)) images.set(pageId, `/_blob/${assetId}`);
       return clean(snap.data());
@@ -246,9 +240,9 @@ ${draft}${FORMAT}`,
       try {
         await ref.update(clean({ title: String(body.title || "").slice(0, 200), pages: body.pages, updatedAt }));
       } catch (e) {
-        if (e?.code === "invalid_argument" && !(await ref.get()).exists) throw httpError(404, "המסמך נמחק.");
-        if (e?.code === "invalid_argument") throw httpError(400, "המסמך גדול מדי לשמירה. חלקו אותו לשני מסמכים.");
-        throw httpError(503, "השמירה נכשלה.");
+        if (e?.code === "invalid_argument" && !(await ref.get()).exists) throw httpError(404, "doc_deleted");
+        if (e?.code === "invalid_argument") throw httpError(400, "doc_too_big");
+        throw httpError(503, "save_failed");
       }
       return { updatedAt };
     }
@@ -278,17 +272,17 @@ ${draft}${FORMAT}`,
     }
 
     if (route.startsWith("POST /api/auth/")) return null;
-    throw httpError(404, "Unknown request");
+    throw httpError(404, "not_found", `Unknown request ${route}`);
   }
 
   async function download(blob, filename) {
     const { downloads } = await ready;
-    if (!downloads) throw new Error("הורדת קבצים לא זמינה בתצוגה הזו.");
+    if (!downloads) throw httpError(503, "downloads_unavailable");
     try {
       await downloads.save({ filename, data: blob });
     } catch (e) {
       if (e?.code === "declined") return;
-      throw new Error("ההורדה נכשלה.");
+      throw httpError(500, "download_failed");
     }
   }
 
@@ -297,6 +291,5 @@ ${draft}${FORMAT}`,
     download,
     pageImageUrl: (doc, page) => images.get(page.id) || null,
     externalAuth: true,
-    signedOutMessage: "כדי לשמור מסמכים ולקרוא כתב יד, התחברו ל-claude.ai ופתחו את הדף שוב.",
   };
 })();

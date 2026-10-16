@@ -80,7 +80,7 @@ export async function listDocs(userId) {
 export async function createDoc(userId, title) {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const doc = { id, title: str(title, 200) || "מסמך ללא שם", createdAt: now, updatedAt: now, pages: [] };
+  const doc = { id, title: str(title, 200), createdAt: now, updatedAt: now, pages: [] };
   await fs.mkdir(docDir(userId, id), { recursive: true });
   await writeAtomic(path.join(docDir(userId, id), "doc.json"), JSON.stringify(doc));
   return doc;

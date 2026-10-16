@@ -49,11 +49,13 @@ body {
 .top { padding: 20px 24px 8px; display: flex; align-items: flex-start; gap: 12px; }
 .top > div:first-child { flex: 1; }
 .account { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--muted); }
-.account[hidden] { display: none; }
+.account [hidden] { display: none; }
 .account button { padding: 4px 10px; font-size: 13px; }
 
 .auth { display: flex; justify-content: center; padding-top: 24px; }
 .auth[hidden] { display: none; }
+.auth-card[hidden] { display: none; }
+#signedOut { font-size: 16px; line-height: 1.5; margin: 0; }
 .auth-card {
   width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 14px;
   background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 26px 24px;
@@ -63,7 +65,7 @@ body {
 .auth-card label[hidden] { display: none; }
 .auth-card input {
   font: inherit; font-size: 16px; padding: 9px 11px; border-radius: 7px;
-  border: 1px solid var(--line); background: var(--bg); color: var(--ink); text-align: right;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink);
 }
 .auth-card input:focus { outline: 2px solid var(--accent); border-color: transparent; }
 .auth-card button { padding: 10px; font-size: 16px; }
@@ -71,7 +73,7 @@ body {
 .auth-switch { margin: 0; font-size: 14px; color: var(--muted); text-align: center; }
 .auth-switch a { color: var(--accent); }
 h1 { margin: 0; font-size: 26px; }
-.sub { margin: 2px 0 0; color: var(--muted); text-align: right; }
+.sub { margin: 2px 0 0; color: var(--muted); }
 main { padding: 12px 24px 48px; max-width: 1300px; margin: 0 auto; }
 
 .dropzone {
@@ -167,7 +169,7 @@ button:disabled { opacity: .5; cursor: default; }
 .lb-stage { position: relative; }
 .lb-stage img { display: block; max-width: 92vw; }
 .lb-box { position: absolute; border: 3px solid #ff3b30; background: rgba(255,59,48,.08); pointer-events: none; }
-.lb-close { position: sticky; top: 6px; float: left; margin: 6px; z-index: 2; }
+.lb-close { position: sticky; top: 6px; float: inline-end; margin: 6px; z-index: 2; }
 
 @media (max-width: 720px) {
   main, .top { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
@@ -175,5 +177,8 @@ button:disabled { opacity: .5; cursor: default; }
   .flag { grid-column: 1; }
   .doc { padding: 18px; }
   .doc-item { flex-wrap: wrap; }
+  .top { flex-wrap: wrap; }
+  .top > div:first-child { flex-basis: 100%; }
+  h1 { font-size: 22px; }
   .doc-item a { flex-basis: 100%; }
 }
