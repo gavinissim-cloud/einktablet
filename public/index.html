@@ -24,9 +24,15 @@
         <div class="dz-hint">תמונה (JPG, PNG, WebP) או PDF · אפשר גם להדביק תמונה (Ctrl+V)</div>
         <div class="dz-hint" dir="ltr">Drag a scan, photo or PDF here, click to choose, or paste an image</div>
       </label>
+      <div id="docList" class="doc-list"></div>
     </section>
 
     <section id="workspace" hidden>
+      <div class="doc-bar">
+        <button id="backHome" class="secondary">→ המסמכים שלי</button>
+        <input id="docTitle" class="doc-title" dir="auto" aria-label="שם המסמך" placeholder="שם המסמך">
+        <span id="saveState" class="save-state"></span>
+      </div>
       <div class="toolbar">
         <div class="tabs" role="tablist">
           <button class="tab active" data-view="lines" role="tab">שורה מול שורה</button>
@@ -39,8 +45,7 @@
           <button id="exportDocxImages">Word + כתב יד ⬇</button>
           <button id="exportTxt">TXT ⬇</button>
           <button id="copyAll">העתקה</button>
-          <button id="addMore" class="secondary">+ קובץ נוסף</button>
-          <button id="clearAll" class="secondary">התחלה מחדש</button>
+          <button id="addMore" class="secondary">+ עמודים נוספים</button>
         </div>
       </div>
       <div id="pages"></div>

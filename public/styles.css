@@ -47,6 +47,27 @@ main { padding: 12px 24px 48px; max-width: 1300px; margin: 0 auto; }
 .dz-title { font-size: 20px; font-weight: 600; }
 .dz-hint { color: var(--muted); font-size: 14px; }
 
+.doc-bar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.doc-title {
+  flex: 1; min-width: 180px; font: inherit; font-size: 20px; font-weight: 600; padding: 6px 10px;
+  border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--ink);
+}
+.doc-title:hover { border-color: var(--line); }
+.doc-title:focus { outline: none; border-color: var(--accent); background: var(--panel); }
+.save-state { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.save-state.err { color: var(--err); }
+
+.doc-list { margin-top: 28px; }
+.doc-list h2 { font-size: 17px; margin: 0 0 10px; }
+.doc-item {
+  display: flex; align-items: center; gap: 12px; padding: 12px 14px; margin-bottom: 8px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+}
+.doc-item a { flex: 1; color: var(--ink); text-decoration: none; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-item a:hover { color: var(--accent); }
+.doc-item .meta { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.doc-item button { padding: 4px 10px; font-size: 13px; }
+
 .toolbar {
   position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 10px 16px;
   align-items: center; padding: 10px 12px; margin-bottom: 16px;
@@ -109,4 +130,6 @@ button:disabled { opacity: .5; cursor: default; }
   .row, .col-head { grid-template-columns: 1fr; }
   .flag { grid-column: 1; }
   .doc { padding: 18px; }
+  .doc-item { flex-wrap: wrap; }
+  .doc-item a { flex-basis: 100%; }
 }

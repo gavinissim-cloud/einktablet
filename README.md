@@ -7,6 +7,7 @@ A web app that turns handwritten modern Hebrew (scans, phone photos, or PDFs) in
 - **Document view:** the full text as one editable document (Word-style).
 - **Words to check:** words the reader wasn't sure about are highlighted in yellow so you know where to look.
 - **Hebrew punctuation:** gershayim (״), geresh (׳), maqaf (־), parentheses, dashes, and quotes are kept. You can switch to plain keyboard punctuation (`" ' -`) when exporting.
+- **Saved automatically:** every document is saved on the server about a second after each edit (the top bar shows "כל השינויים נשמרו ✓"). Reloading the page or coming back later reopens it, and the home screen lists all saved documents so you can reopen, rename or delete them. If a page was still being read when the browser closed, it is read again when the document is reopened.
 - **Export:** Word (.docx, right-to-left), Word with the handwriting image beside each line, plain text, or copy to clipboard.
 
 ## How the reading works
@@ -38,7 +39,12 @@ npm run demo
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Model used to read the handwriting |
 | `CLAUDE_EFFORT` | `high` | `low` / `medium` / `high` / `xhigh` / `max`. Higher means more careful reading, but slower and more expensive |
 | `TRANSCRIBE_PASSES` | `2` | `1` = read only, `2` = read + proofread |
+| `DATA_DIR` | `./data` | Folder where documents are saved (one folder per document: `doc.json` + the page images). Back this folder up to keep your documents |
 | `DEMO_MODE` | unset | `1` returns sample text without calling the API |
+
+## Saved documents and privacy
+
+There are no user accounts yet: everyone who can open the app sees the same list of documents. Run it on your own computer or a private server, and add a login before putting it on the open internet.
 
 ## Accuracy notes
 

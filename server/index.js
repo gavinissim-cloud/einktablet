@@ -4,6 +4,7 @@ import express from "express";
 import Anthropic from "@anthropic-ai/sdk";
 import { transcribePage, demoPage } from "./transcribe.js";
 import { buildDocx } from "./docx.js";
+import * as store from "./store.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -57,6 +58,68 @@ app.post("/api/export/docx", async (req, res) => {
     console.error(error);
     res.status(500).json({ error: "Could not build the Word document." });
   }
+});
+
+// ---------- Saved documents ----------
+
+app.param("docId", (req, res, next, id) => {
+  if (!store.isId(id)) return res.status(400).json({ error: "Invalid document id." });
+  next();
+});
+
+app.get("/api/documents", async (req, res, next) => {
+  try { res.json(await store.listDocs()); } catch (e) { next(e); }
+});
+
+app.post("/api/documents", async (req, res, next) => {
+  try { res.status(201).json(await store.createDoc(req.body?.title)); } catch (e) { next(e); }
+});
+
+app.get("/api/documents/:docId", async (req, res, next) => {
+  try {
+    const doc = await store.getDoc(req.params.docId);
+    if (!doc) return res.status(404).json({ error: "Document not found." });
+    res.json(doc);
+  } catch (e) { next(e); }
+});
+
+app.put("/api/documents/:docId", async (req, res, next) => {
+  try {
+    const doc = await store.saveDoc(req.params.docId, req.body || {});
+    if (!doc) return res.status(404).json({ error: "Document not found." });
+    res.json({ updatedAt: doc.updatedAt });
+  } catch (e) { next(e); }
+});
+
+app.delete("/api/documents/:docId", async (req, res, next) => {
+  try { await store.deleteDoc(req.params.docId); res.status(204).end(); } catch (e) { next(e); }
+});
+
+app.put(
+  "/api/documents/:docId/pages/:pageId/image",
+  express.raw({ type: "image/jpeg", limit: "30mb" }),
+  async (req, res, next) => {
+    if (!store.isId(req.params.pageId) || !Buffer.isBuffer(req.body) || !req.body.length) {
+      return res.status(400).json({ error: "Send the page as image/jpeg." });
+    }
+    try {
+      const ok = await store.savePageImage(req.params.docId, req.params.pageId, req.body);
+      if (!ok) return res.status(404).json({ error: "Document not found." });
+      res.status(204).end();
+    } catch (e) { next(e); }
+  }
+);
+
+app.get("/api/documents/:docId/pages/:pageId/image", (req, res) => {
+  if (!store.isId(req.params.pageId)) return res.status(400).end();
+  res.sendFile(store.pageImagePath(req.params.docId, req.params.pageId), (err) => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
+});
+
+app.use("/api", (err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: "Server error while saving or loading the document." });
 });
 
 if (!DEMO && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
