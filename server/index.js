@@ -1,11 +1,11 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
-import Anthropic from "@anthropic-ai/sdk";
-import { transcribePage, demoPage } from "./transcribe.js";
 import { buildDocx } from "./docx.js";
 import * as store from "./store.js";
+import * as learning from "./learning.js";
 import { authRoutes, requireUser } from "./auth.js";
+import { requestReading, resumeReading } from "./jobs.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -14,7 +14,8 @@ const DEMO = process.env.DEMO_MODE === "1";
 
 app.use(express.json({ limit: "60mb" }));
 app.use(express.static(path.join(here, "..", "public")));
-app.use("/vendor/pdfjs", express.static(path.join(here, "..", "node_modules", "pdfjs-dist", "build")));
+// The "legacy" build also runs on older phones and tablets.
+app.use("/vendor/pdfjs", express.static(path.join(here, "..", "node_modules", "pdfjs-dist", "legacy", "build")));
 
 // Behind a reverse proxy (nginx, Render, etc.) set TRUST_PROXY=1 so client IPs
 // and HTTPS are detected correctly for login throttling and secure cookies.
@@ -28,44 +29,6 @@ authRoutes(app, {
 });
 // Everything else under /api needs a logged-in user.
 app.use("/api", requireUser);
-
-const MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
-
-app.post("/api/transcribe", async (req, res) => {
-  const { image } = req.body || {};
-  const match = typeof image === "string" && image.match(/^data:([^;]+);base64,(.+)$/);
-  if (!match || !MEDIA_TYPES.has(match[1])) {
-    return res.status(400).json({ error: "Send one page as a JPEG, PNG, WebP or GIF data URL." });
-  }
-  if (DEMO) return res.json({ lines: demoPage(), demo: true });
-
-  try {
-    const lines = await transcribePage(match[2], match[1]);
-    res.json({ lines });
-  } catch (error) {
-    console.error(error);
-    let message = error.message || "Transcription failed.";
-    let status = 500;
-    let code = "read_failed";
-    if (error instanceof Anthropic.AuthenticationError) {
-      message = "The server's Anthropic API key is missing or invalid.";
-      code = "api_key";
-    } else if (error instanceof Anthropic.RateLimitError) {
-      message = "Too many requests right now. Wait a minute and retry this page.";
-      status = 429;
-      code = "rate_limited";
-    } else if (error instanceof Anthropic.BadRequestError) {
-      message = `The page could not be processed: ${error.message}`;
-      status = 400;
-      code = "bad_page";
-    } else if (error instanceof Anthropic.APIError) {
-      message = `Claude API error (${error.status}). Please retry.`;
-      status = 502;
-      code = "api_error";
-    }
-    res.status(status).json({ error: message, code });
-  }
-});
 
 app.post("/api/export/docx", async (req, res) => {
   try {
@@ -91,22 +54,28 @@ app.get("/api/documents", async (req, res, next) => {
 });
 
 app.post("/api/documents", async (req, res, next) => {
-  try { res.status(201).json(await store.createDoc(req.user.id, req.body?.title)); } catch (e) { next(e); }
+  try { res.status(201).json(await store.createDoc(req.user.id, req.body || {})); } catch (e) { next(e); }
 });
 
 app.get("/api/documents/:docId", async (req, res, next) => {
   try {
     const doc = await store.getDoc(req.user.id, req.params.docId);
-    if (!doc) return res.status(404).json({ error: "Document not found." });
+    if (!doc) return res.status(404).json({ error: "Document not found.", code: "doc_not_found" });
     res.json(doc);
   } catch (e) { next(e); }
 });
 
 app.put("/api/documents/:docId", async (req, res, next) => {
   try {
+    const before = await store.getDoc(req.user.id, req.params.docId);
     const doc = await store.saveDoc(req.user.id, req.params.docId, req.body || {});
-    if (!doc) return res.status(404).json({ error: "Document not found." });
+    if (!doc) return res.status(404).json({ error: "Document not found.", code: "doc_not_found" });
     res.json({ updatedAt: doc.updatedAt });
+    // Learn from the person's corrections, after answering so saving stays quick.
+    learning
+      .moveDocExamples(req.user.id, before?.writerId, doc.writerId, doc.id)
+      .then(() => learning.learnFromDocument(req.user.id, doc.writerId, doc.id, doc.pages, (pageId) => store.readPageImage(req.user.id, doc.id, pageId)))
+      .catch((error) => console.error("Learning from corrections failed:", error));
   } catch (e) { next(e); }
 });
 
@@ -129,9 +98,71 @@ app.put(
   }
 );
 
+app.post("/api/documents/:docId/pages/:pageId/read", async (req, res, next) => {
+  if (!store.isId(req.params.pageId)) return res.status(400).json({ error: "Invalid page id." });
+  try {
+    const ok = await requestReading(req.user.id, req.params.docId, req.params.pageId);
+    if (!ok) return res.status(404).json({ error: "Page not found.", code: "doc_not_found" });
+    res.status(202).json({ status: "queued" });
+  } catch (e) { next(e); }
+});
+
 app.get("/api/documents/:docId/pages/:pageId/image", (req, res) => {
   if (!store.isId(req.params.pageId)) return res.status(400).end();
   res.sendFile(store.pageImagePath(req.user.id, req.params.docId, req.params.pageId), (err) => {
+    if (err && !res.headersSent) res.status(404).end();
+  });
+});
+
+// ---------- Handwriting profiles ----------
+
+app.param("writerId", (req, res, next, id) => {
+  if (!store.isId(id)) return res.status(400).json({ error: "Invalid writer id." });
+  next();
+});
+
+app.get("/api/writers", async (req, res, next) => {
+  try {
+    let writers = await learning.listWriters(req.user.id);
+    if (!writers.length) {
+      // Everyone starts with a profile for their own handwriting.
+      await learning.createWriter(req.user.id, req.user.username);
+      writers = await learning.listWriters(req.user.id);
+    }
+    res.json(writers);
+  } catch (e) { next(e); }
+});
+
+app.post("/api/writers", async (req, res, next) => {
+  const name = String(req.body?.name || "").trim();
+  if (!name) return res.status(400).json({ error: "Give the writer a name.", code: "writer_name" });
+  try { res.status(201).json(await learning.createWriter(req.user.id, name)); } catch (e) { next(e); }
+});
+
+app.patch("/api/writers/:writerId", async (req, res, next) => {
+  try {
+    const writer = await learning.updateWriter(req.user.id, req.params.writerId, req.body || {});
+    if (!writer) return res.status(404).json({ error: "Writer not found.", code: "writer_not_found" });
+    res.json(writer);
+  } catch (e) { next(e); }
+});
+
+app.delete("/api/writers/:writerId", async (req, res, next) => {
+  try { await learning.deleteWriter(req.user.id, req.params.writerId); res.status(204).end(); } catch (e) { next(e); }
+});
+
+app.get("/api/writers/:writerId/examples", async (req, res, next) => {
+  try { res.json(await learning.listExamples(req.user.id, req.params.writerId)); } catch (e) { next(e); }
+});
+
+app.delete("/api/writers/:writerId/examples/:exampleId", async (req, res, next) => {
+  if (!store.isId(req.params.exampleId)) return res.status(400).end();
+  try { await learning.deleteExample(req.user.id, req.params.writerId, req.params.exampleId); res.status(204).end(); } catch (e) { next(e); }
+});
+
+app.get("/api/writers/:writerId/examples/:exampleId/image", (req, res) => {
+  if (!store.isId(req.params.exampleId)) return res.status(400).end();
+  res.sendFile(learning.exampleImagePath(req.user.id, req.params.writerId, req.params.exampleId), (err) => {
     if (err && !res.headersSent) res.status(404).end();
   });
 });
@@ -145,6 +176,8 @@ if (!DEMO && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN
   console.warn("Warning: ANTHROPIC_API_KEY is not set — transcription requests will fail. Set it, or run `npm run demo` to try the interface.");
 }
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Hebrew handwriting converter running at http://localhost:${PORT}${DEMO ? " (demo mode)" : ""}`);
+  resumeReading().catch((error) => console.error("Could not resume reading:", error));
 });
+server.requestTimeout = 10 * 60 * 1000; // large page uploads on slow connections

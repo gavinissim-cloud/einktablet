@@ -1,0 +1,17 @@
+# One-click setup on Render (render.com): New → Blueprint → pick this repository.
+services:
+  - type: web
+    name: hebrew-handwriting
+    runtime: docker
+    plan: starter # a persistent disk needs a paid plan
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false # you are asked for it when creating the service
+      - key: SIGNUP_CODE
+        sync: false
+      - key: TRUST_PROXY
+        value: "1"

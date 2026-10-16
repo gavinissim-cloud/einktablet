@@ -97,6 +97,28 @@ main { padding: 12px 24px 48px; max-width: 1300px; margin: 0 auto; }
 .save-state.err { color: var(--err); }
 
 .doc-list { margin-top: 28px; }
+.list-head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+.list-head h2 { margin: 0; flex: 1; }
+.list-head button { padding: 4px 10px; font-size: 13px; }
+.list-note { color: var(--muted); font-size: 14px; margin: 4px 0 12px; max-width: 70ch; line-height: 1.5; }
+.writer-pick { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.writer-pick select, .dialog-input {
+  font: inherit; font-size: 14px; padding: 5px 8px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+}
+.dialog-input { width: 100%; font-size: 16px; padding: 8px 10px; margin-bottom: 16px; }
+.writer-name { flex: 1; margin: 0; font-size: 20px; min-width: 0; }
+.writer-panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 14px; }
+.writer-panel .list-note { margin: 8px 0 0; }
+.example-list { display: flex; flex-direction: column; gap: 8px; }
+.example {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 14px; align-items: center;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px;
+}
+.example .crop { cursor: default; }
+.example-text { font-size: 18px; min-width: 0; }
+.example-was { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.example button { padding: 4px 10px; font-size: 13px; }
 .doc-list h2 { font-size: 17px; margin: 0 0 10px; }
 .doc-item {
   display: flex; align-items: center; gap: 12px; padding: 12px 14px; margin-bottom: 8px;
@@ -177,6 +199,7 @@ button:disabled { opacity: .5; cursor: default; }
   .flag { grid-column: 1; }
   .doc { padding: 18px; }
   .doc-item { flex-wrap: wrap; }
+  .example { grid-template-columns: 1fr; }
   .top { flex-wrap: wrap; }
   .top > div:first-child { flex-basis: 100%; }
   h1 { font-size: 22px; }

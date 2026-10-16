@@ -5,7 +5,8 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "demo": "DEMO_MODE=1 node server/index.js"
+    "demo": "DEMO_MODE=1 node server/index.js",
+    "test": "node --test test/*.test.js"
   },
   "repository": {
     "type": "git",
@@ -16,10 +17,11 @@
   },
   "homepage": "https://github.com/gavinissim-cloud/einktablet#readme",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.135.0",
-    "docx": "^9.11.0",
-    "express": "^5.3.0",
-    "pdfjs-dist": "^3.11.174"
+    "@anthropic-ai/sdk": "0.130.0",
+    "docx": "9.7.1",
+    "express": "5.2.1",
+    "pdfjs-dist": "5.4.624",
+    "sharp": "0.35.5"
   },
   "private": true,
   "type": "module",

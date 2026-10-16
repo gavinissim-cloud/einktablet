@@ -5,14 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Hebrew Handwriting to Text</title>
   <link rel="stylesheet" href="styles.css">
-  <script src="vendor/pdfjs/pdf.min.js"></script>
 </head>
 <body>
   <header class="top">
     <div>
       <h1 data-i18n="appName">Hebrew Handwriting to Text</h1>
       <p class="sub" data-i18n="appSub">Turn handwritten Hebrew into editable text</p>
-      <p class="sub" id="previewNote" data-i18n="previewNote" hidden></p>
     </div>
     <div class="account">
       <span id="accountName" dir="auto" hidden></span>
@@ -41,7 +39,6 @@
           <a href="#" id="authSwitch">Sign up</a>
         </p>
       </form>
-      <p id="signedOut" class="auth-card" data-i18n="signedOut" hidden></p>
     </section>
 
     <section id="upload" hidden>
@@ -52,12 +49,30 @@
         <div class="dz-hint" data-i18n="dropHint">Image (JPG, PNG, WebP) or PDF · you can also paste an image (Ctrl+V)</div>
       </label>
       <div id="docList" class="doc-list"></div>
+      <div id="writerList" class="doc-list"></div>
+    </section>
+
+    <section id="writerView" hidden>
+      <div class="doc-bar">
+        <button id="writerBack" class="secondary" data-i18n="backHome">← My documents</button>
+        <h2 id="writerName" class="writer-name" dir="auto"></h2>
+        <button id="writerRename" class="secondary" data-i18n="rename">Rename</button>
+        <button id="writerDelete" class="secondary" data-i18n="delete">Delete</button>
+      </div>
+      <div class="writer-panel">
+        <label class="check"><input type="checkbox" id="writerLearn"> <span data-i18n="learnToggle">Learn from corrections</span></label>
+        <p id="writerSummary" class="list-note"></p>
+      </div>
+      <div id="exampleList" class="example-list"></div>
     </section>
 
     <section id="workspace" hidden>
       <div class="doc-bar">
         <button id="backHome" class="secondary" data-i18n="backHome">← My documents</button>
         <input id="docTitle" class="doc-title" dir="auto" data-i18n-aria="docTitle" data-i18n-placeholder="docTitle">
+        <label class="writer-pick"><span data-i18n="writerLabel">Handwriting of</span>
+          <select id="writerSelect"></select>
+        </label>
         <span id="saveState" class="save-state"></span>
       </div>
       <div class="toolbar">
@@ -86,6 +101,12 @@
     </div>
   </div>
 
+  <script type="module">
+    // PDF pages are drawn in the browser (pdf.js); loaded as a module, ready long before anyone drops a file.
+    import * as pdfjsLib from "./vendor/pdfjs/pdf.min.mjs";
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdfjs/pdf.worker.min.mjs";
+    window.pdfjsLib = pdfjsLib;
+  </script>
   <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>

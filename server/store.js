@@ -40,24 +40,61 @@ async function readDoc(userId, id) {
 const num = (n) => (Number.isFinite(n) ? Math.min(1000, Math.max(0, Math.round(n))) : undefined);
 const str = (s, max) => (typeof s === "string" ? s.slice(0, max) : "");
 
-function cleanPages(pages) {
-  if (!Array.isArray(pages)) return [];
-  return pages
+// Page status: "new" (not read yet), "queued", "working", "done" or "error".
+// The server alone sets status; reading results arrive with a higher readRev.
+export const BUSY = new Set(["queued", "working"]);
+
+const cleanLines = (lines) =>
+  (Array.isArray(lines) ? lines : []).slice(0, 500).map((l) => ({
+    text: str(l?.text, 5000),
+    // What Claude first read, so corrections can be learned from.
+    ai: typeof l?.ai === "string" ? str(l.ai, 5000) : undefined,
+    top: num(l?.top),
+    bottom: num(l?.bottom),
+    left: num(l?.left),
+    right: num(l?.right),
+    unclear: Array.isArray(l?.unclear) ? l.unclear.filter((w) => typeof w === "string").slice(0, 50) : [],
+  }));
+
+/**
+ * Merge the pages the browser sends with what the server knows. The browser
+ * owns names, order and edited text; the server owns reading status, and its
+ * results win while a page is being read or when they are newer.
+ */
+function mergePages(serverPages, clientPages) {
+  if (!Array.isArray(clientPages)) return serverPages;
+  const byId = new Map(serverPages.map((p) => [p.id, p]));
+  return clientPages
     .filter((p) => p && isId(p.id))
-    .map((p) => ({
-      id: p.id,
-      name: str(p.name, 300),
-      status: ["queued", "working", "done", "error"].includes(p.status) ? p.status : "queued",
-      error: p.status === "error" ? str(p.error, 500) : undefined,
-      lines: (Array.isArray(p.lines) ? p.lines : []).map((l) => ({
-        text: str(l?.text, 5000),
-        top: num(l?.top),
-        bottom: num(l?.bottom),
-        left: num(l?.left),
-        right: num(l?.right),
-        unclear: Array.isArray(l?.unclear) ? l.unclear.filter((w) => typeof w === "string").slice(0, 50) : [],
-      })),
-    }));
+    .slice(0, 300)
+    .map((p) => {
+      const server = byId.get(p.id);
+      const base = { id: p.id, name: str(p.name, 300) };
+      if (!server) return { ...base, status: "new", readRev: 0, lines: [] };
+      const serverWins = BUSY.has(server.status) || (server.readRev || 0) > (Number(p.readRev) || 0);
+      return {
+        ...server,
+        ...base,
+        lines: serverWins ? server.lines : cleanLines(p.lines),
+      };
+    });
+}
+
+// One change at a time per document: browser saves and reading results.
+const docLocks = new Map();
+function withDoc(userId, id, fn) {
+  const key = `${userId}/${id}`;
+  const run = (docLocks.get(key) || Promise.resolve()).then(async () => {
+    const doc = await readDoc(userId, id);
+    if (!doc) return null;
+    const result = await fn(doc);
+    if (result === false) return doc; // nothing to write
+    doc.updatedAt = new Date().toISOString();
+    await writeAtomic(path.join(docDir(userId, id), "doc.json"), JSON.stringify(doc));
+    return doc;
+  });
+  docLocks.set(key, run.catch(() => {}));
+  return run;
 }
 
 export async function listDocs(userId) {
@@ -73,14 +110,14 @@ export async function listDocs(userId) {
   );
   return docs
     .filter(Boolean)
-    .map((d) => ({ id: d.id, title: d.title, createdAt: d.createdAt, updatedAt: d.updatedAt, pageCount: d.pages.length }))
+    .map((d) => ({ id: d.id, title: d.title, writerId: d.writerId, createdAt: d.createdAt, updatedAt: d.updatedAt, pageCount: d.pages.length }))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-export async function createDoc(userId, title) {
+export async function createDoc(userId, { title, writerId } = {}) {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  const doc = { id, title: str(title, 200), createdAt: now, updatedAt: now, pages: [] };
+  const doc = { id, title: str(title, 200), writerId: isId(writerId) ? writerId : null, createdAt: now, updatedAt: now, pages: [] };
   await fs.mkdir(docDir(userId, id), { recursive: true });
   await writeAtomic(path.join(docDir(userId, id), "doc.json"), JSON.stringify(doc));
   return doc;
@@ -88,14 +125,62 @@ export async function createDoc(userId, title) {
 
 export const getDoc = readDoc;
 
-export async function saveDoc(userId, id, { title, pages }) {
-  const doc = await readDoc(userId, id);
-  if (!doc) return null;
-  if (typeof title === "string") doc.title = str(title, 200);
-  if (pages !== undefined) doc.pages = cleanPages(pages);
-  doc.updatedAt = new Date().toISOString();
-  await writeAtomic(path.join(docDir(userId, id), "doc.json"), JSON.stringify(doc));
-  return doc;
+export function saveDoc(userId, id, { title, writerId, pages }) {
+  return withDoc(userId, id, (doc) => {
+    if (typeof title === "string") doc.title = str(title, 200);
+    if (writerId === null || isId(writerId)) doc.writerId = writerId;
+    doc.pages = mergePages(doc.pages, pages);
+  });
+}
+
+/** Change one page's reading state (status, progress, error). */
+export function updatePage(userId, id, pageId, patch) {
+  return withDoc(userId, id, (doc) => {
+    const page = doc.pages.find((p) => p.id === pageId);
+    if (!page) return false;
+    Object.assign(page, patch);
+  });
+}
+
+/** Store a finished reading: it replaces the page's lines. */
+export function finishReading(userId, id, pageId, lines) {
+  return withDoc(userId, id, (doc) => {
+    const page = doc.pages.find((p) => p.id === pageId);
+    if (!page) return false;
+    page.lines = cleanLines(lines.map((l) => ({ ...l, ai: l.text })));
+    page.status = "done";
+    page.readRev = (page.readRev || 0) + 1;
+    delete page.progress;
+    delete page.error;
+    delete page.errorCode;
+  });
+}
+
+/** Every page left queued or being read (for picking up after a restart). */
+export async function busyPages() {
+  const out = [];
+  let users;
+  try {
+    users = await fs.readdir(path.join(DATA_DIR, "docs"), { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const u of users.filter((e) => e.isDirectory() && isId(e.name))) {
+    for (const d of await listDocs(u.name)) {
+      const doc = await readDoc(u.name, d.id);
+      for (const p of doc?.pages || []) if (BUSY.has(p.status)) out.push({ userId: u.name, docId: d.id, pageId: p.id });
+    }
+  }
+  return out;
+}
+
+export async function readPageImage(userId, id, pageId) {
+  try {
+    return await fs.readFile(pageImagePath(userId, id, pageId));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
 }
 
 export async function deleteDoc(userId, id) {

@@ -1,39 +1,42 @@
 "use strict";
 
-// Long edge of each page image sent for reading. Large enough to keep small
-// handwriting legible, small enough to stay inside the API's image limits.
-const MAX_EDGE = 2400;
-const CONCURRENCY = 2;
+// Long edge of each stored page image. The server shows Claude the whole page
+// and full-resolution close-ups of it, so keep as much detail as phones give.
+const MAX_EDGE = 4000;
+const POLL_MS = 2500;
 
-if (window.pdfjsLib) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdfjs/pdf.worker.min.js";
-}
-
-const state = { user: null, doc: null, view: "lines" };
+const state = { user: null, doc: null, view: "lines", writers: [] };
 const $ = (sel) => document.querySelector(sel);
 const currentPages = () => state.doc?.pages || [];
 
-// An embedding page (the hosted preview) can supply its own storage, reading
-// and downloads by defining window.HW_BACKEND before this script runs.
-const backend = window.HW_BACKEND || null;
-
 // ---------- In-page dialogs (instead of the browser's alert/confirm) ----------
 
-function dialog(message, { okLabel = t("ok"), cancelLabel = null, danger = false } = {}) {
+function dialog(message, { okLabel = t("ok"), cancelLabel = null, danger = false, input = null } = {}) {
   return new Promise((resolve) => {
     const prev = document.activeElement;
     const wrap = document.createElement("div");
     wrap.className = "dialog-wrap";
-    wrap.innerHTML = '<div class="dialog" role="alertdialog" aria-modal="true"><p class="dialog-msg"></p><div class="dialog-actions"></div></div>';
+    wrap.innerHTML = '<form class="dialog" role="alertdialog" aria-modal="true"><p class="dialog-msg"></p><div class="dialog-actions"></div></form>';
     wrap.querySelector(".dialog-msg").textContent = message;
+    const form = wrap.querySelector("form");
+    let field = null;
+    if (input !== null) {
+      field = document.createElement("input");
+      field.className = "dialog-input";
+      field.dir = "auto";
+      field.value = input;
+      form.insertBefore(field, form.querySelector(".dialog-actions"));
+    }
     const actions = wrap.querySelector(".dialog-actions");
-    const close = (value) => {
+    const close = (ok) => {
       wrap.remove();
       document.removeEventListener("keydown", onKey, true);
       prev?.focus?.();
-      resolve(value);
+      resolve(field ? (ok ? field.value.trim() : null) : ok);
     };
-    const ok = button(okLabel, danger ? "danger" : "", () => close(true));
+    const ok = button(okLabel, danger ? "danger" : "", () => {});
+    ok.type = "submit";
+    form.addEventListener("submit", (e) => { e.preventDefault(); close(true); });
     actions.append(ok);
     if (cancelLabel) actions.append(button(cancelLabel, "secondary", () => close(false)));
     const onKey = (e) => {
@@ -42,21 +45,15 @@ function dialog(message, { okLabel = t("ok"), cancelLabel = null, danger = false
     document.addEventListener("keydown", onKey, true);
     wrap.addEventListener("click", (e) => { if (e.target === wrap) close(false); });
     document.body.append(wrap);
-    ok.focus();
+    (field || ok).focus();
   });
 }
 const notify = (message) => dialog(message);
 const ask = (message, okLabel = t("yes"), opts = {}) => dialog(message, { okLabel, cancelLabel: t("cancel"), ...opts });
+/** Ask for a short text; resolves with it, or null when cancelled. */
+const askText = (message, value = "", okLabel = t("ok")) => dialog(message, { okLabel, cancelLabel: t("cancel"), input: value });
 
 async function api(method, url, body, headers = { "Content-Type": "application/json" }) {
-  if (backend) {
-    try {
-      return await backend.request(method, url, body);
-    } catch (err) {
-      if (err.status === 401 && !url.startsWith("/api/auth/")) showAuth();
-      throw err;
-    }
-  }
   const res = await fetch(url, {
     method,
     headers: body === undefined ? undefined : headers,
@@ -112,7 +109,7 @@ async function addFiles(files) {
   let doc = state.doc;
   if (!doc) {
     try {
-      const created = await api("POST", "/api/documents", { title: accepted[0].name.replace(/\.[^.]+$/, "") });
+      const created = await api("POST", "/api/documents", { title: accepted[0].name.replace(/\.[^.]+$/, ""), writerId: defaultWriterId() });
       doc = adoptDoc(created, []);
     } catch (err) {
       return notify(t("createFailed", { msg: errText(err) }));
@@ -127,15 +124,18 @@ async function addFiles(files) {
           id: crypto.randomUUID(),
           name: canvases.length > 1 ? t("pageOfFile", { file: file.name, n: i + 1 }) : file.name,
           canvas,
-          status: "queued",
+          status: "new",
+          readRev: 0,
           lines: [],
         };
         const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
         await api("PUT", `/api/documents/${doc.id}/pages/${page.id}/image`, blob, { "Content-Type": "image/jpeg" });
         page.src = pageImageUrl(doc, page);
         doc.pages.push(page);
-        scheduleSave(doc);
-        if (doc === state.doc) { render(); pump(); }
+        if (doc === state.doc) render();
+        // The server must know the page before it can read it.
+        await saveNow(doc);
+        await requestRead(doc, page);
       }
     } catch (err) {
       console.error(err);
@@ -164,7 +164,8 @@ async function imageToCanvas(file) {
 
 async function pdfToCanvases(file) {
   if (!window.pdfjsLib) throw new Error("PDF reader failed to load");
-  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+  // isEvalSupported: false keeps a crafted PDF from running code (defence in depth).
+  const pdf = await window.pdfjsLib.getDocument({ data: await file.arrayBuffer(), isEvalSupported: false }).promise;
   const out = [];
   for (let n = 1; n <= pdf.numPages; n++) {
     const page = await pdf.getPage(n);
@@ -185,22 +186,21 @@ async function pdfToCanvases(file) {
 
 // ---------- Saved documents ----------
 
-const pageImageUrl = (doc, page) =>
-  backend ? backend.pageImageUrl(doc, page) : `/api/documents/${doc.id}/pages/${page.id}/image`;
+const pageImageUrl = (doc, page) => `/api/documents/${doc.id}/pages/${page.id}/image`;
 
 function adoptDoc(data, pages) {
-  return { id: data.id, title: data.title, pages, timer: null, saving: false, dirty: false, failed: false };
+  return { id: data.id, title: data.title, writerId: data.writerId || null, pages, timer: null, saving: false, dirty: false, failed: false };
 }
 
 function serialize(doc) {
   return {
     title: doc.title,
+    writerId: doc.writerId,
     pages: doc.pages.map((p) => ({
       id: p.id,
       name: p.name,
-      status: p.status,
-      error: p.error,
-      lines: p.lines.map(({ text, top, bottom, left, right, unclear }) => ({ text, top, bottom, left, right, unclear })),
+      readRev: p.readRev || 0,
+      lines: p.lines.map(({ text, ai, top, bottom, left, right, unclear }) => ({ text, ai, top, bottom, left, right, unclear })),
     })),
   };
 }
@@ -238,6 +238,15 @@ async function flushSave(doc) {
 }
 
 const hasUnsaved = (doc) => doc && (doc.dirty || doc.saving);
+
+/** Save now and wait until no save is pending (or about ten seconds pass). */
+async function saveNow(doc) {
+  doc.dirty = true;
+  for (let i = 0; i < 50 && hasUnsaved(doc); i++) {
+    await flushSave(doc);
+    if (hasUnsaved(doc)) await new Promise((r) => setTimeout(r, 200));
+  }
+}
 
 function updateSaveState() {
   const el = $("#saveState");
@@ -283,25 +292,17 @@ async function loadDoc(id) {
   doc.pages = await Promise.all(
     data.pages.map(async (p) => {
       const page = { ...p, src: pageImageUrl(doc, p) };
-      // A reading that was cut off (page closed mid-way) starts again.
-      if (page.status === "working") page.status = "queued";
       try {
-        if (!page.src) throw new Error("no image");
         page.canvas = await loadCanvas(page.src);
-        page.lines = page.lines.map((l) => (l.top == null ? l : { ...l, ...cropLine(page.canvas, l) }));
+        page.lines = withCrops(page, page.lines);
       } catch {
         page.canvas = null;
-        if (page.status !== "done") {
-          page.status = "error";
-          page.error = t("imageMissing");
-        }
       }
       return page;
     })
   );
   if (location.hash !== `#doc=${id}`) return; // the user navigated away while loading
   showDoc(doc);
-  pump();
 }
 
 function showDoc(doc) {
@@ -309,8 +310,11 @@ function showDoc(doc) {
   state.doc = doc;
   if (location.hash !== `#doc=${doc.id}`) history.pushState(null, "", `#doc=${doc.id}`);
   $("#upload").hidden = true;
+  $("#writerView").hidden = true;
   $("#workspace").hidden = false;
   $("#docTitle").value = doc.title;
+  renderWriterSelect();
+  watchReading();
   document.title = `${doc.title || t("untitled")} — ${t("appName")}`;
   render();
   updateSaveState();
@@ -323,8 +327,9 @@ async function showHome() {
   document.title = t("appName");
   $("#upload").hidden = false;
   $("#workspace").hidden = true;
+  $("#writerView").hidden = true;
   $("#pages").innerHTML = "";
-  await renderDocList();
+  await Promise.all([renderDocList(), renderWriterList()]);
 }
 
 async function renderDocList() {
@@ -369,9 +374,11 @@ function escapeHtml(s) {
 
 function route() {
   if (!state.user) return;
+  const writerId = location.hash.match(/^#writer=([A-Za-z0-9-]+)$/)?.[1];
+  if (writerId) return showWriter(writerId);
   const id = location.hash.match(/^#doc=([A-Za-z0-9-]+)$/)?.[1];
   if (!id) return showHome();
-  if (state.doc?.id !== id) openDoc(id);
+  if (state.doc?.id !== id || $("#workspace").hidden) openDoc(id);
 }
 window.addEventListener("popstate", route);
 window.addEventListener("hashchange", route);
@@ -404,19 +411,12 @@ function setAuthMode(mode) {
 function showAuth() {
   $("#accountName").hidden = true;
   $("#logout").hidden = true;
-  if (backend?.externalAuth) {
-    // The preview signs in through claude.ai, so there is no form to show.
-    $("#upload").hidden = true;
-    $("#workspace").hidden = true;
-    $("#authForm").hidden = true;
-    $("#signedOut").hidden = false;
-    $("#auth").hidden = false;
-    return;
-  }
   state.user = null;
   state.doc = null;
+  state.writers = [];
   $("#upload").hidden = true;
   $("#workspace").hidden = true;
+  $("#writerView").hidden = true;
   $("#pages").innerHTML = "";
   $("#docList").innerHTML = "";
   $("#auth").hidden = false;
@@ -428,10 +428,10 @@ function signedIn(user) {
   $("#auth").hidden = true;
   $("#accountName").hidden = false;
   $("#accountName").textContent = user.username || t("myAccount");
-  $("#logout").hidden = Boolean(backend?.externalAuth);
+  $("#logout").hidden = false;
   $("#authPass").value = "";
   $("#authCode").value = "";
-  route();
+  loadWriters().finally(route);
 }
 
 $("#authSwitch").addEventListener("click", (e) => {
@@ -480,40 +480,63 @@ async function start() {
   }
 }
 
-// ---------- Transcription queue ----------
+// ---------- Reading (done by the server) ----------
 
-let running = 0;
-function pump() {
-  const doc = state.doc;
-  while (doc && running < CONCURRENCY) {
-    const page = doc.pages.find((p) => p.status === "queued" && p.canvas);
-    if (!page) break;
-    running++;
-    transcribe(page, doc).finally(() => { running--; pump(); });
-  }
-  updateStatus();
-}
-
-async function transcribe(page, doc) {
-  page.status = "working";
-  page.error = undefined;
-  renderPage(page);
-  scheduleSave(doc);
+/** Ask the server to read a page; it keeps going even if this tab closes. */
+async function requestRead(doc, page) {
   try {
-    const data = await api("POST", "/api/transcribe", { image: page.canvas.toDataURL("image/jpeg", 0.92) });
-    page.lines = data.lines.map((l) => ({ ...l, ...cropLine(page.canvas, l) }));
-    page.status = "done";
+    await api("POST", `/api/documents/${doc.id}/pages/${page.id}/read`, {});
+    page.status = "queued";
+    page.error = null;
   } catch (err) {
     page.status = "error";
-    page.error = err.message;
+    page.error = errText(err);
   }
-  // The page may have been removed while it was being read.
-  if (!doc.pages.includes(page)) return;
-  scheduleSave(doc);
   if (doc === state.doc) {
     renderPage(page);
     updateStatus();
+    watchReading();
   }
+}
+
+const isBusy = (p) => p.status === "queued" || p.status === "working";
+let pollTimer = null;
+
+/** While pages are being read, check the server for progress and results. */
+function watchReading() {
+  clearTimeout(pollTimer);
+  if (!state.doc?.pages.some(isBusy)) return;
+  const doc = state.doc;
+  pollTimer = setTimeout(async () => {
+    if (doc !== state.doc) return;
+    try {
+      const fresh = await api("GET", `/api/documents/${doc.id}`);
+      if (doc !== state.doc) return;
+      const byId = new Map(fresh.pages.map((p) => [p.id, p]));
+      for (const page of doc.pages) {
+        const server = byId.get(page.id);
+        if (!server) continue;
+        const newer = (server.readRev || 0) > (page.readRev || 0);
+        const changed = newer || server.status !== page.status || JSON.stringify(server.progress) !== JSON.stringify(page.progress);
+        Object.assign(page, { status: server.status, progress: server.progress, error: server.error, errorCode: server.errorCode });
+        if (newer) {
+          page.readRev = server.readRev;
+          page.lines = withCrops(page, server.lines);
+        }
+        if (changed) renderPage(page);
+      }
+      updateStatus();
+    } catch (err) {
+      console.error(err);
+    }
+    watchReading();
+  }, POLL_MS);
+}
+
+/** Add the handwriting image of each line, cut from the page. */
+function withCrops(page, lines) {
+  if (!page.canvas) return lines;
+  return lines.map((l) => (l.top == null ? l : { ...l, ...cropLine(page.canvas, l) }));
 }
 
 /** Cut the handwriting for one line out of the page image. */
@@ -576,23 +599,27 @@ function renderPage(page) {
 
   if (page.src) head.append(button(t("viewPage"), "secondary", () => openLightbox(page)));
 
+  if (page.status === "new") st.textContent = t("notRead");
   if (page.status === "queued") st.textContent = t("queued");
-  if (page.status === "working") st.innerHTML = `<span class="spinner"></span>${escapeHtml(t("reading"))}`;
+  if (page.status === "working") {
+    const step = page.progress?.step || 0;
+    const label = step ? t("readStep", { step, of: page.progress.of, what: t(`step${step}`) }) : t("reading");
+    st.innerHTML = `<span class="spinner"></span>${escapeHtml(label)}`;
+  }
   if (page.status === "error") {
     st.classList.add("err");
-    st.textContent = t("errorPrefix", { msg: page.error });
+    st.textContent = t("errorPrefix", { msg: errText({ code: page.errorCode, message: page.error }) });
   }
   if (page.status === "done") {
     const n = page.lines.filter((l) => l.unclear.length).length;
     st.textContent = t("linesCount", { n: page.lines.length }) + (n ? ` · ${t("toCheck", { n })}` : "");
   }
-  if (page.status === "done" || page.status === "error") {
-    head.append(button(t("reread"), "secondary", async () => {
+  if (!isBusy(page) && page.canvas) {
+    head.append(button(page.status === "new" ? t("read") : t("reread"), "secondary", async () => {
       if (page.status === "done" && !(await ask(t("rereadConfirm"), t("reread")))) return;
-      page.status = "queued";
-      renderPage(page);
-      scheduleSave(state.doc);
-      pump();
+      const doc = state.doc;
+      await flushSave(doc);
+      await requestRead(doc, page);
     }));
   }
   head.append(button(t("remove"), "secondary", async () => {
@@ -718,7 +745,7 @@ function updateStatus() {
   const pages = currentPages();
   const total = pages.length;
   const done = pages.filter((p) => p.status === "done").length;
-  const working = pages.filter((p) => p.status === "working" || p.status === "queued").length;
+  const working = pages.filter(isBusy).length;
   const errors = pages.filter((p) => p.status === "error").length;
   let text = t("pagesReady", { done, total });
   if (working) text += ` · ${t("working")}`;
@@ -767,7 +794,6 @@ function plainText() {
 }
 
 function download(blob, name) {
-  if (backend?.download) return backend.download(blob, name);
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = name;
@@ -817,11 +843,12 @@ $("#exportDocx").addEventListener("click", (e) => exportDocx(false, e.currentTar
 $("#exportDocxImages").addEventListener("click", (e) => exportDocx(true, e.currentTarget));
 
 // Leaving the page: start any pending save now, and warn while one is still in flight.
+// (Reading carries on at the server, so it needs no warning.)
 window.addEventListener("beforeunload", (e) => {
   const doc = state.doc;
   if (!doc) return;
   if (doc.dirty && !doc.saving) flushSave(doc);
-  if (hasUnsaved(doc) || running > 0) e.preventDefault();
+  if (hasUnsaved(doc)) e.preventDefault();
 });
 
 window.addEventListener("resize", () => {
@@ -829,6 +856,169 @@ window.addEventListener("resize", () => {
     t.style.height = "auto";
     t.style.height = `${t.scrollHeight + 2}px`;
   });
+});
+
+// ---------- Handwriting profiles ----------
+
+async function loadWriters() {
+  try {
+    state.writers = await api("GET", "/api/writers");
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+const writerName = (w) => w?.name || t("untitledWriter");
+
+/** The writer for a new document: the one used last, else the first. */
+function defaultWriterId() {
+  let last = null;
+  try { last = localStorage.getItem("hw_writer"); } catch {}
+  return (state.writers.find((w) => w.id === last) || state.writers[0])?.id || null;
+}
+
+function rememberWriter(id) {
+  try { localStorage.setItem("hw_writer", id); } catch {}
+}
+
+async function newWriter() {
+  const name = await askText(t("newWriterPrompt"), "", t("create"));
+  if (!name) return null;
+  try {
+    const writer = await api("POST", "/api/writers", { name });
+    await loadWriters();
+    return writer;
+  } catch (err) {
+    notify(errText(err));
+    return null;
+  }
+}
+
+function renderWriterSelect() {
+  const select = $("#writerSelect");
+  const doc = state.doc;
+  if (!doc) return;
+  select.innerHTML = "";
+  for (const w of state.writers) select.add(new Option(writerName(w), w.id));
+  select.add(new Option(t("noWriter"), ""));
+  select.add(new Option(t("newWriterOption"), "__new"));
+  select.value = state.writers.some((w) => w.id === doc.writerId) ? doc.writerId : "";
+}
+
+$("#writerSelect").addEventListener("change", async () => {
+  const doc = state.doc;
+  if (!doc) return;
+  let id = $("#writerSelect").value;
+  if (id === "__new") id = (await newWriter())?.id ?? doc.writerId ?? "";
+  doc.writerId = id || null;
+  if (id) rememberWriter(id);
+  renderWriterSelect();
+  scheduleSave(doc);
+});
+
+async function renderWriterList() {
+  const list = $("#writerList");
+  await loadWriters();
+  list.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "list-head";
+  head.innerHTML = `<h2>${escapeHtml(t("profiles"))}</h2>`;
+  head.append(button(t("newWriter"), "secondary", async () => { if (await newWriter()) renderWriterList(); }));
+  list.append(head);
+  const note = document.createElement("p");
+  note.className = "list-note";
+  note.textContent = t("profilesNote");
+  list.append(note);
+  for (const w of state.writers) {
+    const item = document.createElement("div");
+    item.className = "doc-item";
+    const link = document.createElement("a");
+    link.href = `#writer=${w.id}`;
+    link.textContent = writerName(w);
+    link.dir = "auto";
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = t("learnedCount", { n: w.exampleCount }) + (w.learn ? "" : ` · ${t("learningOff")}`);
+    item.append(link, meta);
+    list.append(item);
+  }
+}
+
+async function showWriter(writerId) {
+  if (state.doc) flushSave(state.doc);
+  state.doc = null;
+  await loadWriters();
+  const writer = state.writers.find((w) => w.id === writerId);
+  if (!writer) return showHome();
+  let examples = [];
+  try {
+    examples = await api("GET", `/api/writers/${writerId}/examples`);
+  } catch (err) {
+    notify(errText(err));
+  }
+  $("#upload").hidden = true;
+  $("#workspace").hidden = true;
+  $("#writerView").hidden = false;
+  document.title = `${writerName(writer)} — ${t("appName")}`;
+  $("#writerName").textContent = writerName(writer);
+  $("#writerLearn").checked = writer.learn;
+  $("#writerSummary").textContent = t("writerSummary", { n: examples.length });
+  $("#writerView").dataset.id = writerId;
+
+  const list = $("#exampleList");
+  list.innerHTML = "";
+  if (!examples.length) list.innerHTML = `<p class="list-note">${escapeHtml(t("noExamples"))}</p>`;
+  for (const e of examples) {
+    const row = document.createElement("div");
+    row.className = "example";
+    const img = document.createElement("img");
+    img.className = "crop";
+    img.loading = "lazy";
+    img.src = `/api/writers/${writerId}/examples/${e.id}/image`;
+    img.alt = e.text;
+    const text = document.createElement("div");
+    text.className = "example-text";
+    const right = document.createElement("div");
+    right.dir = "rtl";
+    right.lang = "he";
+    right.textContent = e.text;
+    const was = document.createElement("div");
+    was.className = "example-was";
+    was.append(`${t("misreadAs")} `);
+    const wasText = document.createElement("span");
+    wasText.dir = "rtl";
+    wasText.lang = "he";
+    wasText.textContent = e.ai;
+    was.append(wasText);
+    text.append(right, was);
+    row.append(img, text, button(t("forget"), "secondary", async () => {
+      await api("DELETE", `/api/writers/${writerId}/examples/${e.id}`).catch((err) => notify(errText(err)));
+      showWriter(writerId);
+    }));
+    list.append(row);
+  }
+}
+
+$("#writerBack").addEventListener("click", showHome);
+$("#writerLearn").addEventListener("change", async () => {
+  const id = $("#writerView").dataset.id;
+  await api("PATCH", `/api/writers/${id}`, { learn: $("#writerLearn").checked }).catch((err) => notify(errText(err)));
+  await loadWriters();
+});
+$("#writerRename").addEventListener("click", async () => {
+  const id = $("#writerView").dataset.id;
+  const writer = state.writers.find((w) => w.id === id);
+  const name = await askText(t("renameWriterPrompt"), writer?.name || "", t("save"));
+  if (!name) return;
+  await api("PATCH", `/api/writers/${id}`, { name }).catch((err) => notify(errText(err)));
+  showWriter(id);
+});
+$("#writerDelete").addEventListener("click", async () => {
+  const id = $("#writerView").dataset.id;
+  const writer = state.writers.find((w) => w.id === id);
+  if (!(await ask(t("deleteWriterConfirm", { name: writerName(writer) }), t("delete"), { danger: true }))) return;
+  await api("DELETE", `/api/writers/${id}`).catch((err) => notify(errText(err)));
+  showHome();
 });
 
 // ---------- Interface language ----------
@@ -840,9 +1030,10 @@ $("#langSwitch").addEventListener("click", () => {
     document.title = `${state.doc.title || t("untitled")} — ${t("appName")}`;
     render();
     updateSaveState();
+    renderWriterSelect();
   } else {
     document.title = t("appName");
-    if (state.user) renderDocList();
+    if (state.user) route();
   }
   if (state.user) $("#accountName").textContent = state.user.username || t("myAccount");
 });
