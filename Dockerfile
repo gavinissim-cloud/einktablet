@@ -14,7 +14,10 @@ RUN python3 -m venv /opt/ocr \
 # The base model, base.pt, is not included: train it with ocr/train_base.ipynb and
 # put it on the data disk (see OCR_BASE_MODEL below and the README).
 COPY ocr/fetch_models.py ocr/build_stats.py /app/ocr/
-RUN /opt/ocr/bin/python /app/ocr/fetch_models.py /opt/models
+# If this fails (for example, too little memory on a free build machine), the site
+# still works with Gemini; the app's own engine needs this data later.
+RUN /opt/ocr/bin/python /app/ocr/fetch_models.py /opt/models \
+ || echo "Engine data was not built; reading uses Gemini only. Rebuild on a larger machine for the app's engine."
 
 WORKDIR /app
 COPY package.json package-lock.json ./
