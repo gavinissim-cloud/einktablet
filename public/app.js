@@ -618,12 +618,14 @@ function renderPage(page) {
   if (page.status === "queued") st.textContent = t("queued");
   if (page.status === "working") {
     const step = page.progress?.step || 0;
-    const label = step ? t("readStep", { step, of: page.progress.of, what: t(`step${step}`) }) : t("reading");
+    const what = page.progress?.what ? t(`step_${page.progress.what}`) : t(`step${step}`);
+    const label = step ? t("readStep", { step, of: page.progress.of, what }) : t("reading");
     st.innerHTML = `<span class="spinner"></span>${escapeHtml(label)}`;
   }
   if (page.status === "error") {
     st.classList.add("err");
-    st.textContent = t("errorPrefix", { msg: errText({ code: page.errorCode, message: page.error }) });
+    st.textContent = t("errorPrefix", { msg: errText({ code: page.errorCode, message: page.error }) })
+      + (page.errorCode === "read_failed" && page.error ? ` (${page.error})` : "");
   }
   if (page.status === "done") {
     const n = page.lines.filter((l) => l.unclear.length).length;

@@ -10,11 +10,17 @@ const MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const PASSES = Math.min(2, Math.max(1, Number(process.env.GEMINI_PASSES || 2)));
 const THINKING = process.env.GEMINI_THINKING || "HIGH"; // MINIMAL | LOW | MEDIUM | HIGH | off
 const EXAMPLES = Number(process.env.GEMINI_EXAMPLES || 24); // learned lines shown per request
+const TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT || 300) * 1000; // per request
 
 export const geminiEnabled = () => Boolean(process.env.GEMINI_API_KEY);
 
 let client;
-const ai = () => (client ??= new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }));
+// Busy (429) and server errors (5xx) are retried a few times, with growing waits.
+const ai = () =>
+  (client ??= new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: { retryOptions: { attempts: 3 } },
+  }));
 
 export class GeminiError extends Error {
   constructor(code, message) {
@@ -107,7 +113,30 @@ function errorFor(error) {
     if (error.status === 400) return new GeminiError("bad_page", `Gemini could not process the page: ${error.message}`);
     return new GeminiError("api_error", `Gemini error (${error.status}).`);
   }
+  if (/abort|timeout|timed out/i.test(`${error.name} ${error.message}`)) {
+    return new GeminiError("timeout", `Gemini took longer than ${TIMEOUT_MS / 1000} seconds.`);
+  }
   return new GeminiError("read_failed", error.message || "Reading failed.");
+}
+
+/** One Gemini request, given up after TIMEOUT_MS (retries included). */
+async function generate(request) {
+  const controller = new AbortController();
+  let timer;
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new GeminiError("timeout", `Gemini took longer than ${TIMEOUT_MS / 1000} seconds.`));
+    }, TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([
+      ai().models.generateContent({ ...request, config: { ...request.config, abortSignal: controller.signal } }),
+      expired,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function ask(parts) {
@@ -119,12 +148,12 @@ async function ask(parts) {
   if (THINKING !== "off") config.thinkingConfig = { thinkingLevel: THINKING };
   let response;
   try {
-    response = await ai().models.generateContent({ model: MODEL, contents: [{ role: "user", parts }], config });
+    response = await generate({ model: MODEL, contents: [{ role: "user", parts }], config });
   } catch (error) {
     // Some models take no thinking setting; ask once more without it.
     if (error instanceof ApiError && error.status === 400 && config.thinkingConfig && /think/i.test(error.message)) {
       delete config.thinkingConfig;
-      response = await ai().models.generateContent({ model: MODEL, contents: [{ role: "user", parts }], config });
+      response = await generate({ model: MODEL, contents: [{ role: "user", parts }], config });
     } else {
       throw error;
     }
@@ -133,9 +162,11 @@ async function ask(parts) {
   if (reason && !["STOP", "FINISH_REASON_UNSPECIFIED"].includes(reason)) {
     throw new GeminiError(reason === "MAX_TOKENS" ? "page_too_long" : "refused", `Gemini stopped: ${reason}.`);
   }
+  const text = response.text;
+  if (!text) throw new GeminiError("read_failed", `Gemini gave no answer (${reason || "no reason given"}).`);
   let data;
   try {
-    data = JSON.parse(response.text);
+    data = JSON.parse(text);
   } catch {
     throw new GeminiError("read_failed", "Gemini's answer could not be read.");
   }
@@ -151,20 +182,24 @@ export async function readPageGemini(image, { learning = null, onProgress = () =
   try {
     const page = createPartFromBase64(image.toString("base64"), "image/jpeg", PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH);
     const known = learnedParts(learning);
-    onProgress(1, PASSES);
+    onProgress(1, PASSES, "read");
     let lines = await ask([...known, page, { text: "Transcribe all the handwriting on this page." }]);
     if (PASSES > 1 && lines.length) {
-      onProgress(2, PASSES);
+      onProgress(2, PASSES, "check");
       const draft = lines
         .map((l, i) => `${i + 1}. [top ${l.top}, bottom ${l.bottom}, left ${l.left}, right ${l.right}] ${l.text}`)
         .join("\n");
+      // If the proofread fails, the first reading is still a good result.
       const checked = await ask([
         ...known,
         page,
         {
           text: `Below is a draft transcription of this page. It may contain misread letters, words read only partly, missed or extra lines, missing punctuation (״ ׳ ־ parentheses, dashes) or inaccurate line boxes.\n\nProofread it against the handwriting: go through the image line by line and word by word, compare every word with the pen strokes, and return the corrected full transcription. Keep what the draft got right; fix everything it got wrong.\n\nDraft:\n${draft}`,
         },
-      ]);
+      ]).catch((error) => {
+        console.error("Gemini proofread failed, keeping the first reading:", error.message);
+        return [];
+      });
       if (checked.length) lines = checked;
     }
     return lines;

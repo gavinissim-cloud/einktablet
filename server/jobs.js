@@ -72,7 +72,8 @@ function errorInfo(error) {
 }
 
 async function run({ userId, docId, pageId }) {
-  const progress = (step, of) => store.updatePage(userId, docId, pageId, { status: "working", progress: { step, of } }).catch(() => {});
+  const progress = (step, of, what) =>
+    store.updatePage(userId, docId, pageId, { status: "working", progress: what ? { step, of, what } : { step, of } }).catch(() => {});
   try {
     const doc = await store.getDoc(userId, docId);
     if (!doc?.pages.some((p) => p.id === pageId)) return; // removed meanwhile
