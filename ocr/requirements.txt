@@ -1,0 +1,11 @@
+# Python packages for the reading engine. heb-ocr itself is installed separately,
+# without its training-from-scratch extras:
+#   pip install -r ocr/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#   pip install --no-deps "heb-ocr @ git+https://github.com/itayinbarr/heb-ocr@19b7c158d14e9293e0806f909f1d497cc4784eaf"
+# (`npm run setup` does both.) The extra index gives the small CPU-only build of torch.
+torch>=2.7
+numpy
+pillow
+opencv-python-headless
+rapidfuzz
+scipy

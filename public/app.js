@@ -1,7 +1,7 @@
 "use strict";
 
-// Long edge of each stored page image. The server shows Claude the whole page
-// and full-resolution close-ups of it, so keep as much detail as phones give.
+// Long edge of each stored page image. The reading engine finds the lines on
+// the full-size page, so keep as much detail as phones give.
 const MAX_EDGE = 4000;
 const POLL_MS = 2500;
 
@@ -938,7 +938,7 @@ async function renderWriterList() {
     link.dir = "auto";
     const meta = document.createElement("span");
     meta.className = "meta";
-    meta.textContent = t("learnedCount", { n: w.exampleCount }) + (w.learn ? "" : ` · ${t("learningOff")}`);
+    meta.textContent = t("learnedCount", { n: w.exampleCount }) + (w.model ? ` · ${t("personalModel")}` : "") + (w.learn ? "" : ` · ${t("learningOff")}`);
     item.append(link, meta);
     list.append(item);
   }
@@ -964,6 +964,7 @@ async function showWriter(writerId) {
   $("#writerLearn").checked = writer.learn;
   $("#writerSummary").textContent = t("writerSummary", { n: examples.length });
   $("#writerView").dataset.id = writerId;
+  renderTraining(writer);
 
   const list = $("#exampleList");
   list.innerHTML = "";
@@ -998,6 +999,62 @@ async function showWriter(writerId) {
     list.append(row);
   }
 }
+
+const pct = (cer) => (cer == null ? "?" : (Math.round(cer * 1000) / 10).toString());
+let trainTimer = null;
+
+/** The personal-model panel: what is in use, what training is doing, and the button. */
+function renderTraining(writer) {
+  clearTimeout(trainTimer);
+  const tr = writer.training || {};
+  const busy = tr.status === "queued" || tr.status === "running";
+  const when = (iso) => new Date(iso).toLocaleString(lang === "he" ? "he-IL" : "en-GB", { dateStyle: "short", timeStyle: "short" });
+
+  let status = writer.model ? t("trainInUse", { when: when(writer.model.trainedAt), lines: writer.model.lines }) : t("trainNoModel");
+  if (tr.status === "queued") status = t("trainQueued");
+  if (tr.status === "running") {
+    status = t("trainRunning", { lines: tr.lines, pct: tr.of ? Math.round((100 * tr.step) / tr.of) : 0 });
+  }
+  $("#trainStatus").textContent = status;
+
+  let result = "";
+  if (tr.status === "done" && tr.kept && tr.held) result = t("trainGain", { held: tr.held, before: pct(tr.before), after: pct(tr.after) });
+  else if (writer.model?.before != null && !busy) result = t("trainGain", { held: tr.held || "?", before: pct(writer.model.before), after: pct(writer.model.after) });
+  if (tr.status === "done" && !tr.kept && tr.reason === "no_gain") result = t("trainNoGain");
+  if (tr.status === "failed") result = tr.error === "interrupted" ? t("trainInterrupted") : t("trainFailed", { msg: tr.error || "" });
+  $("#trainResult").textContent = result;
+
+  const bar = $("#trainBar");
+  bar.hidden = !busy;
+  bar.firstElementChild.style.width = tr.status === "running" && tr.of ? `${(100 * tr.step) / tr.of}%` : "0";
+
+  const button = $("#trainButton");
+  button.hidden = busy;
+  button.disabled = !writer.canTrain;
+  button.textContent = writer.model ? t("trainAgain") : t("trainButton");
+  $("#trainAuto").textContent = writer.canTrain ? t("trainAuto", { n: 25 }) : t("trainNeedMore", { min: writer.trainMin, n: writer.exampleCount });
+
+  if (busy) {
+    trainTimer = setTimeout(async () => {
+      if ($("#writerView").hidden || $("#writerView").dataset.id !== writer.id) return;
+      await loadWriters();
+      const fresh = state.writers.find((w) => w.id === writer.id);
+      if (fresh) renderTraining(fresh);
+    }, 4000);
+  }
+}
+
+$("#trainButton").addEventListener("click", async () => {
+  const id = $("#writerView").dataset.id;
+  try {
+    await api("POST", `/api/writers/${id}/train`, {});
+  } catch (err) {
+    return notify(errText(err));
+  }
+  await loadWriters();
+  const writer = state.writers.find((w) => w.id === id);
+  if (writer) renderTraining(writer);
+});
 
 $("#writerBack").addEventListener("click", showHome);
 $("#writerLearn").addEventListener("change", async () => {

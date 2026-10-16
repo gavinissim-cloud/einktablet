@@ -110,6 +110,10 @@ main { padding: 12px 24px 48px; max-width: 1300px; margin: 0 auto; }
 .writer-name { flex: 1; margin: 0; font-size: 20px; min-width: 0; }
 .writer-panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 14px; }
 .writer-panel .list-note { margin: 8px 0 0; }
+.panel-title { margin: 0 0 4px; font-size: 16px; }
+.train-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+.train-bar { flex: 1; min-width: 120px; max-width: 360px; height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.train-bar > div { height: 100%; width: 0; background: var(--accent); transition: width .4s; }
 .example-list { display: flex; flex-direction: column; gap: 8px; }
 .example {
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 14px; align-items: center;

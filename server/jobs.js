@@ -1,12 +1,13 @@
-import Anthropic from "@anthropic-ai/sdk";
 import * as store from "./store.js";
 import { learningFor } from "./learning.js";
-import { transcribePage, demoPage } from "./transcribe.js";
+import { readPage, OcrError } from "./ocr.js";
+import { demoPage } from "./demo.js";
 
-// Pages are read on the server, a few at a time, so reading continues even
+// Pages are read on the server, one after another, so reading continues even
 // if the person closes the browser. Progress is written into the document.
+// (The engine itself reads one page at a time using every CPU core.)
 
-const CONCURRENCY = Math.max(1, Number(process.env.READ_CONCURRENCY || 2));
+const CONCURRENCY = 1;
 const DEMO = process.env.DEMO_MODE === "1";
 
 const queue = [];
@@ -42,10 +43,7 @@ function pump() {
 }
 
 function errorInfo(error) {
-  if (error instanceof Anthropic.AuthenticationError) return { code: "api_key", message: "The server's Anthropic API key is missing or invalid." };
-  if (error instanceof Anthropic.RateLimitError) return { code: "rate_limited", message: "Too many requests right now." };
-  if (error instanceof Anthropic.BadRequestError) return { code: "bad_page", message: `The page could not be processed: ${error.message}` };
-  if (error instanceof Anthropic.APIError) return { code: "api_error", message: `Claude API error (${error.status}).` };
+  if (error instanceof OcrError || error.code) return { code: error.code, message: error.message };
   return { code: "read_failed", message: error.message || "Reading failed." };
 }
 
@@ -54,25 +52,27 @@ async function run({ userId, docId, pageId }) {
   try {
     const doc = await store.getDoc(userId, docId);
     if (!doc?.pages.some((p) => p.id === pageId)) return; // removed meanwhile
-    await progress(0, 3);
-    const image = await store.readPageImage(userId, docId, pageId);
-    if (!image) throw Object.assign(new Error("The page image is missing."), { code: "image_missing" });
+    await progress(0, 2);
+    const imagePath = store.pageImagePath(userId, docId, pageId);
+    if (!(await store.readPageImage(userId, docId, pageId))) {
+      throw Object.assign(new Error("The page image is missing."), { code: "image_missing" });
+    }
 
     let lines;
     if (DEMO) {
-      for (const step of [1, 2, 3]) {
-        await progress(step, 3);
+      for (const step of [1, 2]) {
+        await progress(step, 2);
         await new Promise((r) => setTimeout(r, 400));
       }
       lines = demoPage();
     } else {
-      const learning = await learningFor(userId, doc.writerId);
-      lines = await transcribePage(image, { learning, onProgress: progress });
+      const { model, fixes } = await learningFor(userId, doc.writerId);
+      lines = await readPage(imagePath, { model, fixes, onProgress: progress });
     }
     await store.finishReading(userId, docId, pageId, lines);
   } catch (error) {
     console.error(`Reading failed for page ${pageId}:`, error);
-    const info = error.code === "image_missing" ? { code: "image_missing", message: error.message } : errorInfo(error);
+    const info = errorInfo(error);
     await store.updatePage(userId, docId, pageId, { status: "error", progress: null, error: info.message, errorCode: info.code }).catch(() => {});
   }
 }

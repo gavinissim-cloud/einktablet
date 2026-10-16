@@ -6,6 +6,8 @@ import * as store from "./store.js";
 import * as learning from "./learning.js";
 import { authRoutes, requireUser } from "./auth.js";
 import { requestReading, resumeReading } from "./jobs.js";
+import { warmUp, MODELS_DIR } from "./ocr.js";
+import fs from "node:fs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -129,7 +131,7 @@ app.get("/api/writers", async (req, res, next) => {
       await learning.createWriter(req.user.id, req.user.username);
       writers = await learning.listWriters(req.user.id);
     }
-    res.json(writers);
+    res.json(writers.map((w) => ({ ...w, canTrain: learning.canTrain(w.exampleCount), trainMin: learning.TRAINING_MIN })));
   } catch (e) { next(e); }
 });
 
@@ -149,6 +151,16 @@ app.patch("/api/writers/:writerId", async (req, res, next) => {
 
 app.delete("/api/writers/:writerId", async (req, res, next) => {
   try { await learning.deleteWriter(req.user.id, req.params.writerId); res.status(204).end(); } catch (e) { next(e); }
+});
+
+app.post("/api/writers/:writerId/train", async (req, res, next) => {
+  try {
+    const ok = await learning.requestTraining(req.user.id, req.params.writerId);
+    if (!ok) {
+      return res.status(400).json({ error: `Correct at least ${learning.TRAINING_MIN} lines first.`, code: "too_few_lines" });
+    }
+    res.status(202).json({ status: "queued" });
+  } catch (e) { next(e); }
 });
 
 app.get("/api/writers/:writerId/examples", async (req, res, next) => {
@@ -172,12 +184,14 @@ app.use("/api", (err, req, res, next) => {
   res.status(500).json({ error: "Server error while saving or loading the document." });
 });
 
-if (!DEMO && !process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-  console.warn("Warning: ANTHROPIC_API_KEY is not set — transcription requests will fail. Set it, or run `npm run demo` to try the interface.");
+if (!DEMO && !fs.existsSync(`${MODELS_DIR}/mishkefet-v1.pt`)) {
+  console.warn(`Warning: the reading model is not in ${MODELS_DIR}. Run \`npm run models\` to download it, or \`npm run demo\` to try the interface.`);
 }
 
 const server = app.listen(PORT, () => {
   console.log(`Hebrew handwriting converter running at http://localhost:${PORT}${DEMO ? " (demo mode)" : ""}`);
   resumeReading().catch((error) => console.error("Could not resume reading:", error));
+  learning.markInterruptedTraining().catch((error) => console.error("Could not check training:", error));
+  if (!DEMO) warmUp();
 });
 server.requestTimeout = 10 * 60 * 1000; // large page uploads on slow connections

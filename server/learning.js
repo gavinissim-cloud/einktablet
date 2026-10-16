@@ -3,17 +3,24 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { DATA_DIR, isId } from "./store.js";
 import { exampleCrop } from "./images.js";
+import { trainWriter } from "./ocr.js";
 
 // Handwriting profiles. Each account has writers (whose handwriting a document
 // is in). When someone corrects a line, the line's handwriting and the correct
-// text are kept as an example for that writer and shown to Claude next time.
+// text are kept as an example for that writer. They are used two ways:
+//  - right away: words misread before are corrected in the next readings;
+//  - by training: the reading model is taught this writer's handwriting from
+//    the corrected lines, and their pages are read with that personal model.
 //
-// DATA_DIR/writers/<userId>/writers.json            [{id, name, learn, createdAt}]
+// DATA_DIR/writers/<userId>/writers.json            [{id, name, learn, createdAt, training, model}]
 // DATA_DIR/writers/<userId>/<writerId>/examples.json [{id, text, ai, createdAt, updatedAt}]
 // DATA_DIR/writers/<userId>/<writerId>/<exampleId>.jpg
+// DATA_DIR/writers/<userId>/<writerId>/model.pt      the personal model, once trained
 
-const MAX_EXAMPLES = 400; // kept per writer (oldest dropped first)
-export const PROMPT_EXAMPLES = Number(process.env.LEARNING_EXAMPLES || 24); // images shown per request
+const MAX_EXAMPLES = 2000; // kept per writer (oldest dropped first)
+const TRAIN_MIN_LINES = Number(process.env.TRAIN_MIN_LINES || 20); // corrected lines before training is offered
+const AUTO_TRAIN_EVERY = Number(process.env.AUTO_TRAIN_EVERY || 25); // new corrections that start training again (0 = never)
+const DEMO = process.env.DEMO_MODE === "1";
 
 const userDir = (userId) => {
   if (!isId(userId)) throw new Error("Invalid id");
@@ -56,6 +63,9 @@ export async function listWriters(userId) {
     writers.map(async (w) => ({ ...w, exampleCount: (await readJson(examplesFile(userId, w.id), [])).length }))
   );
 }
+
+export const canTrain = (exampleCount) => exampleCount >= TRAIN_MIN_LINES;
+export const TRAINING_MIN = TRAIN_MIN_LINES;
 
 export async function getWriter(userId, writerId) {
   if (!isId(writerId)) return null;
@@ -120,14 +130,14 @@ function exampleId(pageId, box) {
 
 /**
  * Record what the person corrected on a saved document. A line counts as a
- * correction when its text differs from what Claude read (`ai`). Changing a
+ * correction when its text differs from what the engine read (`ai`). Changing a
  * line back to that same reading removes the example again; reading the page
  * again never does (what was learned stays until "Forget").
  * `pageImage(pageId)` returns the stored page image (Buffer) or null.
  */
-export function learnFromDocument(userId, writerId, docId, pages, pageImage) {
-  if (!isId(writerId)) return Promise.resolve();
-  return locked(userId, async () => {
+export async function learnFromDocument(userId, writerId, docId, pages, pageImage) {
+  if (!isId(writerId)) return;
+  await locked(userId, async () => {
     const writer = (await readJson(writersFile(userId), [])).find((w) => w.id === writerId);
     if (!writer || !writer.learn) return;
     const file = examplesFile(userId, writerId);
@@ -174,6 +184,7 @@ export function learnFromDocument(userId, writerId, docId, pages, pageImage) {
     next = next.slice(0, MAX_EXAMPLES);
     await writeJson(file, next);
   });
+  await maybeAutoTrain(userId, writerId);
 }
 
 /**
@@ -198,7 +209,7 @@ export function moveDocExamples(userId, fromWriterId, toWriterId, docId) {
   });
 }
 
-/** Word-level differences between what Claude read and the correct text. */
+/** Word-level differences between what the engine read and the correct text. */
 export function wordFixes(ai, text) {
   const a = ai.split(/\s+/).filter(Boolean);
   const b = text.split(/\s+/).filter(Boolean);
@@ -222,30 +233,146 @@ export function wordFixes(ai, text) {
   return fixes;
 }
 
-/**
- * What Claude is shown about this writer: the most recent corrected lines
- * (image + correct text) and a list of words it misread before.
- */
-export async function learningFor(userId, writerId) {
-  if (!writerId || !(await getWriter(userId, writerId))) return null;
-  const examples = await listExamples(userId, writerId);
-  if (!examples.length) return null;
-
-  const shown = [];
-  for (const e of examples) {
-    if (shown.length >= PROMPT_EXAMPLES) break;
-    try {
-      shown.push({ ...e, image: await fs.readFile(exampleImagePath(userId, writerId, e.id)) });
-    } catch {}
-  }
-
+/** Words misread before in this writer's handwriting: [{from, to, count}]. */
+async function fixesFor(userId, writerId) {
   const counts = new Map();
-  for (const e of examples) {
+  for (const e of await listExamples(userId, writerId)) {
     for (const f of wordFixes(e.ai, e.text)) {
-      const key = `${f.from} → ${f.to}`;
+      if (!f.from || !f.to) continue;
+      const key = `${f.from}\u0000${f.to}`;
       counts.set(key, (counts.get(key) || 0) + 1);
     }
   }
-  const fixes = [...counts].sort((x, y) => y[1] - x[1]).slice(0, 150).map(([k, n]) => (n > 1 ? `${k} (${n}×)` : k));
-  return { examples: shown, fixes, total: examples.length };
+  // When one misreading was corrected to different words, the commonest wins.
+  const best = new Map();
+  for (const [key, count] of counts) {
+    const [from, to] = key.split("\u0000");
+    if (!best.has(from) || best.get(from).count < count) best.set(from, { from, to, count });
+  }
+  return [...best.values()];
+}
+
+export const writerModelPath = (userId, writerId) => path.join(writerDir(userId, writerId), "model.pt");
+
+/** What the reader uses for this writer: their personal model (if trained) and earlier fixes. */
+export async function learningFor(userId, writerId) {
+  const writer = writerId && (await getWriter(userId, writerId));
+  if (!writer) return { model: null, fixes: [] };
+  let model = null;
+  if (writer.model) {
+    try {
+      await fs.access(writerModelPath(userId, writerId));
+      model = writerModelPath(userId, writerId);
+    } catch {}
+  }
+  return { model, fixes: await fixesFor(userId, writerId) };
+}
+
+// ---------- Training a personal model ----------
+
+const trainQueue = [];
+let training = false;
+
+function setTraining(userId, writerId, patch) {
+  return locked(userId, async () => {
+    const writers = await readJson(writersFile(userId), []);
+    const writer = writers.find((w) => w.id === writerId);
+    if (!writer) return null;
+    Object.assign(writer, patch);
+    await writeJson(writersFile(userId), writers);
+    return writer;
+  });
+}
+
+/** Queue training for a writer. Resolves false when there is too little to learn from. */
+export async function requestTraining(userId, writerId) {
+  const writer = await getWriter(userId, writerId);
+  if (!writer) return false;
+  const count = (await listExamples(userId, writerId)).length;
+  if (!canTrain(count)) return false;
+  if (["queued", "running"].includes(writer.training?.status)) return true;
+  await setTraining(userId, writerId, { training: { status: "queued", queuedAt: new Date().toISOString(), lines: count } });
+  trainQueue.push({ userId, writerId });
+  pumpTraining();
+  return true;
+}
+
+async function maybeAutoTrain(userId, writerId) {
+  if (!AUTO_TRAIN_EVERY) return;
+  const writer = await getWriter(userId, writerId);
+  if (!writer || !writer.learn || ["queued", "running"].includes(writer.training?.status)) return;
+  const count = (await listExamples(userId, writerId)).length;
+  const trainedOn = writer.model?.lines || 0;
+  if (canTrain(count) && count - trainedOn >= AUTO_TRAIN_EVERY) await requestTraining(userId, writerId);
+}
+
+async function pumpTraining() {
+  if (training || !trainQueue.length) return;
+  training = true;
+  const { userId, writerId } = trainQueue.shift();
+  try {
+    await runTraining(userId, writerId);
+  } catch (error) {
+    console.error("Training failed:", error);
+    await setTraining(userId, writerId, { training: { status: "failed", error: error.message, finishedAt: new Date().toISOString() } });
+  } finally {
+    training = false;
+    pumpTraining();
+  }
+}
+
+async function runTraining(userId, writerId) {
+  const examples = await listExamples(userId, writerId);
+  const dir = writerDir(userId, writerId);
+  const tsv = path.join(dir, "training.tsv");
+  const rows = examples.map((e) => `${exampleImagePath(userId, writerId, e.id)}\t${e.text.replace(/[\t\n]/g, " ")}`);
+  await fs.writeFile(tsv, rows.join("\n") + "\n");
+  const startedAt = new Date().toISOString();
+  await setTraining(userId, writerId, { training: { status: "running", startedAt, step: 0, of: 0, lines: examples.length } });
+
+  let report;
+  if (DEMO) {
+    for (let step = 1; step <= 4; step++) {
+      await new Promise((r) => setTimeout(r, 300));
+      await setTraining(userId, writerId, { training: { status: "running", startedAt, step, of: 4, lines: examples.length } });
+    }
+    report = { kept: false, reason: "demo", lines: examples.length };
+  } else {
+    let last = 0;
+    report = await trainWriter(tsv, writerModelPath(userId, writerId) + ".new", (step, of) => {
+      if (Date.now() - last < 3000 && step !== of) return; // keep writes light
+      last = Date.now();
+      setTraining(userId, writerId, { training: { status: "running", startedAt, step, of, lines: examples.length } }).catch(() => {});
+    });
+  }
+
+  const finishedAt = new Date().toISOString();
+  const result = { before: report.before ?? null, after: report.after ?? null, lines: report.lines, held: report.held ?? 0 };
+  if (report.kept) {
+    await fs.rename(writerModelPath(userId, writerId) + ".new", writerModelPath(userId, writerId));
+    await setTraining(userId, writerId, {
+      training: { status: "done", finishedAt, ...result, kept: true },
+      model: { trainedAt: finishedAt, lines: examples.length, before: result.before, after: result.after },
+    });
+  } else {
+    await fs.rm(writerModelPath(userId, writerId) + ".new", { force: true });
+    await setTraining(userId, writerId, { training: { status: "done", finishedAt, ...result, kept: false, reason: report.reason || "no_gain" } });
+  }
+}
+
+/** After a restart, training that was cut off is reported as interrupted. */
+export async function markInterruptedTraining() {
+  let users;
+  try {
+    users = await fs.readdir(path.join(DATA_DIR, "writers"), { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const u of users.filter((e) => e.isDirectory() && isId(e.name))) {
+    for (const w of await readJson(writersFile(u.name), [])) {
+      if (["queued", "running"].includes(w.training?.status)) {
+        await setTraining(u.name, w.id, { training: { status: "failed", error: "interrupted", finishedAt: new Date().toISOString() } });
+      }
+    }
+  }
 }

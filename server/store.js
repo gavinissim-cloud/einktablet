@@ -47,7 +47,7 @@ export const BUSY = new Set(["queued", "working"]);
 const cleanLines = (lines) =>
   (Array.isArray(lines) ? lines : []).slice(0, 500).map((l) => ({
     text: str(l?.text, 5000),
-    // What Claude first read, so corrections can be learned from.
+    // What the reading engine first read, so corrections can be learned from.
     ai: typeof l?.ai === "string" ? str(l.ai, 5000) : undefined,
     top: num(l?.top),
     bottom: num(l?.bottom),
