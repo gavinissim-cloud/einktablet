@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>כתב יד לטקסט — Hebrew Handwriting to Text</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="vendor/pdfjs/pdf.min.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>כתב יד לטקסט</h1>
+      <p class="sub" dir="ltr">Hebrew handwriting → editable text</p>
+    </div>
+  </header>
+
+  <main>
+    <section id="upload">
+      <label id="dropzone" class="dropzone" tabindex="0">
+        <input id="fileInput" type="file" accept="image/*,application/pdf" multiple hidden>
+        <div class="dz-icon" aria-hidden="true">⬆</div>
+        <div class="dz-title">גררו לכאן קובץ או לחצו לבחירה</div>
+        <div class="dz-hint">תמונה (JPG, PNG, WebP) או PDF · אפשר גם להדביק תמונה (Ctrl+V)</div>
+        <div class="dz-hint" dir="ltr">Drag a scan, photo or PDF here, click to choose, or paste an image</div>
+      </label>
+    </section>
+
+    <section id="workspace" hidden>
+      <div class="toolbar">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-view="lines" role="tab">שורה מול שורה</button>
+          <button class="tab" data-view="doc" role="tab">מסמך</button>
+        </div>
+        <div class="status" id="status"></div>
+        <div class="actions">
+          <label class="check"><input type="checkbox" id="plainPunct"> פיסוק מקלדת רגיל (" ' -)</label>
+          <button id="exportDocx">Word ⬇</button>
+          <button id="exportDocxImages">Word + כתב יד ⬇</button>
+          <button id="exportTxt">TXT ⬇</button>
+          <button id="copyAll">העתקה</button>
+          <button id="addMore" class="secondary">+ קובץ נוסף</button>
+          <button id="clearAll" class="secondary">התחלה מחדש</button>
+        </div>
+      </div>
+      <div id="pages"></div>
+    </section>
+  </main>
+
+  <div id="lightbox" class="lightbox" hidden>
+    <div class="lb-inner">
+      <button class="lb-close" aria-label="סגירה">✕</button>
+      <div class="lb-stage"><img id="lbImg" alt=""><div id="lbBox" class="lb-box"></div></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

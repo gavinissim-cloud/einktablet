@@ -1,0 +1,29 @@
+{
+  "name": "hebrew-handwriting-to-text",
+  "version": "1.0.0",
+  "description": "Upload Hebrew handwriting (images or PDF) and get editable text, line by line or as a document.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "demo": "DEMO_MODE=1 node server/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gavinissim-cloud/einktablet.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gavinissim-cloud/einktablet/issues"
+  },
+  "homepage": "https://github.com/gavinissim-cloud/einktablet#readme",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
+    "docx": "^9.11.0",
+    "express": "^5.3.0",
+    "pdfjs-dist": "^3.11.174"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
