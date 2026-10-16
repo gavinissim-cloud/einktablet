@@ -9,7 +9,7 @@ if (window.pdfjsLib) {
   pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdfjs/pdf.worker.min.js";
 }
 
-const state = { doc: null, view: "lines" };
+const state = { user: null, doc: null, view: "lines" };
 const $ = (sel) => document.querySelector(sel);
 const currentPages = () => state.doc?.pages || [];
 
@@ -19,6 +19,10 @@ async function api(method, url, body, headers = { "Content-Type": "application/j
     headers: body === undefined ? undefined : headers,
     body: body === undefined || body instanceof Blob ? body : JSON.stringify(body),
   });
+  if (res.status === 401 && !url.startsWith("/api/auth/")) {
+    showAuth();
+    throw Object.assign(new Error("יש להתחבר מחדש."), { status: 401 });
+  }
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw Object.assign(new Error(data.error || `Server error ${res.status}`), { status: res.status });
@@ -55,6 +59,7 @@ document.addEventListener("paste", (e) => {
 $("#addMore").addEventListener("click", () => fileInput.click());
 
 async function addFiles(files) {
+  if (!state.user) return;
   const accepted = files.filter((f) => f && (f.type.startsWith("image/") || f.type === "application/pdf"));
   if (!accepted.length) {
     if (files.length) alert("אפשר להעלות רק תמונות או קובצי PDF.");
@@ -315,6 +320,7 @@ function escapeHtml(s) {
 }
 
 function route() {
+  if (!state.user) return;
   const id = location.hash.match(/^#doc=([A-Za-z0-9-]+)$/)?.[1];
   if (!id) return showHome();
   if (state.doc?.id !== id) openDoc(id);
@@ -329,6 +335,91 @@ $("#docTitle").addEventListener("input", () => {
   document.title = `${state.doc.title} — כתב יד לטקסט`;
   scheduleSave(state.doc);
 });
+
+// ---------- Login ----------
+
+let authMode = "login";
+let signupNeedsCode = false;
+
+function setAuthMode(mode) {
+  authMode = mode;
+  const register = mode === "register";
+  $("#authTitle").textContent = register ? "הרשמה" : "התחברות";
+  $("#authSubmit").textContent = register ? "יצירת חשבון" : "התחברות";
+  $("#authSwitchText").textContent = register ? "כבר יש לכם חשבון?" : "אין לכם חשבון?";
+  $("#authSwitch").textContent = register ? "התחברות" : "הרשמה";
+  $("#authPass").autocomplete = register ? "new-password" : "current-password";
+  $("#authCodeRow").hidden = !(register && signupNeedsCode);
+  $("#authError").textContent = "";
+}
+
+function showAuth() {
+  state.user = null;
+  state.doc = null;
+  $("#account").hidden = true;
+  $("#upload").hidden = true;
+  $("#workspace").hidden = true;
+  $("#pages").innerHTML = "";
+  $("#docList").innerHTML = "";
+  $("#auth").hidden = false;
+  $("#authUser").focus();
+}
+
+function signedIn(user) {
+  state.user = user;
+  $("#auth").hidden = true;
+  $("#account").hidden = false;
+  $("#accountName").textContent = user.username;
+  $("#authPass").value = "";
+  $("#authCode").value = "";
+  route();
+}
+
+$("#authSwitch").addEventListener("click", (e) => {
+  e.preventDefault();
+  setAuthMode(authMode === "login" ? "register" : "login");
+});
+
+$("#authForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const submit = $("#authSubmit");
+  submit.disabled = true;
+  $("#authError").textContent = "";
+  try {
+    const body = { username: $("#authUser").value, password: $("#authPass").value };
+    if (authMode === "register") body.code = $("#authCode").value;
+    const data = await api("POST", `/api/auth/${authMode}`, body);
+    signedIn(data.user);
+  } catch (err) {
+    $("#authError").textContent = err.message;
+  } finally {
+    submit.disabled = false;
+  }
+});
+
+$("#logout").addEventListener("click", async () => {
+  const doc = state.doc;
+  if (doc && hasUnsaved(doc)) {
+    await flushSave(doc);
+    if (hasUnsaved(doc) && !confirm("יש שינויים שעדיין לא נשמרו. להתנתק בכל זאת?")) return;
+  }
+  await api("POST", "/api/auth/logout", {}).catch(() => {});
+  if (location.hash) history.pushState(null, "", location.pathname);
+  setAuthMode("login");
+  showAuth();
+});
+
+async function start() {
+  try {
+    const me = await api("GET", "/api/auth/me");
+    signupNeedsCode = me.signupNeedsCode;
+    setAuthMode("login");
+    if (me.user) signedIn(me.user);
+    else showAuth();
+  } catch (err) {
+    alert(`השרת לא זמין: ${err.message}`);
+  }
+}
 
 // ---------- Transcription queue ----------
 
@@ -675,4 +766,4 @@ window.addEventListener("resize", () => {
   });
 });
 
-route();
+start();

@@ -5,6 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { transcribePage, demoPage } from "./transcribe.js";
 import { buildDocx } from "./docx.js";
 import * as store from "./store.js";
+import { authRoutes, requireUser } from "./auth.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -14,6 +15,19 @@ const DEMO = process.env.DEMO_MODE === "1";
 app.use(express.json({ limit: "60mb" }));
 app.use(express.static(path.join(here, "..", "public")));
 app.use("/vendor/pdfjs", express.static(path.join(here, "..", "node_modules", "pdfjs-dist", "build")));
+
+// Behind a reverse proxy (nginx, Render, etc.) set TRUST_PROXY=1 so client IPs
+// and HTTPS are detected correctly for login throttling and secure cookies.
+if (process.env.TRUST_PROXY === "1") app.set("trust proxy", 1);
+
+authRoutes(app, {
+  onFirstUser: async (userId) => {
+    const moved = await store.adoptLegacyDocs(userId);
+    if (moved) console.log(`Moved ${moved} document(s) saved before accounts existed to the first account.`);
+  },
+});
+// Everything else under /api needs a logged-in user.
+app.use("/api", requireUser);
 
 const MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
@@ -68,16 +82,16 @@ app.param("docId", (req, res, next, id) => {
 });
 
 app.get("/api/documents", async (req, res, next) => {
-  try { res.json(await store.listDocs()); } catch (e) { next(e); }
+  try { res.json(await store.listDocs(req.user.id)); } catch (e) { next(e); }
 });
 
 app.post("/api/documents", async (req, res, next) => {
-  try { res.status(201).json(await store.createDoc(req.body?.title)); } catch (e) { next(e); }
+  try { res.status(201).json(await store.createDoc(req.user.id, req.body?.title)); } catch (e) { next(e); }
 });
 
 app.get("/api/documents/:docId", async (req, res, next) => {
   try {
-    const doc = await store.getDoc(req.params.docId);
+    const doc = await store.getDoc(req.user.id, req.params.docId);
     if (!doc) return res.status(404).json({ error: "Document not found." });
     res.json(doc);
   } catch (e) { next(e); }
@@ -85,14 +99,14 @@ app.get("/api/documents/:docId", async (req, res, next) => {
 
 app.put("/api/documents/:docId", async (req, res, next) => {
   try {
-    const doc = await store.saveDoc(req.params.docId, req.body || {});
+    const doc = await store.saveDoc(req.user.id, req.params.docId, req.body || {});
     if (!doc) return res.status(404).json({ error: "Document not found." });
     res.json({ updatedAt: doc.updatedAt });
   } catch (e) { next(e); }
 });
 
 app.delete("/api/documents/:docId", async (req, res, next) => {
-  try { await store.deleteDoc(req.params.docId); res.status(204).end(); } catch (e) { next(e); }
+  try { await store.deleteDoc(req.user.id, req.params.docId); res.status(204).end(); } catch (e) { next(e); }
 });
 
 app.put(
@@ -103,7 +117,7 @@ app.put(
       return res.status(400).json({ error: "Send the page as image/jpeg." });
     }
     try {
-      const ok = await store.savePageImage(req.params.docId, req.params.pageId, req.body);
+      const ok = await store.savePageImage(req.user.id, req.params.docId, req.params.pageId, req.body);
       if (!ok) return res.status(404).json({ error: "Document not found." });
       res.status(204).end();
     } catch (e) { next(e); }
@@ -112,7 +126,7 @@ app.put(
 
 app.get("/api/documents/:docId/pages/:pageId/image", (req, res) => {
   if (!store.isId(req.params.pageId)) return res.status(400).end();
-  res.sendFile(store.pageImagePath(req.params.docId, req.params.pageId), (err) => {
+  res.sendFile(store.pageImagePath(req.user.id, req.params.docId, req.params.pageId), (err) => {
     if (err && !res.headersSent) res.status(404).end();
   });
 });

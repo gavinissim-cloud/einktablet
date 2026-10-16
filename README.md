@@ -7,6 +7,7 @@ A web app that turns handwritten modern Hebrew (scans, phone photos, or PDFs) in
 - **Document view:** the full text as one editable document (Word-style).
 - **Words to check:** words the reader wasn't sure about are highlighted in yellow so you know where to look.
 - **Hebrew punctuation:** gershayim (״), geresh (׳), maqaf (־), parentheses, dashes, and quotes are kept. You can switch to plain keyboard punctuation (`" ' -`) when exporting.
+- **Accounts:** each person signs up and logs in, and sees only their own documents.
 - **Saved automatically:** every document is saved on the server about a second after each edit (the top bar shows "כל השינויים נשמרו ✓"). Reloading the page or coming back later reopens it, and the home screen lists all saved documents so you can reopen, rename or delete them. If a page was still being read when the browser closed, it is read again when the document is reopened.
 - **Export:** Word (.docx, right-to-left), Word with the handwriting image beside each line, plain text, or copy to clipboard.
 
@@ -39,12 +40,22 @@ npm run demo
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Model used to read the handwriting |
 | `CLAUDE_EFFORT` | `high` | `low` / `medium` / `high` / `xhigh` / `max`. Higher means more careful reading, but slower and more expensive |
 | `TRANSCRIBE_PASSES` | `2` | `1` = read only, `2` = read + proofread |
-| `DATA_DIR` | `./data` | Folder where documents are saved (one folder per document: `doc.json` + the page images). Back this folder up to keep your documents |
+| `DATA_DIR` | `./data` | Folder for accounts and documents (`users.json`, `sessions.json`, and `docs/<user>/<document>/` with `doc.json` + page images). Back this folder up |
+| `SIGNUP_CODE` | unset | If set, new accounts must enter this code |
+| `TRUST_PROXY` | unset | `1` when running behind a reverse proxy (correct client IPs, secure cookies) |
+| `COOKIE_SECURE` | unset | `1` to always mark the login cookie as HTTPS-only |
 | `DEMO_MODE` | unset | `1` returns sample text without calling the API |
 
-## Saved documents and privacy
+## Accounts
 
-There are no user accounts yet: everyone who can open the app sees the same list of documents. Run it on your own computer or a private server, and add a login before putting it on the open internet.
+Everyone signs up with a username (or email) and a password, and sees only their own documents. Reading pages and exporting also require being logged in, so strangers can't use up your API credit.
+
+- Passwords are stored only as salted scrypt hashes, in `DATA_DIR/users.json`. Logins last 30 days, using an HttpOnly cookie.
+- After 10 failed logins, the account and the IP address are locked out for 15 minutes.
+- **Set `SIGNUP_CODE`** if the app is reachable from the internet. New accounts then need that code, so only people you give it to can sign up.
+- Documents saved before accounts existed are moved to the first account that signs up.
+- There's no "forgot password" email yet. To reset a password, delete that user's entry from `users.json` and have them sign up again. Their documents stay in `DATA_DIR/docs/<user id>/`, so move them into the new account's folder.
+- Serve the app over HTTPS when it is online. Behind a proxy that handles HTTPS (nginx, Render, Fly…), set `TRUST_PROXY=1`, or set `COOKIE_SECURE=1` directly.
 
 ## Accuracy notes
 

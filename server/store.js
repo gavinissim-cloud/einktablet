@@ -3,18 +3,23 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-// Each document lives in DATA_DIR/<id>/: doc.json holds the text and edits,
-// <pageId>.jpg holds each page image.
-const DATA_DIR = path.resolve(
+// Each document lives in DATA_DIR/docs/<userId>/<docId>/: doc.json holds the
+// text and edits, <pageId>.jpg holds each page image.
+export const DATA_DIR = path.resolve(
   process.env.DATA_DIR || path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data")
 );
 const ID = /^[A-Za-z0-9-]{1,64}$/;
 
 export const isId = (id) => typeof id === "string" && ID.test(id);
 
-function docDir(id) {
+function userDir(userId) {
+  if (!isId(userId)) throw new Error("Invalid id");
+  return path.join(DATA_DIR, "docs", userId);
+}
+
+function docDir(userId, id) {
   if (!isId(id)) throw new Error("Invalid id");
-  return path.join(DATA_DIR, id);
+  return path.join(userDir(userId), id);
 }
 
 async function writeAtomic(file, data) {
@@ -23,9 +28,9 @@ async function writeAtomic(file, data) {
   await fs.rename(tmp, file);
 }
 
-async function readDoc(id) {
+async function readDoc(userId, id) {
   try {
-    return JSON.parse(await fs.readFile(path.join(docDir(id), "doc.json"), "utf8"));
+    return JSON.parse(await fs.readFile(path.join(docDir(userId, id), "doc.json"), "utf8"));
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
@@ -55,16 +60,16 @@ function cleanPages(pages) {
     }));
 }
 
-export async function listDocs() {
+export async function listDocs(userId) {
   let entries;
   try {
-    entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
+    entries = await fs.readdir(userDir(userId), { withFileTypes: true });
   } catch (error) {
     if (error.code === "ENOENT") return [];
     throw error;
   }
   const docs = await Promise.all(
-    entries.filter((e) => e.isDirectory() && isId(e.name)).map((e) => readDoc(e.name).catch(() => null))
+    entries.filter((e) => e.isDirectory() && isId(e.name)).map((e) => readDoc(userId, e.name).catch(() => null))
   );
   return docs
     .filter(Boolean)
@@ -72,39 +77,67 @@ export async function listDocs() {
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-export async function createDoc(title) {
+export async function createDoc(userId, title) {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   const doc = { id, title: str(title, 200) || "מסמך ללא שם", createdAt: now, updatedAt: now, pages: [] };
-  await fs.mkdir(docDir(id), { recursive: true });
-  await writeAtomic(path.join(docDir(id), "doc.json"), JSON.stringify(doc));
+  await fs.mkdir(docDir(userId, id), { recursive: true });
+  await writeAtomic(path.join(docDir(userId, id), "doc.json"), JSON.stringify(doc));
   return doc;
 }
 
 export const getDoc = readDoc;
 
-export async function saveDoc(id, { title, pages }) {
-  const doc = await readDoc(id);
+export async function saveDoc(userId, id, { title, pages }) {
+  const doc = await readDoc(userId, id);
   if (!doc) return null;
   if (typeof title === "string") doc.title = str(title, 200);
   if (pages !== undefined) doc.pages = cleanPages(pages);
   doc.updatedAt = new Date().toISOString();
-  await writeAtomic(path.join(docDir(id), "doc.json"), JSON.stringify(doc));
+  await writeAtomic(path.join(docDir(userId, id), "doc.json"), JSON.stringify(doc));
   return doc;
 }
 
-export async function deleteDoc(id) {
-  await fs.rm(docDir(id), { recursive: true, force: true });
+export async function deleteDoc(userId, id) {
+  await fs.rm(docDir(userId, id), { recursive: true, force: true });
 }
 
-export async function savePageImage(id, pageId, buffer) {
+export async function savePageImage(userId, id, pageId, buffer) {
   if (!isId(pageId)) throw new Error("Invalid id");
-  if (!(await readDoc(id))) return false;
-  await writeAtomic(path.join(docDir(id), `${pageId}.jpg`), buffer);
+  if (!(await readDoc(userId, id))) return false;
+  await writeAtomic(path.join(docDir(userId, id), `${pageId}.jpg`), buffer);
   return true;
 }
 
-export function pageImagePath(id, pageId) {
+export function pageImagePath(userId, id, pageId) {
   if (!isId(pageId)) throw new Error("Invalid id");
-  return path.join(docDir(id), `${pageId}.jpg`);
+  return path.join(docDir(userId, id), `${pageId}.jpg`);
+}
+
+/**
+ * Documents saved before accounts existed sit directly in DATA_DIR/<docId>/.
+ * Give them to the first account that is created.
+ */
+export async function adoptLegacyDocs(userId) {
+  let entries;
+  try {
+    entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return 0;
+    throw error;
+  }
+  let moved = 0;
+  for (const e of entries) {
+    if (!e.isDirectory() || !isId(e.name) || e.name === "docs") continue;
+    const from = path.join(DATA_DIR, e.name);
+    try {
+      await fs.access(path.join(from, "doc.json"));
+    } catch {
+      continue;
+    }
+    await fs.mkdir(userDir(userId), { recursive: true });
+    await fs.rename(from, docDir(userId, e.name));
+    moved++;
+  }
+  return moved;
 }
