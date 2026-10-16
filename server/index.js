@@ -6,7 +6,8 @@ import * as store from "./store.js";
 import * as learning from "./learning.js";
 import { authRoutes, requireUser } from "./auth.js";
 import { requestReading, resumeReading } from "./jobs.js";
-import { warmUp, MODELS_DIR } from "./ocr.js";
+import { warmUp, MODELS_DIR, localModelAvailable } from "./ocr.js";
+import { geminiEnabled } from "./gemini.js";
 import fs from "node:fs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -184,14 +185,18 @@ app.use("/api", (err, req, res, next) => {
   res.status(500).json({ error: "Server error while saving or loading the document." });
 });
 
-if (!DEMO && !fs.existsSync(`${MODELS_DIR}/mishkefet-v1.pt`)) {
-  console.warn(`Warning: the reading model is not in ${MODELS_DIR}. Run \`npm run models\` to download it, or \`npm run demo\` to try the interface.`);
+if (!DEMO && !localModelAvailable()) {
+  console.warn(
+    geminiEnabled()
+      ? `Note: the free engine has no base model (base.pt) in ${MODELS_DIR}, so pages are read only by Gemini and personal models can't be trained. See the README.`
+      : `Warning: no reader is set up. Set GEMINI_API_KEY, or put base.pt in ${MODELS_DIR} (see the README), or run \`npm run demo\` to try the interface.`
+  );
 }
 
 const server = app.listen(PORT, () => {
   console.log(`Hebrew handwriting converter running at http://localhost:${PORT}${DEMO ? " (demo mode)" : ""}`);
   resumeReading().catch((error) => console.error("Could not resume reading:", error));
   learning.markInterruptedTraining().catch((error) => console.error("Could not check training:", error));
-  if (!DEMO) warmUp();
+  if (!DEMO && localModelAvailable()) warmUp();
 });
 server.requestTimeout = 10 * 60 * 1000; // large page uploads on slow connections

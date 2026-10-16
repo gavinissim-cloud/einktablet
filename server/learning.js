@@ -21,6 +21,11 @@ const MAX_EXAMPLES = 2000; // kept per writer (oldest dropped first)
 const TRAIN_MIN_LINES = Number(process.env.TRAIN_MIN_LINES || 20); // corrected lines before training is offered
 const AUTO_TRAIN_EVERY = Number(process.env.AUTO_TRAIN_EVERY || 25); // new corrections that start training again (0 = never)
 const DEMO = process.env.DEMO_MODE === "1";
+// Lines first read by Gemini are used to train only when this is "1". Google's
+// terms forbid using Gemini to develop competing models; whether training a
+// handwriting reader on users' corrections of Gemini's readings falls under
+// that is a legal question, so it stays off until the operator decides.
+const TRAIN_ON_GEMINI_LINES = process.env.TRAIN_ON_GEMINI_LINES === "1";
 
 const userDir = (userId) => {
   if (!isId(userId)) throw new Error("Invalid id");
@@ -60,7 +65,10 @@ const examplesFile = (userId, writerId) => path.join(writerDir(userId, writerId)
 export async function listWriters(userId) {
   const writers = await readJson(writersFile(userId), []);
   return Promise.all(
-    writers.map(async (w) => ({ ...w, exampleCount: (await readJson(examplesFile(userId, w.id), [])).length }))
+    writers.map(async (w) => {
+      const examples = await readJson(examplesFile(userId, w.id), []);
+      return { ...w, exampleCount: examples.length, correctedCount: examples.filter((e) => e.corrected !== false).length };
+    })
   );
 }
 
@@ -148,13 +156,20 @@ export async function learnFromDocument(userId, writerId, docId, pages, pageImag
 
     for (const page of pages) {
       if (page.status !== "done") continue;
+      const readable = page.lines.filter((l) => typeof l.ai === "string" && l.top != null);
+      const isCorrected = (l) => Boolean(l.text.trim()) && l.text.trim() !== l.ai.trim();
+      // A page the person corrected counts as reviewed: its untouched lines are
+      // kept too, as confirmed readings. They make fair comparisons possible
+      // (corrected lines alone are only the ones the reader got wrong) and
+      // give training more to learn from.
+      const reviewed = readable.some(isCorrected);
       let image; // loaded only when a new crop is needed
-      for (const line of page.lines) {
-        if (typeof line.ai !== "string" || line.top == null) continue;
+      for (const line of readable) {
         const id = exampleId(page.id, line);
         const existing = byId.get(id);
-        const corrected = line.text.trim() && line.text.trim() !== line.ai.trim();
-        if (!corrected) {
+        const corrected = isCorrected(line);
+        if (!reviewed) {
+          // Nothing corrected (any more) on this page: forget what this reading taught.
           if (existing && existing.rev === (page.readRev || 0)) {
             byId.delete(id);
             await fs.rm(exampleImagePath(userId, writerId, id), { force: true });
@@ -163,9 +178,8 @@ export async function learnFromDocument(userId, writerId, docId, pages, pageImag
           continue;
         }
         if (existing) {
-          if (existing.text !== line.text) {
-            existing.text = line.text;
-            existing.updatedAt = now;
+          if (existing.text !== line.text || existing.corrected !== corrected) {
+            Object.assign(existing, { text: line.text, corrected, updatedAt: now });
             changed = true;
           }
           continue;
@@ -174,7 +188,10 @@ export async function learnFromDocument(userId, writerId, docId, pages, pageImag
         if (!image) continue;
         await fs.mkdir(writerDir(userId, writerId), { recursive: true });
         await fs.writeFile(exampleImagePath(userId, writerId, id), await exampleCrop(image, line));
-        byId.set(id, { id, docId, text: line.text, ai: line.ai, rev: page.readRev || 0, createdAt: now, updatedAt: now });
+        byId.set(id, {
+          id, docId, text: line.text, ai: line.ai, corrected, source: line.source || "local",
+          rev: page.readRev || 0, createdAt: now, updatedAt: now,
+        });
         changed = true;
       }
     }
@@ -254,10 +271,14 @@ async function fixesFor(userId, writerId) {
 
 export const writerModelPath = (userId, writerId) => path.join(writerDir(userId, writerId), "model.pt");
 
-/** What the reader uses for this writer: their personal model (if trained) and earlier fixes. */
-export async function learningFor(userId, writerId) {
+/**
+ * What the readers use for this writer: their personal model (if trained, and
+ * whether it measured better than Gemini), earlier fixes, and recent corrected
+ * lines as examples for Gemini.
+ */
+export async function learningFor(userId, writerId, { exampleImages = 0 } = {}) {
   const writer = writerId && (await getWriter(userId, writerId));
-  if (!writer) return { model: null, fixes: [] };
+  if (!writer) return { model: null, beatsGemini: false, fixes: [], examples: [] };
   let model = null;
   if (writer.model) {
     try {
@@ -265,7 +286,17 @@ export async function learningFor(userId, writerId) {
       model = writerModelPath(userId, writerId);
     } catch {}
   }
-  return { model, fixes: await fixesFor(userId, writerId) };
+  const examples = [];
+  if (exampleImages) {
+    for (const e of await listExamples(userId, writerId)) {
+      if (examples.length >= exampleImages) break;
+      if (e.corrected === false) continue;
+      try {
+        examples.push({ ...e, image: await fs.readFile(exampleImagePath(userId, writerId, e.id)) });
+      } catch {}
+    }
+  }
+  return { model, beatsGemini: Boolean(model && writer.model?.beatsGemini), fixes: await fixesFor(userId, writerId), examples };
 }
 
 // ---------- Training a personal model ----------
@@ -325,7 +356,8 @@ async function runTraining(userId, writerId) {
   const examples = await listExamples(userId, writerId);
   const dir = writerDir(userId, writerId);
   const tsv = path.join(dir, "training.tsv");
-  const rows = examples.map((e) => `${exampleImagePath(userId, writerId, e.id)}\t${e.text.replace(/[\t\n]/g, " ")}`);
+  const clean = (s) => String(s ?? "").replace(/[\t\n]/g, " ");
+  const rows = examples.map((e) => [exampleImagePath(userId, writerId, e.id), clean(e.text), clean(e.ai), e.source || ""].join("\t"));
   await fs.writeFile(tsv, rows.join("\n") + "\n");
   const startedAt = new Date().toISOString();
   await setTraining(userId, writerId, { training: { status: "running", startedAt, step: 0, of: 0, lines: examples.length } });
@@ -339,7 +371,7 @@ async function runTraining(userId, writerId) {
     report = { kept: false, reason: "demo", lines: examples.length };
   } else {
     let last = 0;
-    report = await trainWriter(tsv, writerModelPath(userId, writerId) + ".new", (step, of) => {
+    report = await trainWriter(tsv, writerModelPath(userId, writerId) + ".new", TRAIN_ON_GEMINI_LINES ? "" : "gemini", (step, of) => {
       if (Date.now() - last < 3000 && step !== of) return; // keep writes light
       last = Date.now();
       setTraining(userId, writerId, { training: { status: "running", startedAt, step, of, lines: examples.length } }).catch(() => {});
@@ -347,12 +379,20 @@ async function runTraining(userId, writerId) {
   }
 
   const finishedAt = new Date().toISOString();
-  const result = { before: report.before ?? null, after: report.after ?? null, lines: report.lines, held: report.held ?? 0 };
+  const result = {
+    before: report.before ?? null, after: report.after ?? null, lines: report.lines, held: report.held ?? 0,
+    gemini: report.gemini ?? null, personalOnGemini: report.personal_on_gemini ?? null, compared: report.compared ?? 0,
+  };
+  // Switch this writer to their own model only when it read the same lines better than Gemini did.
+  const beatsGemini = result.compared >= 5 && result.personalOnGemini != null && result.personalOnGemini < result.gemini;
   if (report.kept) {
     await fs.rename(writerModelPath(userId, writerId) + ".new", writerModelPath(userId, writerId));
     await setTraining(userId, writerId, {
       training: { status: "done", finishedAt, ...result, kept: true },
-      model: { trainedAt: finishedAt, lines: examples.length, before: result.before, after: result.after },
+      model: {
+        trainedAt: finishedAt, lines: examples.length, before: result.before, after: result.after,
+        gemini: result.gemini, personalOnGemini: result.personalOnGemini, compared: result.compared, beatsGemini,
+      },
     });
   } else {
     await fs.rm(writerModelPath(userId, writerId) + ".new", { force: true });

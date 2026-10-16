@@ -1,6 +1,7 @@
 import * as store from "./store.js";
 import { learningFor } from "./learning.js";
-import { readPage, OcrError } from "./ocr.js";
+import { readPage, OcrError, localModelAvailable } from "./ocr.js";
+import { readPageGemini, geminiEnabled } from "./gemini.js";
 import { demoPage } from "./demo.js";
 
 // Pages are read on the server, one after another, so reading continues even
@@ -9,6 +10,29 @@ import { demoPage } from "./demo.js";
 
 const CONCURRENCY = 1;
 const DEMO = process.env.DEMO_MODE === "1";
+// Which reader reads pages: "auto" (Gemini when a key is set, a writer's own
+// model once it reads them better), "gemini" or "local" (always the free engine).
+const READER = process.env.READER || "auto";
+const localAvailable = localModelAvailable;
+const TRANSIENT = new Set(["rate_limited", "api_error"]);
+
+/** Read with the right engine for this writer. Returns {lines, source}. */
+async function readWithBestEngine(userId, writerId, imagePath, image, progress) {
+  const wantGemini = READER !== "local" && geminiEnabled();
+  const learning = await learningFor(userId, writerId, { exampleImages: wantGemini ? 24 : 0 });
+  const local = async () => {
+    const lines = await readPage(imagePath, { model: learning.model, fixes: learning.fixes, onProgress: progress });
+    return { lines, source: learning.model ? "personal" : "local" };
+  };
+  if (!wantGemini || (READER === "auto" && learning.beatsGemini)) return local();
+  try {
+    return { lines: await readPageGemini(image, { learning, onProgress: progress }), source: "gemini" };
+  } catch (error) {
+    // Gemini busy or down: fall back to the free engine rather than fail the page.
+    if (TRANSIENT.has(error.code) && localAvailable()) return local();
+    throw error;
+  }
+}
 
 const queue = [];
 const queuedKeys = new Set();
@@ -54,22 +78,20 @@ async function run({ userId, docId, pageId }) {
     if (!doc?.pages.some((p) => p.id === pageId)) return; // removed meanwhile
     await progress(0, 2);
     const imagePath = store.pageImagePath(userId, docId, pageId);
-    if (!(await store.readPageImage(userId, docId, pageId))) {
-      throw Object.assign(new Error("The page image is missing."), { code: "image_missing" });
-    }
+    const image = await store.readPageImage(userId, docId, pageId);
+    if (!image) throw Object.assign(new Error("The page image is missing."), { code: "image_missing" });
 
-    let lines;
+    let result;
     if (DEMO) {
       for (const step of [1, 2]) {
         await progress(step, 2);
         await new Promise((r) => setTimeout(r, 400));
       }
-      lines = demoPage();
+      result = { lines: demoPage(), source: "local" };
     } else {
-      const { model, fixes } = await learningFor(userId, doc.writerId);
-      lines = await readPage(imagePath, { model, fixes, onProgress: progress });
+      result = await readWithBestEngine(userId, doc.writerId, imagePath, image, progress);
     }
-    await store.finishReading(userId, docId, pageId, lines);
+    await store.finishReading(userId, docId, pageId, result.lines, result.source);
   } catch (error) {
     console.error(`Reading failed for page ${pageId}:`, error);
     const info = errorInfo(error);

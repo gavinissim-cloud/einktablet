@@ -405,6 +405,7 @@ function setAuthMode(mode) {
   $("#authSwitch").textContent = t(register ? "login" : "register");
   $("#authPass").autocomplete = register ? "new-password" : "current-password";
   $("#authCodeRow").hidden = !(register && signupNeedsCode);
+  $("#authShareRow").hidden = !register;
   $("#authError").textContent = "";
 }
 
@@ -429,10 +430,21 @@ function signedIn(user) {
   $("#accountName").hidden = false;
   $("#accountName").textContent = user.username || t("myAccount");
   $("#logout").hidden = false;
+  $("#shareSetting").checked = Boolean(user.shareForTraining);
   $("#authPass").value = "";
   $("#authCode").value = "";
   loadWriters().finally(route);
 }
+
+$("#shareSetting").addEventListener("change", async () => {
+  try {
+    const data = await api("PATCH", "/api/auth/me", { shareForTraining: $("#shareSetting").checked });
+    state.user = data.user;
+  } catch (err) {
+    $("#shareSetting").checked = !$("#shareSetting").checked;
+    notify(errText(err));
+  }
+});
 
 $("#authSwitch").addEventListener("click", (e) => {
   e.preventDefault();
@@ -446,7 +458,10 @@ $("#authForm").addEventListener("submit", async (e) => {
   $("#authError").textContent = "";
   try {
     const body = { username: $("#authUser").value, password: $("#authPass").value };
-    if (authMode === "register") body.code = $("#authCode").value;
+    if (authMode === "register") {
+      body.code = $("#authCode").value;
+      body.shareForTraining = $("#authShare").checked;
+    }
     const data = await api("POST", `/api/auth/${authMode}`, body);
     signedIn(data.user);
   } catch (err) {
@@ -518,7 +533,7 @@ function watchReading() {
         if (!server) continue;
         const newer = (server.readRev || 0) > (page.readRev || 0);
         const changed = newer || server.status !== page.status || JSON.stringify(server.progress) !== JSON.stringify(page.progress);
-        Object.assign(page, { status: server.status, progress: server.progress, error: server.error, errorCode: server.errorCode });
+        Object.assign(page, { status: server.status, progress: server.progress, error: server.error, errorCode: server.errorCode, readBy: server.readBy });
         if (newer) {
           page.readRev = server.readRev;
           page.lines = withCrops(page, server.lines);
@@ -612,7 +627,8 @@ function renderPage(page) {
   }
   if (page.status === "done") {
     const n = page.lines.filter((l) => l.unclear.length).length;
-    st.textContent = t("linesCount", { n: page.lines.length }) + (n ? ` · ${t("toCheck", { n })}` : "");
+    st.textContent = t("linesCount", { n: page.lines.length }) + (n ? ` · ${t("toCheck", { n })}` : "")
+      + (page.readBy ? ` · ${t(`readBy_${page.readBy}`)}` : "");
   }
   if (!isBusy(page) && page.canvas) {
     head.append(button(page.status === "new" ? t("read") : t("reread"), "secondary", async () => {
@@ -938,7 +954,7 @@ async function renderWriterList() {
     link.dir = "auto";
     const meta = document.createElement("span");
     meta.className = "meta";
-    meta.textContent = t("learnedCount", { n: w.exampleCount }) + (w.model ? ` · ${t("personalModel")}` : "") + (w.learn ? "" : ` · ${t("learningOff")}`);
+    meta.textContent = t("learnedCount", { n: w.correctedCount ?? w.exampleCount }) + (w.model ? ` · ${t("personalModel")}` : "") + (w.learn ? "" : ` · ${t("learningOff")}`);
     item.append(link, meta);
     list.append(item);
   }
@@ -1020,6 +1036,10 @@ function renderTraining(writer) {
   let result = "";
   if (tr.status === "done" && tr.kept && tr.held) result = t("trainGain", { held: tr.held, before: pct(tr.before), after: pct(tr.after) });
   else if (writer.model?.before != null && !busy) result = t("trainGain", { held: tr.held || "?", before: pct(writer.model.before), after: pct(writer.model.after) });
+  const m = writer.model;
+  if (m?.compared >= 5 && !busy) {
+    result += " " + t(m.beatsGemini ? "beatsGemini" : "behindGemini", { n: m.compared, gemini: pct(m.gemini), personal: pct(m.personalOnGemini) });
+  }
   if (tr.status === "done" && !tr.kept && tr.reason === "no_gain") result = t("trainNoGain");
   if (tr.status === "failed") result = tr.error === "interrupted" ? t("trainInterrupted") : t("trainFailed", { msg: tr.error || "" });
   $("#trainResult").textContent = result;

@@ -9,8 +9,11 @@ RUN python3 -m venv /opt/ocr \
  && /opt/ocr/bin/pip install --no-cache-dir -r /app/ocr/requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu \
  && /opt/ocr/bin/pip install --no-cache-dir --no-deps "heb-ocr @ git+https://github.com/itayinbarr/heb-ocr@19b7c158d14e9293e0806f909f1d497cc4784eaf"
 
-# The model (Mishkefet-v1, CC-BY-NC-SA-4.0) and rehearsal data, checked against fixed fingerprints.
-COPY ocr/fetch_models.py /app/ocr/fetch_models.py
+# Rehearsal handwriting (Pinkas, CC-BY-4.0, checked against a fixed fingerprint) and
+# the Hebrew letter/word statistics, built from Wikipedia. All allow commercial use.
+# The base model, base.pt, is not included: train it with ocr/train_base.ipynb and
+# put it on the data disk (see OCR_BASE_MODEL below and the README).
+COPY ocr/fetch_models.py ocr/build_stats.py /app/ocr/
 RUN /opt/ocr/bin/python /app/ocr/fetch_models.py /opt/models
 
 WORKDIR /app
@@ -23,7 +26,8 @@ COPY ocr ./ocr
 # Accounts, documents, page images, learned handwriting and personal models live here.
 # Mount a persistent disk at /data or they are lost on every deploy.
 ENV NODE_ENV=production DATA_DIR=/data PORT=3000 \
-    OCR_PYTHON=/opt/ocr/bin/python OCR_MODELS_DIR=/opt/models
+    OCR_PYTHON=/opt/ocr/bin/python OCR_MODELS_DIR=/opt/models \
+    OCR_BASE_MODEL=/data/models/base.pt
 VOLUME /data
 EXPOSE 3000
 CMD ["node", "server/index.js"]

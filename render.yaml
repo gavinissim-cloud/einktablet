@@ -9,8 +9,8 @@ services:
       mountPath: /data
       sizeGB: 5
     envVars:
-      - key: ANTHROPIC_API_KEY
-        sync: false # you are asked for it when creating the service
+      - key: GEMINI_API_KEY
+        sync: false # you are asked for it when creating the service (use a paid-tier key)
       - key: SIGNUP_CODE
         sync: false
       - key: TRUST_PROXY

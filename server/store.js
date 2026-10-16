@@ -54,6 +54,8 @@ const cleanLines = (lines) =>
     left: num(l?.left),
     right: num(l?.right),
     unclear: Array.isArray(l?.unclear) ? l.unclear.filter((w) => typeof w === "string").slice(0, 50) : [],
+    // Which reader produced `ai`: "gemini", "local" (general model) or "personal".
+    source: ["gemini", "local", "personal"].includes(l?.source) ? l.source : undefined,
   }));
 
 /**
@@ -143,11 +145,12 @@ export function updatePage(userId, id, pageId, patch) {
 }
 
 /** Store a finished reading: it replaces the page's lines. */
-export function finishReading(userId, id, pageId, lines) {
+export function finishReading(userId, id, pageId, lines, source) {
   return withDoc(userId, id, (doc) => {
     const page = doc.pages.find((p) => p.id === pageId);
     if (!page) return false;
-    page.lines = cleanLines(lines.map((l) => ({ ...l, ai: l.text })));
+    page.lines = cleanLines(lines.map((l) => ({ ...l, ai: l.text, source })));
+    page.readBy = source;
     page.status = "done";
     page.readRev = (page.readRev || 0) + 1;
     delete page.progress;

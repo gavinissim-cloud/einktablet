@@ -9,3 +9,5 @@ pillow
 opencv-python-headless
 rapidfuzz
 scipy
+datasets   # only to build the word statistics from Wikipedia
+wordfreq   # only to build the abbreviation table

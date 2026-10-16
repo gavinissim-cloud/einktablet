@@ -14,6 +14,13 @@ const PYTHON = process.env.OCR_PYTHON || (fs.existsSync(localVenv) ? localVenv :
 export const MODELS_DIR = path.resolve(process.env.OCR_MODELS_DIR || path.join(here, "..", "models"));
 const THREADS = process.env.OCR_THREADS || "";
 
+/** Whether the free engine has a base model to read with (the same rule as ocr/engine.py). */
+export function localModelAvailable() {
+  if (process.env.OCR_BASE_MODEL) return fs.existsSync(path.resolve(MODELS_DIR, process.env.OCR_BASE_MODEL));
+  if (fs.existsSync(path.join(MODELS_DIR, "base.pt"))) return true;
+  return process.env.OCR_ALLOW_NONCOMMERCIAL === "1" && fs.existsSync(path.join(MODELS_DIR, "mishkefet-v1.pt"));
+}
+
 const env = () => ({ ...process.env, OCR_MODELS_DIR: MODELS_DIR, OCR_THREADS: THREADS, PYTHONUNBUFFERED: "1" });
 
 export class OcrError extends Error {
@@ -92,9 +99,10 @@ export function warmUp() {
  * Train a personal model. `examplesTsv` lists image paths and correct texts.
  * Resolves with the final report: {kept, before, after, lines, held, seconds}.
  */
-export function trainWriter(examplesTsv, outPath, onProgress) {
+export function trainWriter(examplesTsv, outPath, evalOnlySource, onProgress) {
   return new Promise((resolve, reject) => {
     const args = [path.join(OCR_DIR, "train_writer.py"), "--models", MODELS_DIR, "--examples", examplesTsv, "--out", outPath];
+    if (evalOnlySource) args.push("--eval-only-source", evalOnlySource);
     if (THREADS) args.push("--threads", THREADS);
     const proc = spawn(PYTHON, args, { env: env(), stdio: ["ignore", "pipe", "inherit"] });
     let report = null;

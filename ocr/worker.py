@@ -28,7 +28,7 @@ def send(obj):
 
 def main() -> int:
     models = os.environ.get("OCR_MODELS_DIR", str(Path(__file__).resolve().parent.parent / "models"))
-    threads = int(os.environ.get("OCR_THREADS", "0")) or None
+    threads = int(os.environ.get("OCR_THREADS") or 0) or None
     try:
         import engine
 

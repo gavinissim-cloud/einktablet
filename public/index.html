@@ -32,6 +32,7 @@
         <label id="authCodeRow" hidden><span data-i18n="signupCode">Sign-up code</span>
           <input id="authCode" name="code" dir="ltr" autocomplete="off">
         </label>
+        <label id="authShareRow" class="check" hidden><input type="checkbox" id="authShare"> <span data-i18n="shareConsent">Let my corrected lines help improve the reading engine for everyone</span></label>
         <p id="authError" class="auth-error" role="alert"></p>
         <button id="authSubmit" type="submit">Log in</button>
         <p class="auth-switch">
@@ -50,6 +51,9 @@
       </label>
       <div id="docList" class="doc-list"></div>
       <div id="writerList" class="doc-list"></div>
+      <div class="doc-list">
+        <label class="check"><input type="checkbox" id="shareSetting"> <span data-i18n="shareConsent">Let my corrected lines help improve the reading engine for everyone</span></label>
+      </div>
     </section>
 
     <section id="writerView" hidden>

@@ -1,15 +1,25 @@
-"""Reading pages of Hebrew handwriting with Mishkefet (heb-ocr), on the CPU.
+"""Reading pages of Hebrew handwriting with a heb-ocr model, on the CPU.
 
-Everything runs locally: no network and no paid service. The model files come
-from fetch_models.py and are loaded in a mode that refuses to run code, so a
-tampered download cannot execute anything.
+Everything runs locally: no network and no paid service. Model files are loaded
+in a mode that refuses to run code, so a tampered file cannot execute anything.
+
+Which base model is used (see base_model_path):
+- base.pt: the commercial-safe model trained with ocr/train_base.ipynb, only on
+  data that allows commercial use. The default.
+- mishkefet-v1.pt: the published Mishkefet-v1 model. More accurate today, but
+  CC-BY-NC-SA-4.0 (non-commercial), so used only with OCR_ALLOW_NONCOMMERCIAL=1.
 """
 
+import json
 import math
+import os
 import pickle
+import re
 import types
 from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
 from PIL import Image, ImageOps
 
@@ -46,7 +56,7 @@ hebocr.wordlm.pickle = _data_only_pickle
 from hebocr.data.transforms import preprocess  # noqa: E402
 from hebocr.decode import beam_decode, greedy_confidence, greedy_decode  # noqa: E402
 from hebocr.lm import CharNGramLM  # noqa: E402
-from hebocr.page.segment import segment_page  # noqa: E402
+from hebocr.page.segment import binarize, estimate_skew, segment_page  # noqa: E402
 from hebocr.recognize import Recognizer  # noqa: E402
 from hebocr.wordlm import WordUnigramLM  # noqa: E402
 
@@ -62,14 +72,48 @@ def _strip(word: str) -> str:
     return word.strip(PUNCT)
 
 
+HEB = "\u05d0-\u05ea"
+
+
+def hebrew_marks(text: str, gershayim: dict[str, str]) -> str:
+    """Turn the model's keyboard marks into Hebrew ones, and gershayim it read as two yods back.
+
+    The model writes " ' - (it has no ״ ׳ ־). In handwriting, gershayim also
+    looks like two small yods, so "ד״ר" can come out as "דייר"; `gershayim`
+    (from build_stats.py) maps such spellings to the abbreviation.
+    """
+    words = text.split(" ")
+    for i, word in enumerate(words):
+        core = _strip(word)
+        if core in gershayim:
+            words[i] = word.replace(core, gershayim[core], 1)
+    text = " ".join(words)
+    text = re.sub(f'(?<=[{HEB}])"(?=[{HEB}])', "\u05f4", text)
+    text = re.sub(f"(?<=[{HEB}])'", "\u05f3", text)
+    return re.sub(f"(?<=[{HEB}])-(?=[{HEB}])", "\u05be", text)
+
+
+def base_model_path(models_dir: str | Path) -> Path:
+    models_dir = Path(models_dir)
+    if os.environ.get("OCR_BASE_MODEL"):
+        return models_dir / os.environ["OCR_BASE_MODEL"]  # a full path also works
+    if (models_dir / "base.pt").exists():
+        return models_dir / "base.pt"
+    if os.environ.get("OCR_ALLOW_NONCOMMERCIAL") == "1":
+        return models_dir / "mishkefet-v1.pt"
+    raise FileNotFoundError(2, "no commercial-safe base model (base.pt); train one with ocr/train_base.ipynb", str(models_dir / "base.pt"))
+
+
 class Engine:
     def __init__(self, models_dir: str | Path, threads: int | None = None):
         self.dir = Path(models_dir)
         if threads:
             torch.set_num_threads(threads)
+        self.base_path = base_model_path(self.dir)
         self.char_lm = CharNGramLM.load(self.dir / "hebrew_char6.pkl")
         self.word_lm = WordUnigramLM.load(self.dir / "hebrew_words.pkl")
-        self.base_path = self.dir / "mishkefet-v1.pt"
+        table = self.dir / "gershayim.json"
+        self.gershayim = json.loads(table.read_text(encoding="utf-8")) if table.exists() else {}
         self._models: dict[str, Recognizer] = {}
 
     def recognizer(self, checkpoint: str | Path | None = None) -> Recognizer:
@@ -151,7 +195,9 @@ class Engine:
         """
         image = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
         progress(1, 2)
-        crops, boxes, angle = segment_page(image)
+        cleaned, turned = clean_page(image)
+        crops, boxes, angle = segment_page(cleaned)
+        angle += turned  # both turns are about the page centre, so they add up
         if not crops:
             return []
         progress(2, 2)
@@ -167,7 +213,7 @@ class Engine:
             # Specks and margin marks: tiny, short and unsure.
             if not text or (len(_strip(text)) <= 2 and (conf < 0.8 or box.w < 2 * typical)):
                 continue
-            text = self.apply_fixes(text, fixes)
+            text = self.apply_fixes(hebrew_marks(text, self.gershayim), fixes)
             lines.append({
                 "text": text,
                 **page_box(box, angle, image.width, image.height),
@@ -175,6 +221,37 @@ class Engine:
                 "confidence": round(float(conf), 3),
             })
         return lines
+
+
+def clean_page(image: Image.Image) -> tuple[Image.Image, float]:
+    """Straighten the page and paint out the paper's printed ruled lines.
+
+    The line finder otherwise takes each ruled line for a line of text, and
+    the reader then sees the rule inside every crop. Rules are found as long,
+    thin, horizontal dark runs, which only works once the page is straight.
+    Returns the cleaned page and the angle it was turned by.
+    """
+    binary, _ = binarize(image)
+    angle = estimate_skew(binary)
+    rgb = np.asarray(image.convert("RGB"))
+    paper_colour = tuple(int(v) for v in np.median(rgb.reshape(-1, 3), axis=0))
+    if abs(angle) > 1e-3:
+        image = image.rotate(angle, resample=Image.BICUBIC, fillcolor=paper_colour)
+        rgb = np.asarray(image)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    block = max(31, (min(h, w) // 40) | 1)
+    dark = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, 10)
+    # A run as long as a sixth of the page and one pixel high is a printed rule:
+    # handwriting never draws one.
+    rules = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(40, w // 6), 1)))
+    if rules.any():
+        rules = cv2.dilate(rules, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5)))
+        paper = cv2.medianBlur(rgb, 31)
+        rgb = rgb.copy()
+        rgb[rules > 0] = paper[rules > 0]
+        image = Image.fromarray(rgb)
+    return image, angle
 
 
 def page_box(box, angle: float, width: int, height: int) -> dict:

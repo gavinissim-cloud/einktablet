@@ -128,11 +128,32 @@ export async function requireUser(req, res, next) {
 
 // ---------- Routes ----------
 
+const publicUser = (u) => ({ username: u.username, shareForTraining: Boolean(u.shareForTraining) });
+
+/** Ids of the accounts that allowed their corrections to train the shared model. */
+export async function sharingUserIds() {
+  return (await users.load()).filter((u) => u.shareForTraining).map((u) => u.id);
+}
+
 export function authRoutes(app, { onFirstUser } = {}) {
+  app.patch("/api/auth/me", async (req, res, next) => {
+    try {
+      const user = await currentUser(req);
+      if (!user) return res.status(401).json({ error: "Please log in again.", code: "auth_required" });
+      if (typeof req.body?.shareForTraining !== "boolean") return res.status(400).json({ error: "Nothing to change." });
+      const updated = await users.update((all) => {
+        const u = all.find((x) => x.id === user.id);
+        if (u) u.shareForTraining = req.body.shareForTraining;
+        return u;
+      });
+      res.json({ user: publicUser(updated) });
+    } catch (e) { next(e); }
+  });
+
   app.get("/api/auth/me", async (req, res, next) => {
     try {
       const user = await currentUser(req);
-      res.json({ user: user ? { username: user.username } : null, signupNeedsCode: Boolean(SIGNUP_CODE) });
+      res.json({ user: user ? publicUser(user) : null, signupNeedsCode: Boolean(SIGNUP_CODE) });
     } catch (e) { next(e); }
   });
 
@@ -150,7 +171,11 @@ export function authRoutes(app, { onFirstUser } = {}) {
         return res.status(400).json({ error: "Passwords need at least 8 characters.", code: "bad_password" });
       }
       const { salt, hash } = await hashPassword(password);
-      const user = { id: crypto.randomUUID(), username, salt, hash, createdAt: new Date().toISOString() };
+      const user = {
+        id: crypto.randomUUID(), username, salt, hash, createdAt: new Date().toISOString(),
+        // Whether this person's corrected lines may help train the shared reading model.
+        shareForTraining: req.body?.shareForTraining === true,
+      };
       const result = await users.update((all) => {
         if (all.some((u) => u.username === username)) return "taken";
         all.push(user);
@@ -159,7 +184,7 @@ export function authRoutes(app, { onFirstUser } = {}) {
       if (result === "taken") return res.status(409).json({ error: "That username is already taken.", code: "taken" });
       if (result === "first" && onFirstUser) await onFirstUser(user.id);
       await startSession(req, res, user);
-      res.status(201).json({ user: { username } });
+      res.status(201).json({ user: publicUser(user) });
     } catch (e) { next(e); }
   });
 
@@ -178,7 +203,7 @@ export function authRoutes(app, { onFirstUser } = {}) {
       }
       keys.forEach((k) => failures.delete(k));
       await startSession(req, res, user);
-      res.json({ user: { username: user.username } });
+      res.json({ user: publicUser(user) });
     } catch (e) { next(e); }
   });
 
