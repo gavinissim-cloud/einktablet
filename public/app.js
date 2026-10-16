@@ -13,7 +13,50 @@ const state = { user: null, doc: null, view: "lines" };
 const $ = (sel) => document.querySelector(sel);
 const currentPages = () => state.doc?.pages || [];
 
+// An embedding page (the hosted preview) can supply its own storage, reading
+// and downloads by defining window.HW_BACKEND before this script runs.
+const backend = window.HW_BACKEND || null;
+
+// ---------- In-page dialogs (instead of the browser's alert/confirm) ----------
+
+function dialog(message, { okLabel = "אישור", cancelLabel = null, danger = false } = {}) {
+  return new Promise((resolve) => {
+    const prev = document.activeElement;
+    const wrap = document.createElement("div");
+    wrap.className = "dialog-wrap";
+    wrap.innerHTML = '<div class="dialog" role="alertdialog" aria-modal="true"><p class="dialog-msg"></p><div class="dialog-actions"></div></div>';
+    wrap.querySelector(".dialog-msg").textContent = message;
+    const actions = wrap.querySelector(".dialog-actions");
+    const close = (value) => {
+      wrap.remove();
+      document.removeEventListener("keydown", onKey, true);
+      prev?.focus?.();
+      resolve(value);
+    };
+    const ok = button(okLabel, danger ? "danger" : "", () => close(true));
+    actions.append(ok);
+    if (cancelLabel) actions.append(button(cancelLabel, "secondary", () => close(false)));
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); close(false); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    wrap.addEventListener("click", (e) => { if (e.target === wrap) close(false); });
+    document.body.append(wrap);
+    ok.focus();
+  });
+}
+const notify = (message) => dialog(message);
+const ask = (message, okLabel = "כן", opts = {}) => dialog(message, { okLabel, cancelLabel: "ביטול", ...opts });
+
 async function api(method, url, body, headers = { "Content-Type": "application/json" }) {
+  if (backend) {
+    try {
+      return await backend.request(method, url, body);
+    } catch (err) {
+      if (err.status === 401 && !url.startsWith("/api/auth/")) showAuth();
+      throw err;
+    }
+  }
   const res = await fetch(url, {
     method,
     headers: body === undefined ? undefined : headers,
@@ -27,7 +70,8 @@ async function api(method, url, body, headers = { "Content-Type": "application/j
     const data = await res.json().catch(() => ({}));
     throw Object.assign(new Error(data.error || `Server error ${res.status}`), { status: res.status });
   }
-  return res.status === 204 ? null : res.json();
+  if (res.status === 204) return null;
+  return (res.headers.get("Content-Type") || "").includes("json") ? res.json() : res.blob();
 }
 
 // ---------- File intake ----------
@@ -62,7 +106,7 @@ async function addFiles(files) {
   if (!state.user) return;
   const accepted = files.filter((f) => f && (f.type.startsWith("image/") || f.type === "application/pdf"));
   if (!accepted.length) {
-    if (files.length) alert("אפשר להעלות רק תמונות או קובצי PDF.");
+    if (files.length) notify("אפשר להעלות רק תמונות או קובצי PDF.");
     return;
   }
   let doc = state.doc;
@@ -71,7 +115,7 @@ async function addFiles(files) {
       const created = await api("POST", "/api/documents", { title: accepted[0].name.replace(/\.[^.]+$/, "") });
       doc = adoptDoc(created, []);
     } catch (err) {
-      return alert(`לא הצלחנו ליצור מסמך חדש: ${err.message}`);
+      return notify(`לא הצלחנו ליצור מסמך חדש: ${err.message}`);
     }
     showDoc(doc);
   }
@@ -95,7 +139,7 @@ async function addFiles(files) {
       }
     } catch (err) {
       console.error(err);
-      alert(`לא הצלחנו להוסיף את הקובץ ${file.name}: ${err.message}. אם זו תמונת HEIC מאייפון, המירו אותה ל-JPG.`);
+      notify(`לא הצלחנו להוסיף את הקובץ ${file.name}: ${err.message}. אם זו תמונת HEIC מאייפון, המירו אותה ל-JPG.`);
     }
   }
 }
@@ -141,7 +185,8 @@ async function pdfToCanvases(file) {
 
 // ---------- Saved documents ----------
 
-const pageImageUrl = (doc, page) => `/api/documents/${doc.id}/pages/${page.id}/image`;
+const pageImageUrl = (doc, page) =>
+  backend ? backend.pageImageUrl(doc, page) : `/api/documents/${doc.id}/pages/${page.id}/image`;
 
 function adoptDoc(data, pages) {
   return { id: data.id, title: data.title, pages, timer: null, saving: false, dirty: false, failed: false };
@@ -231,7 +276,7 @@ async function loadDoc(id) {
   try {
     data = await api("GET", `/api/documents/${id}`);
   } catch (err) {
-    alert(`לא הצלחנו לפתוח את המסמך: ${err.message}`);
+    if (err.status !== 401) notify(`לא הצלחנו לפתוח את המסמך: ${err.message}`);
     return showHome();
   }
   const doc = adoptDoc(data, []);
@@ -241,12 +286,15 @@ async function loadDoc(id) {
       // A reading that was cut off (page closed mid-way) starts again.
       if (page.status === "working") page.status = "queued";
       try {
+        if (!page.src) throw new Error("no image");
         page.canvas = await loadCanvas(page.src);
         page.lines = page.lines.map((l) => (l.top == null ? l : { ...l, ...cropLine(page.canvas, l) }));
       } catch {
         page.canvas = null;
-        page.status = "error";
-        page.error = "תמונת העמוד חסרה בשרת";
+        if (page.status !== "done") {
+          page.status = "error";
+          page.error = "תמונת העמוד לא נשמרה. הסירו את העמוד והעלו אותו שוב.";
+        }
       }
       return page;
     })
@@ -303,11 +351,11 @@ async function renderDocList() {
     const when = new Date(d.updatedAt).toLocaleString("he-IL", { dateStyle: "short", timeStyle: "short" });
     meta.textContent = `${d.pageCount} עמודים · עודכן ${when}`;
     item.append(link, meta, button("מחיקה", "secondary", async () => {
-      if (!confirm(`למחוק את המסמך "${d.title}"? אי אפשר לבטל את זה.`)) return;
+      if (!(await ask(`למחוק את המסמך "${d.title}"? אי אפשר לבטל את זה.`, "מחיקה", { danger: true }))) return;
       try {
         await api("DELETE", `/api/documents/${d.id}`);
       } catch (err) {
-        alert(`המחיקה נכשלה: ${err.message}`);
+        notify(`המחיקה נכשלה: ${err.message}`);
       }
       renderDocList();
     }));
@@ -354,6 +402,17 @@ function setAuthMode(mode) {
 }
 
 function showAuth() {
+  if (backend?.externalAuth) {
+    $("#account").hidden = true;
+    $("#upload").hidden = true;
+    $("#workspace").hidden = true;
+    $("#auth").hidden = false;
+    $("#authForm").innerHTML = "";
+    const msg = document.createElement("p");
+    msg.textContent = backend.signedOutMessage;
+    $("#authForm").append(msg);
+    return;
+  }
   state.user = null;
   state.doc = null;
   $("#account").hidden = true;
@@ -370,6 +429,7 @@ function signedIn(user) {
   $("#auth").hidden = true;
   $("#account").hidden = false;
   $("#accountName").textContent = user.username;
+  $("#logout").hidden = Boolean(backend?.externalAuth);
   $("#authPass").value = "";
   $("#authCode").value = "";
   route();
@@ -401,7 +461,7 @@ $("#logout").addEventListener("click", async () => {
   const doc = state.doc;
   if (doc && hasUnsaved(doc)) {
     await flushSave(doc);
-    if (hasUnsaved(doc) && !confirm("יש שינויים שעדיין לא נשמרו. להתנתק בכל זאת?")) return;
+    if (hasUnsaved(doc) && !(await ask("יש שינויים שעדיין לא נשמרו. להתנתק בכל זאת?", "התנתקות"))) return;
   }
   await api("POST", "/api/auth/logout", {}).catch(() => {});
   if (location.hash) history.pushState(null, "", location.pathname);
@@ -417,7 +477,7 @@ async function start() {
     if (me.user) signedIn(me.user);
     else showAuth();
   } catch (err) {
-    alert(`השרת לא זמין: ${err.message}`);
+    notify(`השרת לא זמין: ${err.message}`);
   }
 }
 
@@ -528,16 +588,16 @@ function renderPage(page) {
     st.textContent = `${page.lines.length} שורות` + (n ? ` · ${n} לבדיקה` : "");
   }
   if (page.status === "done" || page.status === "error") {
-    head.append(button("קריאה מחדש", "secondary", () => {
-      if (page.status === "done" && !confirm("קריאה מחדש תחליף את התיקונים שעשיתם בעמוד הזה. להמשיך?")) return;
+    head.append(button("קריאה מחדש", "secondary", async () => {
+      if (page.status === "done" && !(await ask("קריאה מחדש תחליף את התיקונים שעשיתם בעמוד הזה. להמשיך?", "קריאה מחדש"))) return;
       page.status = "queued";
       renderPage(page);
       scheduleSave(state.doc);
       pump();
     }));
   }
-  head.append(button("הסרה", "secondary", () => {
-    if (page.status === "done" && !confirm("להסיר את העמוד הזה מהמסמך?")) return;
+  head.append(button("הסרה", "secondary", async () => {
+    if (page.status === "done" && !(await ask("להסיר את העמוד הזה מהמסמך?", "הסרה", { danger: true }))) return;
     state.doc.pages = state.doc.pages.filter((p) => p !== page);
     scheduleSave(state.doc);
     render();
@@ -708,6 +768,7 @@ function plainText() {
 }
 
 function download(blob, name) {
+  if (backend?.download) return backend.download(blob, name);
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = name;
@@ -720,7 +781,11 @@ $("#exportTxt").addEventListener("click", () => {
 });
 
 $("#copyAll").addEventListener("click", async () => {
-  await navigator.clipboard.writeText(plainText());
+  try {
+    await navigator.clipboard.writeText(plainText());
+  } catch {
+    return notify("ההעתקה לא הצליחה בדפדפן הזה. עברו לתצוגת \"מסמך\", סמנו את הטקסט והעתיקו ידנית.");
+  }
   $("#copyAll").textContent = "הועתק ✓";
   setTimeout(() => ($("#copyAll").textContent = "העתקה"), 1500);
 });
@@ -732,18 +797,13 @@ async function exportDocx(withImages, btn) {
       ...(withImages && l.crop ? { image: l.crop, width: l.cropW, height: l.cropH } : {}),
     })),
   }));
-  if (!pages.length) return alert("אין עדיין טקסט לייצוא.");
+  if (!pages.length) return notify("אין עדיין טקסט לייצוא.");
   btn.disabled = true;
   try {
-    const res = await fetch("/api/export/docx", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pages, withImages }),
-    });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
-    download(await res.blob(), withImages ? "transcription-with-handwriting.docx" : "transcription.docx");
+    const blob = await api("POST", "/api/export/docx", { pages, withImages });
+    await download(blob, withImages ? "transcription-with-handwriting.docx" : "transcription.docx");
   } catch (err) {
-    alert(`הייצוא נכשל: ${err.message}`);
+    if (err.status !== 401) notify(`הייצוא נכשל: ${err.message}`);
   } finally {
     btn.disabled = false;
   }
