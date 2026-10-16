@@ -776,8 +776,12 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
-$("#exportTxt").addEventListener("click", () => {
-  download(new Blob(["﻿" + plainText()], { type: "text/plain;charset=utf-8" }), "transcription.txt");
+$("#exportTxt").addEventListener("click", async () => {
+  try {
+    await download(new Blob(["﻿" + plainText()], { type: "text/plain;charset=utf-8" }), "transcription.txt");
+  } catch (err) {
+    notify(`ההורדה נכשלה: ${err.message}`);
+  }
 });
 
 $("#copyAll").addEventListener("click", async () => {

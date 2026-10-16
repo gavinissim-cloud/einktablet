@@ -46,6 +46,16 @@ npm run demo
 | `COOKIE_SECURE` | unset | `1` to always mark the login cookie as HTTPS-only |
 | `DEMO_MODE` | unset | `1` returns sample text without calling the API |
 
+## Hosted preview on claude.ai
+
+`node scripts/build-preview.mjs` builds `preview/dist/index.html`. It is the same app as a single page that runs as a claude.ai artifact, with no server of its own:
+
+- People sign in with their claude.ai account, and each person's documents are private to them.
+- Claude reads the handwriting using the viewer's own Claude usage, with the same instructions as the server.
+- Page images are stored with the artifact, and Word and text files are built in the browser.
+
+The bridge to claude.ai is `preview/backend.js`. The preview can only send Claude images of about 1.2 megapixels, so it sends each page whole plus zoomed strips. Accuracy may still differ a little from the server version.
+
 ## Accounts
 
 Everyone signs up with a username (or email) and a password, and sees only their own documents. Reading pages and exporting also require being logged in, so strangers can't use up your API credit.

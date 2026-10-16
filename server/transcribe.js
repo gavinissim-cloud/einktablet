@@ -8,7 +8,7 @@ const EFFORT = process.env.CLAUDE_EFFORT || "high";
 // Pass 1 reads the page; pass 2 re-reads it against the draft and fixes mistakes.
 const PASSES = Math.max(1, Number(process.env.TRANSCRIBE_PASSES || 2));
 
-const LINE_SCHEMA = {
+export const LINE_SCHEMA = {
   type: "object",
   properties: {
     lines: {
@@ -32,7 +32,7 @@ const LINE_SCHEMA = {
   additionalProperties: false,
 };
 
-const SYSTEM = `You are an expert reader of handwritten modern Hebrew (עברית מודרנית), including cursive script (כתב יד רהוט), print-style block letters, and mixed styles, from neat to very messy, written by children, adults and the elderly, on lined, blank or squared paper, in pen or pencil, scanned or photographed at an angle.
+export const SYSTEM = `You are an expert reader of handwritten modern Hebrew (עברית מודרנית), including cursive script (כתב יד רהוט), print-style block letters, and mixed styles, from neat to very messy, written by children, adults and the elderly, on lined, blank or squared paper, in pen or pencil, scanned or photographed at an angle.
 
 Your job is an exact, faithful transcription of the handwriting on the page — character for character, line for line, as the writer wrote it.
 

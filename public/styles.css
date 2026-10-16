@@ -12,7 +12,7 @@
   --radius: 10px;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #17181b;
     --panel: #212226;
     --ink: #ececef;
@@ -23,7 +23,21 @@
     --warn-bg: #3a3014;
     --warn: #f0be4a;
     --err: #ff7a6e;
+    color-scheme: dark;
   }
+}
+:root[data-theme="dark"] {
+  --bg: #17181b;
+  --panel: #212226;
+  --ink: #ececef;
+  --muted: #a0a0a8;
+  --line: #34353b;
+  --accent: #6d8ff0;
+  --accent-ink: #0d0e10;
+  --warn-bg: #3a3014;
+  --warn: #f0be4a;
+  --err: #ff7a6e;
+  color-scheme: dark;
 }
 * { box-sizing: border-box; }
 body {
@@ -156,7 +170,7 @@ button:disabled { opacity: .5; cursor: default; }
 .lb-close { position: sticky; top: 6px; float: left; margin: 6px; z-index: 2; }
 
 @media (max-width: 720px) {
-  main, .top { padding-left: 12px; padding-right: 12px; }
+  main, .top { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
   .row, .col-head { grid-template-columns: 1fr; }
   .flag { grid-column: 1; }
   .doc { padding: 18px; }
