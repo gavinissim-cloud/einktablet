@@ -1,4 +1,5 @@
 import { GoogleGenAI, ApiError, PartMediaResolutionLevel, createPartFromBase64 } from "@google/genai";
+import sharp from "sharp";
 
 // Reading pages with Google's Gemini (paid per page; commercial use allowed on
 // a paid account, where Google does not use the pages to train its models).
@@ -10,7 +11,9 @@ const MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const PASSES = Math.min(2, Math.max(1, Number(process.env.GEMINI_PASSES || 2)));
 const THINKING = process.env.GEMINI_THINKING || "HIGH"; // MINIMAL | LOW | MEDIUM | HIGH | off
 const EXAMPLES = Number(process.env.GEMINI_EXAMPLES || 24); // learned lines shown per request
-const TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT || 300) * 1000; // per request
+const TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT || 480) * 1000; // per request
+// Gemini scales images down itself, so a bigger upload only makes requests slower.
+const IMAGE_EDGE = Number(process.env.GEMINI_IMAGE_EDGE || 2400);
 
 export const geminiEnabled = () => Boolean(process.env.GEMINI_API_KEY);
 
@@ -149,7 +152,19 @@ async function generate(request) {
   }
 }
 
-async function ask(parts) {
+async function ask(parts, label = "request") {
+  const started = Date.now();
+  try {
+    const lines = await askOnce(parts);
+    console.log(`Gemini ${label}: ${lines.length} lines in ${Math.round((Date.now() - started) / 1000)}s`);
+    return lines;
+  } catch (error) {
+    console.error(`Gemini ${label} failed after ${Math.round((Date.now() - started) / 1000)}s: ${error.message}`);
+    throw error;
+  }
+}
+
+async function askOnce(parts) {
   const config = {
     systemInstruction: INSTRUCTIONS,
     responseMimeType: "application/json",
@@ -190,10 +205,14 @@ async function ask(parts) {
  */
 export async function readPageGemini(image, { learning = null, onProgress = () => {} } = {}) {
   try {
-    const page = createPartFromBase64(image.toString("base64"), "image/jpeg", PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH);
+    const small = await sharp(image)
+      .resize({ width: IMAGE_EDGE, height: IMAGE_EDGE, fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+    const page = createPartFromBase64(small.toString("base64"), "image/jpeg", PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH);
     const known = learnedParts(learning);
     onProgress(1, PASSES, "read");
-    let lines = await ask([...known, page, { text: "Transcribe all the handwriting on this page." }]);
+    let lines = await ask([...known, page, { text: "Transcribe all the handwriting on this page." }], "reading");
     if (PASSES > 1 && lines.length) {
       onProgress(2, PASSES, "check");
       const draft = lines
@@ -206,7 +225,7 @@ export async function readPageGemini(image, { learning = null, onProgress = () =
         {
           text: `Below is a draft transcription of this page. It may contain misread letters, words read only partly, missed or extra lines, missing punctuation (״ ׳ ־ parentheses, dashes) or inaccurate line boxes.\n\nProofread it against the handwriting: go through the image line by line and word by word, compare every word with the pen strokes, and return the corrected full transcription. Keep what the draft got right; fix everything it got wrong.\n\nDraft:\n${draft}`,
         },
-      ]).catch((error) => {
+      ], "proofread").catch((error) => {
         console.error("Gemini proofread failed, keeping the first reading:", error.message);
         return [];
       });
@@ -215,5 +234,17 @@ export async function readPageGemini(image, { learning = null, onProgress = () =
     return lines;
   } catch (error) {
     throw errorFor(error);
+  }
+}
+
+/** A tiny request at startup, so the log shows at once whether the key and model work. */
+export async function checkGemini() {
+  const started = Date.now();
+  try {
+    const response = await generate({ model: MODEL, contents: [{ role: "user", parts: [{ text: "Reply with the word OK." }] }], config: {} });
+    console.log(`Gemini check: ${MODEL} answered "${String(response.text).trim().slice(0, 20)}" in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+  } catch (error) {
+    const e = errorFor(error);
+    console.error(`Gemini check FAILED for ${MODEL} (${e.code}): ${e.message}`);
   }
 }

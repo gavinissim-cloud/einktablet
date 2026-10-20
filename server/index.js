@@ -7,7 +7,7 @@ import * as learning from "./learning.js";
 import { authRoutes, requireUser } from "./auth.js";
 import { requestReading, resumeReading } from "./jobs.js";
 import { warmUp, MODELS_DIR, localModelAvailable } from "./ocr.js";
-import { geminiEnabled } from "./gemini.js";
+import { geminiEnabled, checkGemini } from "./gemini.js";
 import fs from "node:fs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -198,5 +198,6 @@ const server = app.listen(PORT, () => {
   resumeReading().catch((error) => console.error("Could not resume reading:", error));
   learning.markInterruptedTraining().catch((error) => console.error("Could not check training:", error));
   if (!DEMO && localModelAvailable()) warmUp();
+  if (!DEMO && geminiEnabled()) checkGemini();
 });
 server.requestTimeout = 10 * 60 * 1000; // large page uploads on slow connections
