@@ -532,7 +532,9 @@ function watchReading() {
         const server = byId.get(page.id);
         if (!server) continue;
         const newer = (server.readRev || 0) > (page.readRev || 0);
-        const changed = newer || server.status !== page.status || JSON.stringify(server.progress) !== JSON.stringify(page.progress);
+        const draftChanged = (server.draft?.length || 0) !== (page.draft?.length || 0);
+        const changed = newer || draftChanged || server.status !== page.status || JSON.stringify(server.progress) !== JSON.stringify(page.progress);
+        if (draftChanged) page.draft = server.draft ? withCrops(page, server.draft) : null;
         Object.assign(page, { status: server.status, progress: server.progress, error: server.error, errorCode: server.errorCode, readBy: server.readBy });
         if (newer) {
           page.readRev = server.readRev;
@@ -648,6 +650,7 @@ function renderPage(page) {
   }));
   el.append(head);
 
+  if (page.status === "working" && page.draft?.length) return renderDraft(page, el);
   if (page.status !== "done") return;
   if (!page.lines.length) {
     el.insertAdjacentHTML("beforeend", `<div class="empty">${escapeHtml(t("noHandwriting"))}</div>`);
@@ -707,6 +710,31 @@ function renderLines(page, el) {
       }));
       row.append(flag);
     }
+    el.append(row);
+  });
+}
+
+/** The first reading, shown while the proofread runs. Editing waits until it is final. */
+function renderDraft(page, el) {
+  el.insertAdjacentHTML("beforeend", `<div class="draft-note">${escapeHtml(t("draftNote"))}</div>`);
+  page.draft.forEach((line, i) => {
+    const row = document.createElement("div");
+    row.className = "row draft";
+    if (line.crop) {
+      const img = document.createElement("img");
+      img.className = "crop";
+      img.src = line.crop;
+      img.alt = t("lineAlt", { n: i + 1 });
+      row.append(img);
+    } else {
+      row.append(document.createElement("div"));
+    }
+    const text = document.createElement("div");
+    text.className = "draft-text";
+    text.dir = "rtl";
+    text.lang = "he";
+    text.textContent = line.text;
+    row.append(text);
     el.append(row);
   });
 }

@@ -222,7 +222,7 @@ async function askOnce(parts) {
  * ({image, text, ai}) and fixes ({from, to, count}). Lines come back with
  * boxes in 0–1000 page coordinates.
  */
-export async function readPageGemini(image, { learning = null, onProgress = () => {} } = {}) {
+export async function readPageGemini(image, { learning = null, onProgress = () => {}, onDraft = () => {} } = {}) {
   try {
     const small = await sharp(image)
       .resize({ width: IMAGE_EDGE, height: IMAGE_EDGE, fit: "inside", withoutEnlargement: true })
@@ -233,6 +233,7 @@ export async function readPageGemini(image, { learning = null, onProgress = () =
     onProgress(1, PASSES, "read");
     let lines = await ask([...known, page, { text: "Transcribe all the handwriting on this page." }], "reading");
     if (PASSES > 1 && lines.length) {
+      await onDraft(lines);
       onProgress(2, PASSES, "check");
       const draft = lines
         .map((l, i) => `${i + 1}. [top ${l.top}, bottom ${l.bottom}, left ${l.left}, right ${l.right}] ${l.text}`)

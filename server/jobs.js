@@ -8,7 +8,8 @@ import { demoPage } from "./demo.js";
 // if the person closes the browser. Progress is written into the document.
 // (The engine itself reads one page at a time using every CPU core.)
 
-const CONCURRENCY = 1;
+// Gemini pages are read in parallel (the free engine still reads one at a time).
+const CONCURRENCY = Math.max(1, Number(process.env.READ_CONCURRENCY || 3));
 const DEMO = process.env.DEMO_MODE === "1";
 // Which reader reads pages: "auto" (Gemini when a key is set, a writer's own
 // model once it reads them better), "gemini" or "local" (always the free engine).
@@ -17,7 +18,7 @@ const localAvailable = localModelAvailable;
 const TRANSIENT = new Set(["rate_limited", "api_error"]);
 
 /** Read with the right engine for this writer. Returns {lines, source}. */
-async function readWithBestEngine(userId, writerId, imagePath, image, progress) {
+async function readWithBestEngine(userId, writerId, imagePath, image, progress, onDraft) {
   const wantGemini = READER !== "local" && geminiEnabled();
   const learning = await learningFor(userId, writerId, { exampleImages: wantGemini ? 24 : 0 });
   const local = async () => {
@@ -26,7 +27,7 @@ async function readWithBestEngine(userId, writerId, imagePath, image, progress) 
   };
   if (!wantGemini || (READER === "auto" && learning.beatsGemini)) return local();
   try {
-    return { lines: await readPageGemini(image, { learning, onProgress: progress }), source: "gemini" };
+    return { lines: await readPageGemini(image, { learning, onProgress: progress, onDraft }), source: "gemini" };
   } catch (error) {
     // Gemini busy or down: fall back to the free engine rather than fail the page.
     if (TRANSIENT.has(error.code) && localAvailable()) return local();
@@ -41,7 +42,7 @@ const key = (j) => `${j.userId}/${j.docId}/${j.pageId}`;
 
 /** Ask for a page to be read (again). */
 export async function requestReading(userId, docId, pageId) {
-  const doc = await store.updatePage(userId, docId, pageId, { status: "queued", progress: null, error: null, errorCode: null });
+  const doc = await store.updatePage(userId, docId, pageId, { status: "queued", progress: null, draft: null, error: null, errorCode: null });
   if (!doc?.pages.some((p) => p.id === pageId)) return false;
   enqueue({ userId, docId, pageId });
   return true;
@@ -90,13 +91,14 @@ async function run({ userId, docId, pageId }) {
       }
       result = { lines: demoPage(), source: "local" };
     } else {
-      result = await readWithBestEngine(userId, doc.writerId, imagePath, image, progress);
+      const onDraft = (lines) => store.showDraft(userId, docId, pageId, lines).catch(() => {});
+      result = await readWithBestEngine(userId, doc.writerId, imagePath, image, progress, onDraft);
     }
     await store.finishReading(userId, docId, pageId, result.lines, result.source);
   } catch (error) {
     console.error(`Reading failed for page ${pageId}:`, error);
     const info = errorInfo(error);
-    await store.updatePage(userId, docId, pageId, { status: "error", progress: null, error: info.message, errorCode: info.code }).catch(() => {});
+    await store.updatePage(userId, docId, pageId, { status: "error", progress: null, draft: null, error: info.message, errorCode: info.code }).catch(() => {});
   }
 }
 

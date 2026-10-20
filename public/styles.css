@@ -171,6 +171,9 @@ button:disabled { opacity: .5; cursor: default; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 8px 14px; border-bottom: 1px solid var(--line); align-items: center; }
 .row:last-child { border-bottom: 0; }
 .row.unclear { background: var(--warn-bg); }
+.draft-note { padding: 10px 14px; color: var(--muted, #666); font-size: 14px; border-bottom: 1px solid var(--line); }
+.row.draft { opacity: 0.85; }
+.draft-text { font-size: 18px; line-height: 1.6; padding: 8px 10px; }
 .row textarea {
   width: 100%; font: inherit; font-size: 19px; padding: 8px 10px; border-radius: 6px;
   border: 1px solid var(--line); background: var(--bg); color: var(--ink);

@@ -144,6 +144,15 @@ export function updatePage(userId, id, pageId, patch) {
   });
 }
 
+/** Show a first reading while the page is still being checked (read-only in the browser). */
+export function showDraft(userId, id, pageId, lines) {
+  return withDoc(userId, id, (doc) => {
+    const page = doc.pages.find((p) => p.id === pageId);
+    if (!page || !BUSY.has(page.status)) return false;
+    page.draft = cleanLines(lines);
+  });
+}
+
 /** Store a finished reading: it replaces the page's lines. */
 export function finishReading(userId, id, pageId, lines, source) {
   return withDoc(userId, id, (doc) => {
@@ -154,6 +163,7 @@ export function finishReading(userId, id, pageId, lines, source) {
     page.status = "done";
     page.readRev = (page.readRev || 0) + 1;
     delete page.progress;
+    delete page.draft;
     delete page.error;
     delete page.errorCode;
   });

@@ -120,6 +120,8 @@ Back up the data folder regularly. It holds everyone's accounts, documents, page
 | `GEMINI_PASSES` | `2` | `1` = read, `2` = read, then proofread against the image |
 | `GEMINI_THINKING` | `HIGH` | `MINIMAL` / `LOW` / `MEDIUM` / `HIGH`, or `off` |
 | `GEMINI_EXAMPLES` | `24` | Learned lines shown to Gemini per request |
+| `GEMINI_TIMEOUT` | `480` | Seconds before a Gemini request is given up |
+| `READ_CONCURRENCY` | `3` | Pages read by Gemini at the same time across the whole site (the app's engine reads one at a time) |
 | `OCR_MODELS_DIR` | `./models` (`/opt/models` in Docker) | The engine's data |
 | `OCR_BASE_MODEL` | `base.pt` (`/data/models/base.pt` in Docker) | Base model file, relative to `OCR_MODELS_DIR` or a full path |
 | `OCR_ALLOW_NONCOMMERCIAL` | unset | `1` lets the engine use Mishkefet-v1 when there is no `base.pt` (non-commercial use only) |
