@@ -625,7 +625,7 @@ function renderPage(page) {
   if (page.status === "error") {
     st.classList.add("err");
     st.textContent = t("errorPrefix", { msg: errText({ code: page.errorCode, message: page.error }) })
-      + (page.errorCode === "read_failed" && page.error ? ` (${page.error})` : "");
+      + (page.error && ["read_failed", "rate_limited", "api_key", "bad_page", "api_error"].includes(page.errorCode) ? ` (${page.error})` : "");
   }
   if (page.status === "done") {
     const n = page.lines.filter((l) => l.unclear.length).length;

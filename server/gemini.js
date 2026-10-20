@@ -105,13 +105,23 @@ function cleanLine(line) {
   return { text, top, bottom, left, right, unclear };
 }
 
+function googleReason(message) {
+  let text = String(message || "");
+  try {
+    text = JSON.parse(text.slice(text.indexOf("{"))).error?.message || text;
+  } catch {}
+  return text.replace(/\s+/g, " ").slice(0, 400);
+}
+
 function errorFor(error) {
   if (error instanceof GeminiError) return error;
   if (error instanceof ApiError) {
-    if (error.status === 401 || error.status === 403) return new GeminiError("api_key", "The Gemini API key is missing or not allowed.");
-    if (error.status === 429) return new GeminiError("rate_limited", "Gemini is busy or the usage limit was reached.");
-    if (error.status === 400) return new GeminiError("bad_page", `Gemini could not process the page: ${error.message}`);
-    return new GeminiError("api_error", `Gemini error (${error.status}).`);
+    // Keep Google's own explanation (for example which quota ran out); it is shown on the page.
+    const why = googleReason(error.message);
+    if (error.status === 401 || error.status === 403) return new GeminiError("api_key", why);
+    if (error.status === 429) return new GeminiError("rate_limited", why);
+    if (error.status === 400) return new GeminiError("bad_page", why);
+    return new GeminiError("api_error", `${error.status}: ${why}`);
   }
   if (/abort|timeout|timed out/i.test(`${error.name} ${error.message}`)) {
     return new GeminiError("timeout", `Gemini took longer than ${TIMEOUT_MS / 1000} seconds.`);
