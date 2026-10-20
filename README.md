@@ -95,6 +95,22 @@ Add the zip to the Kaggle notebook as a dataset and run its last section; downlo
 
 The app is a normal Node.js website with one folder of data, so it runs on any host that runs Docker and has a **persistent disk**. Without one, accounts and documents disappear on every deploy.
 
+**A free server on Google Cloud (no monthly bill):** Google Cloud's free tier includes one small server (an `e2-micro`) with a 30 GB disk, which keeps documents and learning across restarts. It reads with Gemini; it is too small to train personal models. Use the same Google account as your Gemini key.
+
+1. Open [console.cloud.google.com](https://console.cloud.google.com), choose your project, and go to **Compute Engine → VM instances** (click **Enable** if asked; it takes a minute).
+2. Click **Create instance** and set:
+   - **Name:** `hebrew-handwriting`
+   - **Region:** `us-east1` (South Carolina, closest to New York among the free regions), any zone
+   - **Machine type:** `e2-micro` (under *General purpose → E2*)
+   - **OS and storage → Change:** *Debian GNU/Linux 12*, disk type **Standard persistent disk**, size **30 GB**
+   - **Networking → Firewall:** tick **Allow HTTP traffic** and **Allow HTTPS traffic**
+   - **Advanced → Automation → Startup script:** paste all of [`deploy/google-cloud/startup.sh`](deploy/google-cloud/startup.sh)
+   - **Advanced → Metadata → Add item:** key `gemini-api-key` with your key, and key `signup-code` with your sign-up code
+3. Click **Create**, and wait about 10 minutes for the first start.
+4. In the VM list, note the **External IP**, for example `34.75.1.2`. Your site is at **https://34-75-1-2.sslip.io**: the same numbers, with dashes.
+
+To update the app later, click the VM's name → **Reset** (it fetches the newest version as it starts). Free-tier limits change from time to time, so check **Billing** after the first few days, and set a budget alert (**Billing → Budgets & alerts**) so you hear at once if anything starts costing money. The first 1 GB of data sent out each month is free; past that it costs about a cent per 100 MB.
+
 **Render (simplest):**
 
 1. On [render.com](https://render.com), choose **New → Blueprint** and pick this repository. `render.yaml` sets up a web service with a 5 GB disk at `/data`.

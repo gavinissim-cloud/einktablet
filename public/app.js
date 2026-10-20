@@ -108,8 +108,12 @@ async function addFiles(files) {
   }
   let doc = state.doc;
   if (!doc) {
+    // Learning is per person, so ask whose handwriting this is before reading.
+    const writerId = await pickWriter();
+    if (writerId === undefined) return;
+    if (writerId) rememberWriter(writerId);
     try {
-      const created = await api("POST", "/api/documents", { title: accepted[0].name.replace(/\.[^.]+$/, ""), writerId: defaultWriterId() });
+      const created = await api("POST", "/api/documents", { title: accepted[0].name.replace(/\.[^.]+$/, ""), writerId });
       doc = adoptDoc(created, []);
     } catch (err) {
       return notify(t("createFailed", { msg: errText(err) }));
@@ -940,6 +944,57 @@ async function newWriter() {
   }
 }
 
+/**
+ * Ask whose handwriting a new document is in. Resolves with a writer id, null
+ * ("not sure"), or undefined when cancelled.
+ */
+function pickWriter() {
+  return new Promise((resolve) => {
+    const prev = document.activeElement;
+    const wrap = document.createElement("div");
+    wrap.className = "dialog-wrap";
+    wrap.innerHTML = '<form class="dialog writer-dialog" role="dialog" aria-modal="true"><p class="dialog-msg"></p><p class="list-note pick-note"></p><div class="pick-list"></div><div class="pick-new"><input class="dialog-input" dir="auto"></div><div class="dialog-actions"></div></form>';
+    wrap.querySelector(".dialog-msg").textContent = t("pickWriterTitle");
+    wrap.querySelector(".pick-note").textContent = t("pickWriterNote");
+    const field = wrap.querySelector(".pick-new input");
+    field.placeholder = t("pickWriterNew");
+    const close = (value) => {
+      wrap.remove();
+      document.removeEventListener("keydown", onKey, true);
+      prev?.focus?.();
+      resolve(value);
+    };
+    const list = wrap.querySelector(".pick-list");
+    const last = defaultWriterId();
+    const writers = [...state.writers].sort((x, y) => (y.id === last) - (x.id === last));
+    for (const w of writers) {
+      list.append(button(writerName(w), w.id === last ? "" : "secondary", () => close(w.id)));
+    }
+    const actions = wrap.querySelector(".dialog-actions");
+    const create = button(t("pickWriterCreate"), "", () => {});
+    create.type = "submit";
+    actions.append(create, button(t("pickWriterUnsure"), "secondary", () => close(null)), button(t("cancel"), "secondary", () => close(undefined)));
+    wrap.querySelector("form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const name = field.value.trim();
+      if (!name) return field.focus();
+      try {
+        const writer = await api("POST", "/api/writers", { name });
+        await loadWriters();
+        close(writer.id);
+      } catch (err) {
+        notify(errText(err));
+      }
+    });
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); close(undefined); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(wrap);
+    (list.querySelector("button") || field).focus();
+  });
+}
+
 function renderWriterSelect() {
   const select = $("#writerSelect");
   const doc = state.doc;
@@ -1011,6 +1066,7 @@ async function showWriter(writerId) {
   $("#writerSummary").textContent = t("writerSummary", { n: examples.length });
   $("#writerView").dataset.id = writerId;
   renderTraining(writer);
+  renderCheck(writer);
 
   const list = $("#exampleList");
   list.innerHTML = "";
@@ -1093,6 +1149,49 @@ function renderTraining(writer) {
     }, 4000);
   }
 }
+
+/** The accuracy-check panel: the last result, or progress while checking. */
+let checkTimer = null;
+function renderCheck(writer) {
+  clearTimeout(checkTimer);
+  $("#checkPanel").hidden = !writer.gemini;
+  const c = writer.check || {};
+  const running = c.state === "running";
+  let text = "";
+  if (running) text = t("checkRunning", { done: c.done, of: c.of });
+  else if (c.state === "done") {
+    text = t("checkDone", { pages: c.pages, first: c.first, now: c.now, secs: c.nowSeconds });
+    if (c.fast != null) {
+      text += " " + t(c.fast >= c.now ? "checkFastSame" : "checkFastWorse", { fast: c.fast, secs: c.fastSeconds, setting: c.fastSetting });
+    }
+  } else if (c.state === "error") text = t("checkFailed", { msg: c.error || "" });
+  else if (c.state === "interrupted") text = t("checkInterrupted");
+  $("#checkResult").textContent = text;
+  const bar = $("#checkBar");
+  bar.hidden = !running;
+  bar.firstElementChild.style.width = running && c.of ? `${(100 * c.done) / c.of}%` : "0";
+  $("#checkButton").hidden = running;
+  if (running) {
+    checkTimer = setTimeout(async () => {
+      if ($("#writerView").hidden || $("#writerView").dataset.id !== writer.id) return;
+      await loadWriters();
+      const fresh = state.writers.find((w) => w.id === writer.id);
+      if (fresh) renderCheck(fresh);
+    }, 5000);
+  }
+}
+
+$("#checkButton").addEventListener("click", async () => {
+  const id = $("#writerView").dataset.id;
+  try {
+    await api("POST", `/api/writers/${id}/check`, {});
+  } catch (err) {
+    return notify(errText(err));
+  }
+  await loadWriters();
+  const writer = state.writers.find((w) => w.id === id);
+  if (writer) renderCheck(writer);
+});
 
 $("#trainButton").addEventListener("click", async () => {
   const id = $("#writerView").dataset.id;

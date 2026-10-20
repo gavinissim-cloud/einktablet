@@ -16,6 +16,7 @@ const TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT || 480) * 1000; // per requ
 const IMAGE_EDGE = Number(process.env.GEMINI_IMAGE_EDGE || 2400);
 
 export const geminiEnabled = () => Boolean(process.env.GEMINI_API_KEY);
+export const GEMINI_SETTINGS = { model: MODEL, thinking: THINKING, passes: PASSES };
 
 let client;
 // Busy (429) and server errors (5xx) are retried a few times, with growing waits.
@@ -76,9 +77,29 @@ For each line give: text; top, bottom, left, right — the line's bounding box a
 function learnedParts(learning) {
   const examples = (learning?.examples || []).slice(0, EXAMPLES);
   const parts = [];
+  // First what many writers taught the app, then (closer to the page, and
+  // weighted most) what this writer taught it.
+  const general = learning?.general;
+  if (general?.examples?.length) {
+    parts.push({
+      text: `For general reference, ${general.examples.length} handwritten Hebrew lines by other writers that were misread before, each with its correct reading. They show common handwriting shapes and pitfalls; they are NOT by this page's writer.`,
+    });
+    general.examples.forEach((e, i) => {
+      parts.push(createPartFromBase64(e.image.toString("base64"), "image/jpeg"));
+      parts.push({ text: `Reference ${i + 1} — correct reading: «${e.text}»${e.ai && e.ai !== e.text ? ` (misread as «${e.ai}»)` : ""}` });
+    });
+  }
+  if (general?.fixes?.length) {
+    parts.push({
+      text: `Misreadings that happened in several different writers' handwriting (misread → correct). Take extra care with these:\n${general.fixes
+        .slice(0, 100)
+        .map((f) => `${f.from} → ${f.to}`)
+        .join("\n")}`,
+    });
+  }
   if (examples.length) {
     parts.push({
-      text: `This page was written by a writer whose handwriting has been read before. Here are ${examples.length} lines from their earlier pages, each with the correct transcription their reader confirmed. Study how this person forms each letter, joins letters, and writes final letters and punctuation, and read the new page with that in mind.`,
+      text: `MOST IMPORTANT: this page was written by a writer whose handwriting has been read before. Here are ${examples.length} lines from their earlier pages, each with the correct transcription their reader confirmed. Study how this person forms each letter, joins letters, and writes final letters and punctuation, and read the new page with that in mind. Where this writer's habits differ from the general references, follow this writer.`,
     });
     examples.forEach((e, i) => {
       parts.push(createPartFromBase64(e.image.toString("base64"), "image/jpeg"));
@@ -171,10 +192,10 @@ async function generate(request) {
   }
 }
 
-async function ask(parts, label = "request") {
+async function ask(parts, label = "request", options = {}) {
   const started = Date.now();
   try {
-    const lines = await askOnce(parts);
+    const lines = await askOnce(parts, options);
     console.log(`Gemini ${label}: ${lines.length} lines in ${Math.round((Date.now() - started) / 1000)}s`);
     return lines;
   } catch (error) {
@@ -183,13 +204,13 @@ async function ask(parts, label = "request") {
   }
 }
 
-async function askOnce(parts) {
+async function askOnce(parts, { thinking = THINKING } = {}) {
   const config = {
     systemInstruction: INSTRUCTIONS,
     responseMimeType: "application/json",
     responseJsonSchema: LINE_SCHEMA,
   };
-  if (THINKING !== "off") config.thinkingConfig = { thinkingLevel: THINKING };
+  if (thinking !== "off") config.thinkingConfig = { thinkingLevel: thinking };
   let response;
   try {
     response = await generate({ model: MODEL, contents: [{ role: "user", parts }], config });
@@ -222,7 +243,15 @@ async function askOnce(parts) {
  * ({image, text, ai}) and fixes ({from, to, count}). Lines come back with
  * boxes in 0–1000 page coordinates.
  */
-export async function readPageGemini(image, { learning = null, onProgress = () => {}, onDraft = () => {} } = {}) {
+/**
+ * `thinking` and `passes` override the server's settings (used to measure a
+ * faster setting against the current one).
+ */
+export async function readPageGemini(
+  image,
+  { learning = null, onProgress = () => {}, onDraft = () => {}, thinking = THINKING, passes = PASSES } = {}
+) {
+  const opts = { thinking };
   try {
     const small = await sharp(image)
       .resize({ width: IMAGE_EDGE, height: IMAGE_EDGE, fit: "inside", withoutEnlargement: true })
@@ -230,11 +259,11 @@ export async function readPageGemini(image, { learning = null, onProgress = () =
       .toBuffer();
     const page = createPartFromBase64(small.toString("base64"), "image/jpeg", PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH);
     const known = learnedParts(learning);
-    onProgress(1, PASSES, "read");
-    let lines = await ask([...known, page, { text: "Transcribe all the handwriting on this page." }], "reading");
-    if (PASSES > 1 && lines.length) {
+    onProgress(1, passes, "read");
+    let lines = await ask([...known, page, { text: "Transcribe all the handwriting on this page." }], "reading", opts);
+    if (passes > 1 && lines.length) {
       await onDraft(lines);
-      onProgress(2, PASSES, "check");
+      onProgress(2, passes, "check");
       const draft = lines
         .map((l, i) => `${i + 1}. [top ${l.top}, bottom ${l.bottom}, left ${l.left}, right ${l.right}] ${l.text}`)
         .join("\n");
@@ -245,7 +274,7 @@ export async function readPageGemini(image, { learning = null, onProgress = () =
         {
           text: `Below is a draft transcription of this page. It may contain misread letters, words read only partly, missed or extra lines, missing punctuation (״ ׳ ־ parentheses, dashes) or inaccurate line boxes.\n\nProofread it against the handwriting: go through the image line by line and word by word, compare every word with the pen strokes, and return the corrected full transcription. Keep what the draft got right; fix everything it got wrong.\n\nDraft:\n${draft}`,
         },
-      ], "proofread").catch((error) => {
+      ], "proofread", opts).catch((error) => {
         console.error("Gemini proofread failed, keeping the first reading:", error.message);
         return [];
       });

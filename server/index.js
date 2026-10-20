@@ -8,6 +8,8 @@ import { authRoutes, requireUser } from "./auth.js";
 import { requestReading, resumeReading } from "./jobs.js";
 import { warmUp, MODELS_DIR, localModelAvailable } from "./ocr.js";
 import { geminiEnabled, checkGemini } from "./gemini.js";
+import { startCheck, isChecking } from "./evaluate.js";
+import { refreshLessons } from "./lessons.js";
 import fs from "node:fs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -78,6 +80,7 @@ app.put("/api/documents/:docId", async (req, res, next) => {
     learning
       .moveDocExamples(req.user.id, before?.writerId, doc.writerId, doc.id)
       .then(() => learning.learnFromDocument(req.user.id, doc.writerId, doc.id, doc.pages, (pageId) => store.readPageImage(req.user.id, doc.id, pageId)))
+      .then(refreshLessons)
       .catch((error) => console.error("Learning from corrections failed:", error));
   } catch (e) { next(e); }
 });
@@ -132,7 +135,14 @@ app.get("/api/writers", async (req, res, next) => {
       await learning.createWriter(req.user.id, req.user.username);
       writers = await learning.listWriters(req.user.id);
     }
-    res.json(writers.map((w) => ({ ...w, canTrain: learning.canTrain(w.exampleCount), trainMin: learning.TRAINING_MIN })));
+    res.json(writers.map((w) => ({
+      ...w,
+      // A check that was running when the server restarted did not finish.
+      check: w.check?.state === "running" && !isChecking(req.user.id, w.id) ? { ...w.check, state: "interrupted" } : w.check,
+      canTrain: learning.canTrain(w.exampleCount),
+      trainMin: learning.TRAINING_MIN,
+      gemini: geminiEnabled(),
+    })));
   } catch (e) { next(e); }
 });
 
@@ -161,6 +171,14 @@ app.post("/api/writers/:writerId/train", async (req, res, next) => {
       return res.status(400).json({ error: `Correct at least ${learning.TRAINING_MIN} lines first.`, code: "too_few_lines" });
     }
     res.status(202).json({ status: "queued" });
+  } catch (e) { next(e); }
+});
+
+app.post("/api/writers/:writerId/check", async (req, res, next) => {
+  try {
+    const code = await startCheck(req.user.id, req.params.writerId);
+    if (code) return res.status(code === "writer_not_found" ? 404 : 400).json({ error: code, code });
+    res.status(202).json({ status: "running" });
   } catch (e) { next(e); }
 });
 

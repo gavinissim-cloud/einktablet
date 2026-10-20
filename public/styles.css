@@ -212,3 +212,7 @@ button:disabled { opacity: .5; cursor: default; }
   h1 { font-size: 22px; }
   .doc-item a { flex-basis: 100%; }
 }
+.writer-dialog { max-width: 440px; }
+.pick-list { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.pick-new { margin-bottom: 4px; }
+.pick-new .dialog-input { width: 100%; box-sizing: border-box; }

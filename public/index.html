@@ -67,6 +67,15 @@
         <label class="check"><input type="checkbox" id="writerLearn"> <span data-i18n="learnToggle">Learn from corrections</span></label>
         <p id="writerSummary" class="list-note"></p>
       </div>
+      <div class="writer-panel" id="checkPanel">
+        <h3 class="panel-title" data-i18n="checkTitle">Accuracy check</h3>
+        <p class="list-note" data-i18n="checkAbout">Re-reads up to 5 of this writer's corrected pages and compares with your corrections, so you can see how much the learning has helped. Each page is read again by Gemini, which is billed as usual.</p>
+        <p id="checkResult" class="list-note"></p>
+        <div class="train-row">
+          <button id="checkButton" data-i18n="checkButton">Check accuracy</button>
+          <div id="checkBar" class="train-bar" hidden><div></div></div>
+        </div>
+      </div>
       <div class="writer-panel">
         <h3 class="panel-title" data-i18n="trainTitle">Personal reading model</h3>
         <p id="trainStatus" class="list-note"></p>

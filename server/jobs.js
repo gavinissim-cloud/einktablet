@@ -2,6 +2,7 @@ import * as store from "./store.js";
 import { learningFor } from "./learning.js";
 import { readPage, OcrError, localModelAvailable } from "./ocr.js";
 import { readPageGemini, geminiEnabled } from "./gemini.js";
+import { generalLessons } from "./lessons.js";
 import { demoPage } from "./demo.js";
 
 // Pages are read on the server, one after another, so reading continues even
@@ -26,6 +27,7 @@ async function readWithBestEngine(userId, writerId, imagePath, image, progress, 
     return { lines, source: learning.model ? "personal" : "local" };
   };
   if (!wantGemini || (READER === "auto" && learning.beatsGemini)) return local();
+  learning.general = await generalLessons(userId, writerId);
   try {
     return { lines: await readPageGemini(image, { learning, onProgress: progress, onDraft }), source: "gemini" };
   } catch (error) {

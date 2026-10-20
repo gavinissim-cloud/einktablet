@@ -276,7 +276,7 @@ export const writerModelPath = (userId, writerId) => path.join(writerDir(userId,
  * whether it measured better than Gemini), earlier fixes, and recent corrected
  * lines as examples for Gemini.
  */
-export async function learningFor(userId, writerId, { exampleImages = 0 } = {}) {
+export async function learningFor(userId, writerId, { exampleImages = 0, excludeDocId = null } = {}) {
   const writer = writerId && (await getWriter(userId, writerId));
   if (!writer) return { model: null, beatsGemini: false, fixes: [], examples: [] };
   let model = null;
@@ -290,7 +290,7 @@ export async function learningFor(userId, writerId, { exampleImages = 0 } = {}) 
   if (exampleImages) {
     for (const e of await listExamples(userId, writerId)) {
       if (examples.length >= exampleImages) break;
-      if (e.corrected === false) continue;
+      if (e.corrected === false || (excludeDocId && e.docId === excludeDocId)) continue;
       try {
         examples.push({ ...e, image: await fs.readFile(exampleImagePath(userId, writerId, e.id)) });
       } catch {}
@@ -303,6 +303,10 @@ export async function learningFor(userId, writerId, { exampleImages = 0 } = {}) 
 
 const trainQueue = [];
 let training = false;
+
+export function setWriterFields(userId, writerId, patch) {
+  return setTraining(userId, writerId, patch);
+}
 
 function setTraining(userId, writerId, patch) {
   return locked(userId, async () => {
