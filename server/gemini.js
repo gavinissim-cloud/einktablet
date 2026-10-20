@@ -132,7 +132,13 @@ function errorFor(error) {
   return new GeminiError("read_failed", error.message || "Reading failed.");
 }
 
-/** One Gemini request, given up after TIMEOUT_MS (retries included). */
+/**
+ * One Gemini request, given up after TIMEOUT_MS (retries included). It is
+ * streamed, with Gemini's thinking included, so the connection is never silent
+ * for long: Node gives up on a request that sends nothing for 5 minutes, and
+ * careful reading of a full page can think for longer than that.
+ * Returns {text, finishReason, thinkingChars}.
+ */
 async function generate(request) {
   const controller = new AbortController();
   let timer;
@@ -143,10 +149,23 @@ async function generate(request) {
     }, TIMEOUT_MS);
   });
   try {
-    return await Promise.race([
-      ai().models.generateContent({ ...request, config: { ...request.config, abortSignal: controller.signal } }),
-      expired,
-    ]);
+    const config = { ...request.config, abortSignal: controller.signal };
+    if (config.thinkingConfig) config.thinkingConfig = { ...config.thinkingConfig, includeThoughts: true };
+    const collect = async () => {
+      const stream = await ai().models.generateContentStream({ ...request, config });
+      let text = "", finishReason, thinkingChars = 0;
+      for await (const chunk of stream) {
+        const candidate = chunk.candidates?.[0];
+        for (const part of candidate?.content?.parts || []) {
+          if (typeof part.text !== "string") continue;
+          if (part.thought) thinkingChars += part.text.length;
+          else text += part.text;
+        }
+        if (candidate?.finishReason) finishReason = candidate.finishReason;
+      }
+      return { text, finishReason, thinkingChars };
+    };
+    return await Promise.race([collect(), expired]);
   } finally {
     clearTimeout(timer);
   }
@@ -183,7 +202,7 @@ async function askOnce(parts) {
       throw error;
     }
   }
-  const reason = response.candidates?.[0]?.finishReason;
+  const reason = response.finishReason;
   if (reason && !["STOP", "FINISH_REASON_UNSPECIFIED"].includes(reason)) {
     throw new GeminiError(reason === "MAX_TOKENS" ? "page_too_long" : "refused", `Gemini stopped: ${reason}.`);
   }
