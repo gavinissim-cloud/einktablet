@@ -59,10 +59,12 @@ export const INSTRUCTIONS = `You are an expert reader of handwritten modern Hebr
 
 Your job is an exact, faithful transcription of the handwriting on the page — character for character, line for line, as the writer wrote it. Accuracy matters more than anything else: look closely at every word.
 
+NEVER INVENT TEXT. Write only letters you actually see on the page. Never replace a word with a different word that "makes more sense", never complete a sentence, never rephrase, never fill a hard-to-read spot with a likely-sounding word. A transcription that says what the writer probably meant, instead of what is written, is wrong. When a word is hard to read, write the letters you can make out as best you can and list that word under "unclear" — the reader will check every unclear word, so marking a word unclear is always better than guessing.
+
 Reading method:
 - Work through the page line by line, top to bottom, each line right to left. A "line" is one physical line of handwriting as it appears on the page; never merge two handwritten lines or split one. Printed ruled lines of the paper are not text.
 - Read every word completely, from its first letter to its last. Do not stop at a word's recognizable start, guess its ending, or drop small words, prefixes (ו ה ב כ ל מ ש) and suffixes.
-- Use the surrounding words and sentence meaning to decide between letters that look alike in handwriting, especially: ו/ז/י/ן, ד/ר/ך, ה/ח/ת, ב/כ/פ, ג/נ, ט/מ, ס/ם, ע/צ/א, ק/ף, and the final forms ך ם ן ף ץ. Check each decision against the actual pen strokes — context helps you choose, but the handwriting is the authority.
+- Letters that look alike in handwriting (ו/ז/י/ן, ד/ר/ך, ה/ח/ת, ב/כ/פ, ג/נ, ט/מ, ס/ם, ע/צ/א, ק/ף, and the final forms ך ם ן ף ץ): decide from the pen strokes. Context may only break a tie between two letters that the strokes genuinely allow; it never justifies a word whose letters are not on the page. If the strokes don't settle it, pick the likelier letter and mark the word unclear.
 - Do NOT correct the writer's spelling, grammar or word choice, and do not complete words that are not written.
 - Skip text that the writer clearly crossed out. Include text inserted above a line at the place it is inserted.
 - Keep niqqud only if the writer actually wrote it. Numbers and Latin-script words stay exactly as written.
@@ -72,7 +74,7 @@ Punctuation and symbols — reproduce every mark the writer made, using these ch
 - A short line or two lines written ABOVE letters (the handwritten way to mark an abbreviation or a number in letters) → mark them with ״ before the last letter (or ׳ after a single letter).
 - Maqaf → ־ ; dashes between phrases → – ; parentheses, brackets, quotation marks, colons, semicolons, commas, periods, question and exclamation marks, slashes, percent → exactly as written. Write parentheses in reading order: "(" comes before the words it encloses.
 
-For each line give: text; top, bottom, left, right — the line's bounding box as integers from 0 to 1000 relative to the page image's height (top/bottom) and width (left/right), generous enough for ascenders, descenders and marks above letters; unclear — the words of this line you could not read with confidence (copied exactly from your text), empty when confident.`;
+For each line give: text; top, bottom, left, right — the line's bounding box as integers from 0 to 1000 relative to the page image's height (top/bottom) and width (left/right), generous enough for ascenders, descenders and marks above letters; unclear — every word of this line you are not fully sure of, letter by letter (copied exactly from your text); empty only when you are certain of every letter.`;
 
 function learnedParts(learning) {
   const examples = (learning?.examples || []).slice(0, EXAMPLES);
@@ -244,6 +246,24 @@ async function askOnce(parts, { thinking = THINKING } = {}) {
  * boxes in 0–1000 page coordinates.
  */
 /**
+ * Words the proofread changed, or that the two readings otherwise disagree on,
+ * are marked unclear: a word Gemini wrote one way and then another is exactly
+ * the kind a person should look at.
+ */
+export function flagDisagreements(draft, checked) {
+  const centre = (l) => (l.top + l.bottom) / 2;
+  return checked.map((line) => {
+    // The draft line nearest in height; with no draft lines there is nothing to compare.
+    let best = null;
+    for (const d of draft) if (!best || Math.abs(centre(d) - centre(line)) < Math.abs(centre(best) - centre(line))) best = d;
+    if (!best) return line;
+    const before = new Set(best.text.split(/\s+/));
+    const changed = line.text.split(/\s+/).filter((w) => w && !before.has(w));
+    return changed.length ? { ...line, unclear: [...new Set([...line.unclear, ...changed])] } : line;
+  });
+}
+
+/**
  * `thinking` and `passes` override the server's settings (used to measure a
  * faster setting against the current one).
  */
@@ -272,13 +292,13 @@ export async function readPageGemini(
         ...known,
         page,
         {
-          text: `Below is a draft transcription of this page. It may contain misread letters, words read only partly, missed or extra lines, missing punctuation (״ ׳ ־ parentheses, dashes) or inaccurate line boxes.\n\nProofread it against the handwriting: go through the image line by line and word by word, compare every word with the pen strokes, and return the corrected full transcription. Keep what the draft got right; fix everything it got wrong.\n\nDraft:\n${draft}`,
+          text: `Below is a draft transcription of this page. It may contain misread letters, words read only partly, missed or extra lines, missing punctuation (״ ׳ ־ parentheses, dashes), words that are not actually written on the page, or inaccurate line boxes.\n\nProofread it against the handwriting: go through the image line by line and word by word, and compare every word, letter by letter, with the pen strokes. Change a word only when the handwriting clearly shows different letters; never change a word to one that merely reads better or makes more sense. If the draft has a word that is not written on the page, replace it with what is actually written. Where you are unsure, keep the draft's word and mark it unclear. Return the full corrected transcription.\n\nDraft:\n${draft}`,
         },
       ], "proofread", opts).catch((error) => {
         console.error("Gemini proofread failed, keeping the first reading:", error.message);
         return [];
       });
-      if (checked.length) lines = checked;
+      if (checked.length) lines = flagDisagreements(lines, checked);
     }
     return lines;
   } catch (error) {
