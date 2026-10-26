@@ -362,7 +362,7 @@ async function streamOnce(body, signal) {
 
 /** One request: retried when Google is busy, given up after TIMEOUT_MS. */
 // Added to the instructions: Gemini tends to "improve" what people write.
-const EXACT_RULES = `KEEP THE WRITER'S EXACT WORDS, SPELLING AND GRAMMAR. Never add or remove a letter to make a word "correct": if the writer wrote הסטוריה, write הסטוריה, not היסטוריה; if they wrote אמא, don't write אימא; if they used the wrong gender, tense or preposition, or left a word out, keep it exactly that way. Never add, drop, reorder or replace words, and never add punctuation the writer didn't write. Read each word from its own letters, not from what the sentence suggests.`;
+const EXACT_RULES = `KEEP THE WRITER'S EXACT WORDS, SPELLING AND GRAMMAR. Never add or remove a letter to make a word "correct": if the writer wrote הסטוריה, write הסטוריה, not היסטוריה; if they wrote אמא, don't write אימא; if they used the wrong gender, tense or preposition, or left a word out, keep it exactly that way. Never add, drop, reorder or replace words, and never add punctuation the writer didn't write. Read each word from its own letters, not from what the sentence suggests. The texts are often Torah or Gemara study notes mixing Hebrew and Aramaic (for example דבלא, היגיע, מזונותיה, דצורת, ממילא, ואי); their spellings and words are correct as written. Never turn them into everyday modern Hebrew.`;
 
 const EXACT_SCHEMA = {
   type: "object",
@@ -421,7 +421,126 @@ function cleanLines(lines) {
 
 const ask = async (parts) => cleanLines((await askJson(parts, LINE_SCHEMA)).lines || []);
 
-const EXACT_BATCH = 12; // lines per request in the word-by-word step
+const EXACT_BATCH = 12; // lines per request when a line can't be split into words
+const WORD_BATCH = 30;  // word pictures per request
+
+/**
+ * Split one handwritten line into words by the blank space between them.
+ * `box` is the line in 0–1000 page coordinates. Returns word boxes (same
+ * coordinates), right to left, or null when the line can't be split reliably.
+ */
+function segmentWords(bitmap, box) {
+  const W = bitmap.width, H = bitmap.height;
+  const x0 = (box.left / 1000) * W, x1 = (box.right / 1000) * W;
+  const y0 = (box.top / 1000) * H, y1 = (box.bottom / 1000) * H;
+  const scale = 120 / Math.max(1, y1 - y0); // analysed at 120 px high
+  const cw = Math.max(1, Math.round((x1 - x0) * scale)), ch = 120;
+  const c = document.createElement("canvas"); c.width = cw; c.height = ch;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bitmap, x0, y0, x1 - x0, y1 - y0, 0, 0, cw, ch);
+  const px = ctx.getImageData(0, 0, cw, ch).data;
+  const gray = new Uint8Array(cw * ch), hist = new Array(256).fill(0);
+  for (let i = 0; i < cw * ch; i++) { const g = (px[i * 4] * 299 + px[i * 4 + 1] * 587 + px[i * 4 + 2] * 114) / 1000 | 0; gray[i] = g; hist[g]++; }
+  // Ink vs paper (Otsu's threshold).
+  let sum = 0; for (let t = 0; t < 256; t++) sum += t * hist[t];
+  let sumB = 0, wB = 0, best = 0, thr = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]; if (!wB) continue; const wF = cw * ch - wB; if (!wF) break;
+    sumB += t * hist[t]; const v = wB * wF * (sumB / wB - (sum - sumB) / wF) ** 2;
+    if (v > best) { best = v; thr = t; }
+  }
+  // The letters' main band; strokes of the lines above and below sit outside it.
+  const rows = new Array(ch).fill(0);
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) if (gray[y * cw + x] < thr) rows[y]++;
+  const maxRow = Math.max(...rows);
+  if (!maxRow) return null;
+  let top = 0, bottom = ch - 1;
+  while (top < ch && rows[top] < maxRow * 0.25) top++;
+  while (bottom > top && rows[bottom] < maxRow * 0.25) bottom--;
+  const core = Math.max(8, bottom - top + 1);
+  const bandTop = Math.max(0, Math.round(top - core * 0.3)), bandBottom = Math.min(ch - 1, Math.round(bottom + core * 0.3));
+  const isInk = new Array(cw).fill(false);
+  for (let x = 0; x < cw; x++) { let n = 0; for (let y = bandTop; y <= bandBottom; y++) if (gray[y * cw + x] < thr) n++; isInk[x] = n >= 2; }
+  const runs = [];
+  for (let x = 0; x < cw;) {
+    while (x < cw && !isInk[x]) x++;
+    if (x >= cw) break;
+    const s = x; while (x < cw && isInk[x]) x++;
+    runs.push([s, x - 1]);
+  }
+  if (!runs.length) return null;
+  // A space between words is clearly wider than the space between letters.
+  const minGap = Math.max(4, core * 0.45);
+  const words = []; let cur = [...runs[0]];
+  for (let i = 1; i < runs.length; i++) {
+    if (runs[i][0] - cur[1] - 1 >= minGap) { words.push(cur); cur = [...runs[i]]; } else cur[1] = runs[i][1];
+  }
+  words.push(cur);
+  const kept = words.filter(([s, e]) => e - s >= 3);
+  if (!kept.length || kept.length > 30) return null;
+  const toPage = (v) => box.left + (v / scale / W) * 1000;
+  const pad = core * 0.25;
+  return kept
+    .map(([s, e]) => ({ top: box.top, bottom: box.bottom, left: Math.max(box.left, toPage(s - pad)), right: Math.min(box.right, toPage(e + pad)) }))
+    .reverse(); // Hebrew reads right to left
+}
+
+const WORD_SCHEMA = {
+  type: "object",
+  properties: {
+    words: {
+      type: "array",
+      items: { type: "object", properties: { image: { type: "integer" }, text: { type: "string" }, sure: { type: "boolean" } }, required: ["image", "text", "sure"] },
+    },
+  },
+  required: ["words"],
+};
+
+/**
+ * The word-by-word step: every word is cut out of the page and all the words
+ * are read in random order, so Gemini sees only each word's own letters, never
+ * a sentence or topic to guess from. Returns per line {text, unsure: [words]},
+ * or null for lines that couldn't be split into words.
+ */
+async function readWordsExactly(bitmap, lines, known) {
+  const items = []; // {line, pos, box}
+  const perLine = lines.map((line, i) => {
+    const h = line.bottom - line.top;
+    const loose = { ...line, top: Math.max(0, line.top - h * 0.15), bottom: Math.min(1000, line.bottom + h * 0.15) };
+    const words = segmentWords(bitmap, loose);
+    if (!words) return null;
+    words.forEach((box, pos) => items.push({ line: i, pos, box }));
+    return words.length;
+  });
+  for (let i = items.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [items[i], items[j]] = [items[j], items[i]]; }
+  const texts = lines.map((_, i) => (perLine[i] ? new Array(perLine[i]).fill(null) : null));
+  const sure = lines.map((_, i) => (perLine[i] ? new Array(perLine[i]).fill(true) : null));
+  const batches = [];
+  for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
+  await Promise.all(batches.map(async (batch) => {
+    const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. If a letter is uncertain, write your best reading and set "sure" to false. Answer with one entry per image, using the image's number.` }];
+    for (const [k, it] of batch.entries()) {
+      const crop = cropLine(bitmap, it.box, 240);
+      parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
+    }
+    try {
+      const res = await askJson(parts, WORD_SCHEMA);
+      for (const r of res.words || []) {
+        const it = batch[r.image - 1];
+        if (!it || typeof r.text !== "string") continue;
+        texts[it.line][it.pos] = r.text.trim();
+        sure[it.line][it.pos] = r.sure !== false;
+      }
+    } catch (e) {
+      console.warn("Word-by-word step failed for some words:", e);
+    }
+  }));
+  return lines.map((_, i) => {
+    if (!texts[i] || texts[i].some((t) => t === null)) return null; // a word is missing: don't trust this line's split
+    const words = texts[i].filter(Boolean);
+    return { text: words.join(" "), unsure: words.filter((w, k) => !sure[i][k]) };
+  });
+}
 
 /**
  * The word-by-word step: every line is cut out of the full-size page and read
@@ -460,13 +579,16 @@ async function readLinesExactly(bitmap, lines, known) {
 }
 
 /** Word-level differences between a reading and the corrected text. */
-function wordFixes(ai, text) {
+function wordFixes(ai, text) { return wordGaps(ai, text).filter((f) => f.from && f.to); }
+
+/** Every place where two readings differ: [{from, to}], either side may be empty. */
+function wordGaps(ai, text) {
   const a = ai.split(/\s+/).filter(Boolean), b = text.split(/\s+/).filter(Boolean);
   const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
   for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--)
     dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
   const fixes = []; let i = 0, j = 0, ga = [], gb = [];
-  const flush = () => { if (ga.length && gb.length) fixes.push({ from: ga.join(" "), to: gb.join(" ") }); ga = []; gb = []; };
+  const flush = () => { if (ga.length || gb.length) fixes.push({ from: ga.join(" "), to: gb.join(" ") }); ga = []; gb = []; };
   while (i < a.length || j < b.length) {
     if (i < a.length && j < b.length && a[i] === b[j]) { flush(); i++; j++; }
     else if (j < b.length && (i === a.length || dp[i][j + 1] >= dp[i + 1][j])) gb.push(b[j++]);
@@ -508,16 +630,24 @@ async function readPage(doc, page, onStep) {
   let lines = await ask([...known, pagePart, { text: "Transcribe all the handwriting on this page." }]);
   if (PASSES > 1 && lines.length) {
     onStep(2, lines);
-    const exact = await readLinesExactly(bitmap, lines, known);
-    // The literal reading wins; wherever it differs from the page reading, the word is flagged.
+    // Every word read on its own; lines that can't be split are read as whole lines instead.
+    const byWord = await readWordsExactly(bitmap, lines, known);
+    const missing = lines.map((l, i) => (byWord[i] ? null : i)).filter((i) => i !== null);
+    const byLine = missing.length ? await readLinesExactly(bitmap, missing.map((i) => lines[i]), known) : [];
+    missing.forEach((i, k) => { if (byLine[k]) byWord[i] = { text: byLine[k].text, unsure: byLine[k].unclear }; });
+    // The literal reading wins. Wherever the page reading differs, the word is
+    // flagged, with the page reading offered as the other choice.
     lines = lines.map((line, i) => {
-      const e = exact[i];
-      if (!e) return line;
+      const e = byWord[i];
+      if (!e || !e.text) return line;
+      const gaps = wordGaps(e.text, line.text);
+      // One-click choices only for short differences; a line read completely differently is just flagged.
+      const short = (t) => t.split(" ").length <= 3;
+      const alts = gaps.filter((f) => f.from && f.to && short(f.from) && short(f.to)).map((f) => ({ word: f.from, alt: f.to }));
+      const flagged = new Set(e.unsure);
+      for (const f of gaps) f.from.split(" ").filter(Boolean).forEach((w) => flagged.add(w));
       const words = new Set(e.text.split(/\s+/));
-      const before = new Set(line.text.split(/\s+/));
-      const differ = e.text.split(/\s+/).filter((w) => w && !before.has(w));
-      const unclear = [...new Set([...e.unclear, ...line.unclear, ...differ])].filter((w) => words.has(w));
-      return { ...line, text: e.text, unclear };
+      return { ...line, text: e.text, alts, unclear: [...flagged].filter((w) => words.has(w)) };
     });
   }
   return lines.map((l) => ({ ...l, ai: l.text }));
@@ -694,7 +824,7 @@ async function renderPage(page) {
   head.append(h, st);
   if (page.status === "queued") st.textContent = "Waiting…";
   if (page.status === "working") {
-    const label = page.step === 2 ? "Step 2 of 2: checking each line word by word…" : "Step 1 of 2: Gemini is reading the page…";
+    const label = page.step === 2 ? "Step 2 of 2: reading every word on its own…" : "Step 1 of 2: Gemini is reading the page…";
     st.innerHTML = `<span class="spinner"></span>${label}`;
   }
   if (page.status === "error") { st.classList.add("err"); st.textContent = "Error: " + page.error; }
@@ -725,7 +855,7 @@ async function renderPage(page) {
 
   const body = document.createElement("div");
   if (page.status === "working" && page.draft?.length) {
-    body.innerHTML = '<div class="draft-note">First reading. Gemini is now checking each line on its own, word by word; you can edit when it\'s done.</div>';
+    body.innerHTML = '<div class="draft-note">First reading. Gemini is now reading every word on its own, letter by letter; you can edit when it\'s done.</div>';
     const draft = page.draft; // the reading may finish while the pictures are cut
     const imgs = await crops(page, draft);
     draft.forEach((l, i) => {
@@ -750,8 +880,23 @@ async function renderPage(page) {
       if (line.unclear.length) {
         const f = document.createElement("div"); f.className = "flag";
         f.append("Please check: " + line.unclear.join(", "));
+        // The other reading of a doubtful word, one click away.
+        for (const a of line.alts || []) {
+          if (!line.text.includes(a.word)) continue;
+          const use = document.createElement("button");
+          use.textContent = `${a.word} → ${a.alt}`;
+          use.title = "Use the other reading";
+          use.onclick = () => {
+            line.text = line.text.replace(a.word, a.alt);
+            line.alts = line.alts.filter((x) => x !== a);
+            const now = new Set(line.text.split(/\s+/));
+            line.unclear = line.unclear.filter((w) => now.has(w) && !a.word.split(" ").includes(w));
+            scheduleSave(); renderPage(page);
+          };
+          f.append(use);
+        }
         const ok = document.createElement("button"); ok.textContent = "Checked ✓";
-        ok.onclick = () => { line.unclear = []; scheduleSave(); renderPage(page); };
+        ok.onclick = () => { line.unclear = []; line.alts = []; scheduleSave(); renderPage(page); };
         f.append(ok); row.append(f);
       }
       body.append(row);
