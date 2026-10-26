@@ -93,6 +93,14 @@ mark { background: var(--warn-bg); color: inherit; border-radius: 3px; }
     <input type="file" id="fileInput" accept="image/*,application/pdf" multiple hidden>
     <div class="card"><div class="pad" style="padding-bottom:6px"><h2>My documents</h2></div><div class="list" id="docList"></div></div>
     <div class="card"><div class="pad" style="padding-bottom:6px"><h2>People</h2><p class="muted" style="margin:0">The converter learns each person's handwriting separately, from the corrections you make on their pages.</p></div><div class="list" id="writerList"></div></div>
+    <div class="card pad">
+      <h2>Saving</h2>
+      <p class="muted" style="margin-top:0">Your documents and what was learned about each person's handwriting are saved in this browser on this computer, and stay after you close it. Open the converter in the same browser each time, and don't clear this browser's "cookies and site data". For extra safety, make a backup now and then: it saves everything as one file, which you can restore here or on another computer.</p>
+      <button id="backupBtn">Backup ⬇</button>
+      <button class="secondary" id="restoreBtn">Restore from a backup</button>
+      <input type="file" id="restoreInput" accept=".json,application/json" hidden>
+      <p class="muted" id="backupNote" style="margin-bottom:0"></p>
+    </div>
   </section>
 
   <section id="docView" hidden>
@@ -584,6 +592,7 @@ async function showHome() {
   state.doc = null; location.hash = "";
   if (!getKey()) return show("setup");
   show("home");
+  showBackupNote();
   const docs = (await getAll("docs")).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   $("#docList").innerHTML = docs.length ? "" : '<p class="pad muted" style="margin:0">Nothing yet. Drag a page above to start.</p>';
   for (const d of docs) {
@@ -717,8 +726,9 @@ async function renderPage(page) {
   const body = document.createElement("div");
   if (page.status === "working" && page.draft?.length) {
     body.innerHTML = '<div class="draft-note">First reading. Gemini is now checking each line on its own, word by word; you can edit when it\'s done.</div>';
-    const imgs = await crops(page, page.draft);
-    page.draft.forEach((l, i) => {
+    const draft = page.draft; // the reading may finish while the pictures are cut
+    const imgs = await crops(page, draft);
+    draft.forEach((l, i) => {
       const row = document.createElement("div"); row.className = "row";
       row.innerHTML = `<img alt=""><div class="draft-text" dir="rtl" lang="he"></div>`;
       row.querySelector("img").src = imgs[i]; row.querySelector(".draft-text").textContent = l.text;
@@ -934,6 +944,43 @@ $("#writerDelete").onclick = async () => {
   location.hash = ""; showHome();
 };
 window.addEventListener("beforeunload", () => { if (saveTimer) flushSave(); });
+
+// ---------- Backup and restore ----------
+const toDataUrl = (blob) => new Promise((resolve) => { const fr = new FileReader(); fr.onload = () => resolve(fr.result); fr.readAsDataURL(blob); });
+const fromDataUrl = async (url) => (await fetch(url)).blob();
+
+$("#backupBtn").onclick = async () => {
+  await flushSave();
+  const docs = await getAll("docs"), writers = await getAll("writers");
+  for (const d of docs) for (const p of d.pages) p.image = await toDataUrl(p.image);
+  for (const w of writers) for (const e of w.examples || []) e.crop = await toDataUrl(e.crop);
+  const data = { app: "hebrew-converter", version: 1, savedAt: new Date().toISOString(), docs, writers };
+  download(new Blob([JSON.stringify(data)], { type: "application/json" }), `hebrew-converter-backup-${new Date().toISOString().slice(0, 10)}.json`);
+  try { localStorage.setItem("last_backup", new Date().toISOString()); } catch {}
+  showBackupNote();
+};
+$("#restoreBtn").onclick = () => $("#restoreInput").click();
+$("#restoreInput").onchange = async () => {
+  const file = $("#restoreInput").files[0];
+  $("#restoreInput").value = "";
+  if (!file) return;
+  let data;
+  try { data = JSON.parse(await file.text()); } catch { return notify("That file isn't a converter backup."); }
+  if (data?.app !== "hebrew-converter") return notify("That file isn't a converter backup.");
+  if (!(await dialog(`Restore ${data.docs.length} documents and ${data.writers.length} people from this backup? Items with the same name in both are replaced by the backup's version; everything else here is kept.`, { ok: "Restore", cancel: "Cancel" }))) return;
+  for (const d of data.docs) { for (const p of d.pages) p.image = await fromDataUrl(p.image); await putOne("docs", d); }
+  for (const w of data.writers) { for (const e of w.examples || []) e.crop = await fromDataUrl(e.crop); await putOne("writers", w); }
+  notify("Restored.");
+  showHome();
+};
+function showBackupNote() {
+  let last = null;
+  try { last = localStorage.getItem("last_backup"); } catch {}
+  $("#backupNote").textContent = last ? `Last backup: ${new Date(last).toLocaleString()}.` : "No backup made yet.";
+}
+
+// Ask the browser to keep this data for good (not clear it to free up space).
+navigator.storage?.persist?.().catch(() => {});
 
 // Pages that were being read when the window was closed are read again.
 (async () => {
