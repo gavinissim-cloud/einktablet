@@ -353,19 +353,38 @@ async function streamOnce(body, signal) {
 }
 
 /** One request: retried when Google is busy, given up after TIMEOUT_MS. */
-async function ask(parts, thinking = THINKING) {
+// Added to the instructions: Gemini tends to "improve" what people write.
+const EXACT_RULES = `KEEP THE WRITER'S EXACT WORDS, SPELLING AND GRAMMAR. Never add or remove a letter to make a word "correct": if the writer wrote הסטוריה, write הסטוריה, not היסטוריה; if they wrote אמא, don't write אימא; if they used the wrong gender, tense or preposition, or left a word out, keep it exactly that way. Never add, drop, reorder or replace words, and never add punctuation the writer didn't write. Read each word from its own letters, not from what the sentence suggests.`;
+
+const EXACT_SCHEMA = {
+  type: "object",
+  properties: {
+    lines: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { image: { type: "integer" }, text: { type: "string" }, unclear: { type: "array", items: { type: "string" } } },
+        required: ["image", "text", "unclear"],
+      },
+    },
+  },
+  required: ["lines"],
+};
+
+/** One Gemini request returning JSON; retried when Google is busy, given up after TIMEOUT_MS. */
+async function askJson(parts, schema) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-  const generationConfig = { responseMimeType: "application/json", responseJsonSchema: LINE_SCHEMA };
-  if (thinking !== "off") generationConfig.thinkingConfig = { thinkingLevel: thinking, includeThoughts: true };
-  const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS }] }, contents: [{ role: "user", parts }], generationConfig };
+  const generationConfig = { responseMimeType: "application/json", responseJsonSchema: schema };
+  if (THINKING !== "off") generationConfig.thinkingConfig = { thinkingLevel: THINKING, includeThoughts: true };
+  const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS + "\n\n" + EXACT_RULES }] }, contents: [{ role: "user", parts }], generationConfig };
   try {
     for (let attempt = 0; ; attempt++) {
       try {
         const { text, finish } = await streamOnce(body, controller.signal);
         if (finish && !["STOP", "FINISH_REASON_UNSPECIFIED"].includes(finish)) throw new ReadError(`Gemini stopped: ${finish}`);
         if (!text) throw new ReadError("Gemini gave no answer.");
-        return cleanLines(JSON.parse(text).lines || []);
+        return JSON.parse(text);
       } catch (e) {
         if (e.name === "AbortError") throw new ReadError("Gemini took too long. Try again, or try a clearer photo.");
         if (e.status === 400 && generationConfig.thinkingConfig && /think/i.test(e.message)) { delete generationConfig.thinkingConfig; continue; }
@@ -392,17 +411,44 @@ function cleanLines(lines) {
   }).filter((l) => l.text);
 }
 
-/** Words the two readings disagree on are marked for checking. */
-function flagDisagreements(draft, checked) {
-  const centre = (l) => (l.top + l.bottom) / 2;
-  return checked.map((line) => {
-    let best = null;
-    for (const d of draft) if (!best || Math.abs(centre(d) - centre(line)) < Math.abs(centre(best) - centre(line))) best = d;
-    if (!best) return line;
-    const before = new Set(best.text.split(/\s+/));
-    const changed = line.text.split(/\s+/).filter((w) => w && !before.has(w));
-    return changed.length ? { ...line, unclear: [...new Set([...line.unclear, ...changed])] } : line;
-  });
+const ask = async (parts) => cleanLines((await askJson(parts, LINE_SCHEMA)).lines || []);
+
+const EXACT_BATCH = 12; // lines per request in the word-by-word step
+
+/**
+ * The word-by-word step: every line is cut out of the full-size page and read
+ * on its own, zoomed in, in shuffled order, so Gemini can't follow (or
+ * "improve") the sentence. Returns the literal text per line (null where a
+ * line could not be read).
+ */
+async function readLinesExactly(bitmap, lines, known) {
+  const order = lines.map((_, i) => i);
+  for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+  const out = new Array(lines.length).fill(null);
+  const batches = [];
+  for (let i = 0; i < order.length; i += EXACT_BATCH) batches.push(order.slice(i, i + EXACT_BATCH));
+  await Promise.all(batches.map(async (batch) => {
+    const parts = [...known, { text: `Below are ${batch.length} images, each one handwritten line cut out of a page, in random order (they do not form a text together). For each image, transcribe exactly the letters written on the main line in the middle of the image, letter by letter and word by word, right to left. Ignore cut-off bits of the lines above or below it. Do not guess from meaning: a word you can't read fully goes in "unclear" with the letters you can see. Keep the writer's spelling and grammar exactly, even when wrong. Answer with one entry per image, using the image's number.` }];
+    for (const [k, idx] of batch.entries()) {
+      const box = lines[idx];
+      // A little extra height, since line boxes are approximate.
+      const h = box.bottom - box.top;
+      const loose = { ...box, top: Math.max(0, box.top - h * 0.15), bottom: Math.min(1000, box.bottom + h * 0.15) };
+      const crop = cropLine(bitmap, loose, 320);
+      parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
+    }
+    try {
+      const res = await askJson(parts, EXACT_SCHEMA);
+      for (const r of res.lines || []) {
+        const idx = batch[r.image - 1];
+        if (idx === undefined || typeof r.text !== "string" || !r.text.trim()) continue;
+        out[idx] = { text: r.text.trim(), unclear: (r.unclear || []).filter((w) => typeof w === "string") };
+      }
+    } catch (e) {
+      console.warn("Word-by-word step failed for some lines, keeping the page reading there:", e);
+    }
+  }));
+  return out;
 }
 
 /** Word-level differences between a reading and the corrected text. */
@@ -454,9 +500,17 @@ async function readPage(doc, page, onStep) {
   let lines = await ask([...known, pagePart, { text: "Transcribe all the handwriting on this page." }]);
   if (PASSES > 1 && lines.length) {
     onStep(2, lines);
-    const draft = lines.map((l, i) => `${i + 1}. [top ${l.top}, bottom ${l.bottom}, left ${l.left}, right ${l.right}] ${l.text}`).join("\n");
-    const checked = await ask([...known, pagePart, { text: `Below is a draft transcription of this page. It may contain misread letters, words read only partly, missed or extra lines, missing punctuation (״ ׳ ־ parentheses, dashes), words that are not actually written on the page, or inaccurate line boxes.\n\nProofread it against the handwriting: go through the image line by line and word by word, and compare every word, letter by letter, with the pen strokes. Change a word only when the handwriting clearly shows different letters; never change a word to one that merely reads better or makes more sense. If the draft has a word that is not written on the page, replace it with what is actually written. Where you are unsure, keep the draft's word and mark it unclear. Return the full corrected transcription.\n\nDraft:\n${draft}` }]).catch((e) => { console.warn("Proofread failed, keeping the first reading:", e); return []; });
-    if (checked.length) lines = flagDisagreements(lines, checked);
+    const exact = await readLinesExactly(bitmap, lines, known);
+    // The literal reading wins; wherever it differs from the page reading, the word is flagged.
+    lines = lines.map((line, i) => {
+      const e = exact[i];
+      if (!e) return line;
+      const words = new Set(e.text.split(/\s+/));
+      const before = new Set(line.text.split(/\s+/));
+      const differ = e.text.split(/\s+/).filter((w) => w && !before.has(w));
+      const unclear = [...new Set([...e.unclear, ...line.unclear, ...differ])].filter((w) => words.has(w));
+      return { ...line, text: e.text, unclear };
+    });
   }
   return lines.map((l) => ({ ...l, ai: l.text }));
 }
@@ -631,7 +685,7 @@ async function renderPage(page) {
   head.append(h, st);
   if (page.status === "queued") st.textContent = "Waiting…";
   if (page.status === "working") {
-    const label = page.step === 2 ? "Step 2 of 2: proofreading against the handwriting…" : "Step 1 of 2: Gemini is reading the page…";
+    const label = page.step === 2 ? "Step 2 of 2: checking each line word by word…" : "Step 1 of 2: Gemini is reading the page…";
     st.innerHTML = `<span class="spinner"></span>${label}`;
   }
   if (page.status === "error") { st.classList.add("err"); st.textContent = "Error: " + page.error; }
@@ -662,7 +716,7 @@ async function renderPage(page) {
 
   const body = document.createElement("div");
   if (page.status === "working" && page.draft?.length) {
-    body.innerHTML = '<div class="draft-note">First reading. Gemini is now proofreading it against the handwriting; you can edit when it\'s done.</div>';
+    body.innerHTML = '<div class="draft-note">First reading. Gemini is now checking each line on its own, word by word; you can edit when it\'s done.</div>';
     const imgs = await crops(page, page.draft);
     page.draft.forEach((l, i) => {
       const row = document.createElement("div"); row.className = "row";
