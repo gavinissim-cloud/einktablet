@@ -380,11 +380,11 @@ const EXACT_SCHEMA = {
 };
 
 /** One Gemini request returning JSON; retried when Google is busy, given up after TIMEOUT_MS. */
-async function askJson(parts, schema) {
+async function askJson(parts, schema, thinking = THINKING) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const generationConfig = { responseMimeType: "application/json", responseJsonSchema: schema };
-  if (THINKING !== "off") generationConfig.thinkingConfig = { thinkingLevel: THINKING, includeThoughts: true };
+  if (thinking !== "off") generationConfig.thinkingConfig = { thinkingLevel: thinking, includeThoughts: true };
   const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS + "\n\n" + EXACT_RULES }] }, contents: [{ role: "user", parts }], generationConfig };
   try {
     for (let attempt = 0; ; attempt++) {
@@ -422,7 +422,12 @@ function cleanLines(lines) {
 const ask = async (parts) => cleanLines((await askJson(parts, LINE_SCHEMA)).lines || []);
 
 const EXACT_BATCH = 12; // lines per request when a line can't be split into words
-const WORD_BATCH = 30;  // word pictures per request
+const WORD_BATCH = 15;  // word pictures per request
+const WORD_PARALLEL = 6; // word requests at the same time
+const WORD_EXAMPLES = 8; // the writer's corrected lines shown with each word request
+// Reading one isolated word needs little thinking; deep thinking is mostly
+// reasoning about meaning, which is what this step is meant to avoid.
+const WORD_THINKING = "LOW";
 
 /**
  * Split one handwritten line into words by the blank space between them.
@@ -502,7 +507,7 @@ const WORD_SCHEMA = {
  * a sentence or topic to guess from. Returns per line {text, unsure: [words]},
  * or null for lines that couldn't be split into words.
  */
-async function readWordsExactly(bitmap, lines, known) {
+async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
   const items = []; // {line, pos, box}
   const perLine = lines.map((line, i) => {
     const h = line.bottom - line.top;
@@ -517,14 +522,16 @@ async function readWordsExactly(bitmap, lines, known) {
   const sure = lines.map((_, i) => (perLine[i] ? new Array(perLine[i]).fill(true) : null));
   const batches = [];
   for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
-  await Promise.all(batches.map(async (batch) => {
+  let done = 0;
+  onWords(0, items.length);
+  const readBatch = async (batch) => {
     const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. If a letter is uncertain, write your best reading and set "sure" to false. Answer with one entry per image, using the image's number.` }];
     for (const [k, it] of batch.entries()) {
       const crop = cropLine(bitmap, it.box, 240);
       parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
     }
     try {
-      const res = await askJson(parts, WORD_SCHEMA);
+      const res = await askJson(parts, WORD_SCHEMA, WORD_THINKING);
       for (const r of res.words || []) {
         const it = batch[r.image - 1];
         if (!it || typeof r.text !== "string") continue;
@@ -534,6 +541,13 @@ async function readWordsExactly(bitmap, lines, known) {
     } catch (e) {
       console.warn("Word-by-word step failed for some words:", e);
     }
+    done += batch.length;
+    onWords(done, items.length);
+  };
+  // A few requests at a time.
+  const pending = [...batches];
+  await Promise.all(Array.from({ length: Math.min(WORD_PARALLEL, pending.length) }, async () => {
+    while (pending.length) await readBatch(pending.shift());
   }));
   return lines.map((_, i) => {
     if (!texts[i] || texts[i].some((t) => t === null)) return null; // a word is missing: don't trust this line's split
@@ -598,9 +612,9 @@ function wordGaps(ai, text) {
   return fixes;
 }
 
-async function learnedParts(writer, pageId) {
+async function learnedParts(writer, pageId, max = EXAMPLES) {
   if (!writer) return [];
-  const examples = (writer.examples || []).filter((e) => e.pageId !== pageId).slice(0, EXAMPLES);
+  const examples = (writer.examples || []).filter((e) => e.pageId !== pageId).slice(0, max);
   const parts = [];
   if (examples.length) {
     parts.push({ text: `MOST IMPORTANT: this page was written by a writer whose handwriting has been read before. Here are ${examples.length} lines from their earlier pages, each with the correct transcription their reader confirmed. Study how this person forms each letter, joins letters, and writes final letters and punctuation, and read the new page with that in mind.` });
@@ -631,7 +645,8 @@ async function readPage(doc, page, onStep) {
   if (PASSES > 1 && lines.length) {
     onStep(2, lines);
     // Every word read on its own; lines that can't be split are read as whole lines instead.
-    const byWord = await readWordsExactly(bitmap, lines, known);
+    const knownWords = await learnedParts(writer, page.id, WORD_EXAMPLES);
+    const byWord = await readWordsExactly(bitmap, lines, knownWords, (done, total) => onStep(2, null, { done, total }));
     const missing = lines.map((l, i) => (byWord[i] ? null : i)).filter((i) => i !== null);
     const byLine = missing.length ? await readLinesExactly(bitmap, missing.map((i) => lines[i]), known) : [];
     missing.forEach((i, k) => { if (byLine[k]) byWord[i] = { text: byLine[k].text, unsure: byLine[k].unclear }; });
@@ -680,8 +695,9 @@ async function runJob({ docId, pageId }) {
   const page = doc?.pages.find((p) => p.id === pageId);
   if (!page) return;
   try {
-    await updatePage(docId, pageId, { status: "working", step: 0, draft: null, error: null });
-    const lines = await readPage(doc, page, (step, draft) => updatePage(docId, pageId, draft ? { step, draft } : { step }));
+    await updatePage(docId, pageId, { status: "working", step: 0, draft: null, words: null, error: null });
+    const lines = await readPage(doc, page, (step, draft, words) =>
+      updatePage(docId, pageId, { step, ...(draft ? { draft } : {}), ...(words ? { words } : {}) }));
     await updatePage(docId, pageId, { status: "done", lines, draft: null, step: 0 });
   } catch (e) {
     console.error(e);
@@ -824,7 +840,10 @@ async function renderPage(page) {
   head.append(h, st);
   if (page.status === "queued") st.textContent = "Waiting…";
   if (page.status === "working") {
-    const label = page.step === 2 ? "Step 2 of 2: reading every word on its own…" : "Step 1 of 2: Gemini is reading the page…";
+    const w = page.words;
+    const label = page.step === 2
+      ? `Step 2 of 2: reading every word on its own${w?.total ? ` (${w.done} of ${w.total})` : ""}…`
+      : "Step 1 of 2: Gemini is reading the page…";
     st.innerHTML = `<span class="spinner"></span>${label}`;
   }
   if (page.status === "error") { st.classList.add("err"); st.textContent = "Error: " + page.error; }
