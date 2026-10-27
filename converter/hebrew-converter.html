@@ -362,7 +362,9 @@ async function streamOnce(body, signal) {
 
 /** One request: retried when Google is busy, given up after TIMEOUT_MS. */
 // Added to the instructions: Gemini tends to "improve" what people write.
-const EXACT_RULES = `KEEP THE WRITER'S EXACT WORDS, SPELLING AND GRAMMAR. Never add or remove a letter to make a word "correct": if the writer wrote הסטוריה, write הסטוריה, not היסטוריה; if they wrote אמא, don't write אימא; if they used the wrong gender, tense or preposition, or left a word out, keep it exactly that way. Never add, drop, reorder or replace words, and never add punctuation the writer didn't write. Read each word from its own letters, not from what the sentence suggests. The texts are often Torah or Gemara study notes mixing Hebrew and Aramaic (for example דבלא, היגיע, מזונותיה, דצורת, ממילא, ואי); their spellings and words are correct as written. Never turn them into everyday modern Hebrew.`;
+const EXACT_RULES = `KEEP THE WRITER'S EXACT WORDS, SPELLING AND GRAMMAR. Never add or remove a letter to make a word "correct": if the writer wrote הסטוריה, write הסטוריה, not היסטוריה; if they wrote אמא, don't write אימא; if they used the wrong gender, tense or preposition, or left a word out, keep it exactly that way. Never add, drop, reorder or replace words, and never add punctuation the writer didn't write. Read each word from its own letters, not from what the sentence suggests. The texts are often Torah or Gemara study notes mixing Hebrew and Aramaic (for example דבלא, היגיע, מזונותיה, דצורת, ממילא, ואי); their spellings and words are correct as written. Never turn them into everyday modern Hebrew.
+
+WHEN YOU CAN'T READ A LETTER, WRITE ? IN ITS PLACE. For example, if you can read מז and נותיה but not the letter between them, write מז?נותיה. If you can't read a whole word, write one ? for each letter you think it has, or just ???. A ? is always right; a guessed letter or word is always wrong. Never fill a hard-to-read spot with a word that fits the sentence.`;
 
 const EXACT_SCHEMA = {
   type: "object",
@@ -415,7 +417,9 @@ function cleanLines(lines) {
     if (right < left) [left, right] = [right, left];
     const text = String(l.text || "").trim();
     const words = new Set(text.split(/\s+/));
-    return { text, top, bottom, left, right, unclear: (l.unclear || []).filter((w) => typeof w === "string" && words.has(w)) };
+    const unclear = (l.unclear || []).filter((w) => typeof w === "string" && words.has(w));
+    for (const w of words) if (w.includes("?") && !unclear.includes(w)) unclear.push(w); // unreadable letters
+    return { text, top, bottom, left, right, unclear };
   }).filter((l) => l.text);
 }
 
@@ -525,7 +529,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
   let done = 0;
   onWords(0, items.length);
   const readBatch = async (batch) => {
-    const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. If a letter is uncertain, write your best reading and set "sure" to false. Answer with one entry per image, using the image's number.` }];
+    const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. If you can't make out a letter, write ? in its place (a ? is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per image, using the image's number.` }];
     for (const [k, it] of batch.entries()) {
       const crop = cropLine(bitmap, it.box, 240);
       parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
@@ -662,6 +666,7 @@ async function readPage(doc, page, onStep) {
       const flagged = new Set(e.unsure);
       for (const f of gaps) f.from.split(" ").filter(Boolean).forEach((w) => flagged.add(w));
       const words = new Set(e.text.split(/\s+/));
+      for (const w of words) if (w.includes("?")) flagged.add(w);
       return { ...line, text: e.text, alts, unclear: [...flagged].filter((w) => words.has(w)) };
     });
   }
