@@ -142,7 +142,9 @@ mark { background: var(--warn-bg); color: inherit; border-radius: 3px; }
 "use strict";
 
 // ---------- Settings ----------
-const MODEL = "gemini-flash-latest";
+const DEFAULT_MODEL = "gemini-flash-latest";
+function getModel() { try { return localStorage.getItem("gemini_model") || DEFAULT_MODEL; } catch { return DEFAULT_MODEL; } }
+function setModel(m) { try { localStorage.setItem("gemini_model", m); } catch {} }
 const THINKING = "HIGH";
 const PASSES = 2;
 const EXAMPLES = 24;          // learned lines shown to Gemini per request
@@ -324,7 +326,7 @@ function cropLine(bitmap, box, height = 0) {
 class ReadError extends Error {}
 
 async function streamOnce(body, signal) {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:streamGenerateContent?alt=sse`, {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${getModel()}:streamGenerateContent?alt=sse`, {
     method: "POST", signal,
     headers: { "Content-Type": "application/json", "x-goog-api-key": getKey() },
     body: JSON.stringify(body),
@@ -1166,9 +1168,48 @@ $("#keySave").onclick = () => {
   if (!k) return $("#keyInput").focus();
   setKey(k); $("#keyInput").value = ""; route();
 };
+/** The Gemini models this key may use, asked from Google (names change, so they aren't hard-coded). */
+async function listModels() {
+  const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { headers: { "x-goog-api-key": getKey() } });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error?.message || `error ${res.status}`);
+  const data = await res.json();
+  return (data.models || [])
+    .filter((m) => m.name.startsWith("models/gemini") && (m.supportedGenerationMethods || []).includes("generateContent")
+      && !/embedding|tts|image|live|audio|robotics|computer/i.test(m.name))
+    .map((m) => ({ id: m.name.replace("models/", ""), label: m.displayName || m.name.replace("models/", "") }));
+}
+
 $("#settingsBtn").onclick = async () => {
-  const k = await dialog("Your Gemini key (saved only in this browser). Paste a new one to replace it, or leave empty to keep it.", { ok: "Save", cancel: "Cancel", input: "" });
-  if (k) { setKey(k); notify("Saved."); }
+  const wrap = document.createElement("div");
+  wrap.className = "dialog-wrap";
+  wrap.innerHTML = `<form class="dialog"><p><b>Settings</b></p>
+    <p class="muted">Reading model. <b>Flash</b> is fast and cheap. <b>Pro</b> is usually more accurate on hard handwriting, but slower and several times the price per page.</p>
+    <p><select id="modelPick" style="width:100%"><option>Loading the models your key can use…</option></select></p>
+    <p class="muted">Gemini key (saved only in this browser). Paste a new one to replace it, or leave empty to keep it.</p>
+    <p><input type="password" id="keyNew" placeholder="New key (optional)"></p>
+    <div class="actions"><button type="submit">Save</button><button type="button" class="secondary" id="setCancel">Cancel</button></div></form>`;
+  document.body.append(wrap);
+  const pick = wrap.querySelector("#modelPick");
+  const current = getModel();
+  listModels().then((models) => {
+    pick.innerHTML = "";
+    if (!models.some((m) => m.id === current)) models.unshift({ id: current, label: current });
+    // Pro and Flash first, newest-looking names first.
+    models.sort((a, b) => (/pro/i.test(b.id) - /pro/i.test(a.id)) || (/latest/.test(b.id) - /latest/.test(a.id)) || b.id.localeCompare(a.id));
+    for (const m of models) pick.add(new Option(`${m.label}  (${m.id})`, m.id, false, m.id === current));
+  }).catch((e) => {
+    pick.innerHTML = "";
+    pick.add(new Option(`${current} (couldn't list models: ${e.message})`, current, true, true));
+  });
+  wrap.querySelector("#setCancel").onclick = () => wrap.remove();
+  wrap.querySelector("form").onsubmit = (e) => {
+    e.preventDefault();
+    const k = wrap.querySelector("#keyNew").value.trim();
+    if (k) setKey(k);
+    if (pick.value && !pick.value.startsWith("Loading")) setModel(pick.value);
+    wrap.remove();
+    notify(`Saved. Pages will be read with ${getModel()}.`);
+  };
 };
 $("#backHome").onclick = async () => { await flushSave(); location.hash = ""; showHome(); };
 $("#docTitle").oninput = scheduleSave;
