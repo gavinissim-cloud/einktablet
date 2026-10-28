@@ -216,9 +216,10 @@ async function tx(store, mode, fn) {
     const t = d.transaction(store, mode);
     const s = t.objectStore(store);
     let result;
-    Promise.resolve(fn(s)).then((r) => { result = r; });
+    Promise.resolve(fn(s)).then((r) => { result = r; }, () => {}); // failures surface through the transaction
     t.oncomplete = () => resolve(result);
-    t.onerror = () => reject(t.error);
+    t.onerror = (ev) => reject(t.error || ev.target?.error || new Error("Saving failed."));
+    t.onabort = () => reject(t.error || new Error("Saving failed (is the disk full?)."));
   });
 }
 const req = (r) => new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
@@ -226,6 +227,33 @@ const getAll = (store) => tx(store, "readonly", (s) => req(s.getAll()));
 const getOne = (store, id) => tx(store, "readonly", (s) => req(s.get(id)));
 const putOne = (store, value) => tx(store, "readwrite", (s) => req(s.put(value)));
 const delOne = (store, id) => tx(store, "readwrite", (s) => req(s.delete(id)));
+/**
+ * Change one stored record in a single transaction, so changes made at the
+ * same moment (three pages finishing together, an edit being saved) can never
+ * overwrite each other. `fn` changes the record in place and must not wait on
+ * anything; returning false means "no change". Resolves with the record, or
+ * null when it doesn't exist or wasn't changed.
+ */
+async function modify(store, id, fn) {
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    const t = d.transaction(store, "readwrite");
+    const s = t.objectStore(store);
+    let result = null;
+    const r = s.get(id);
+    r.onsuccess = () => {
+      if (!r.result) return;
+      let changed;
+      try { changed = fn(r.result); } catch (e) { t.abort(); reject(e); return; }
+      if (changed === false) return;
+      result = r.result;
+      s.put(r.result);
+    };
+    t.oncomplete = () => resolve(result);
+    t.onerror = (ev) => reject(t.error || ev.target?.error || new Error("Saving failed."));
+    t.onabort = () => reject(t.error || new Error("Saving failed (is the disk full?)."));
+  });
+}
 
 // ---------- Dialogs ----------
 function dialog(message, { ok = "OK", cancel = null, danger = false, input = null } = {}) {
@@ -359,6 +387,7 @@ async function streamOnce(body, signal) {
     for (const line of block.split(/\r?\n/)) {
       if (!line.startsWith("data:")) continue;
       const chunk = JSON.parse(line.slice(5).trim());
+      if (chunk.error) throw Object.assign(new ReadError(chunk.error.message || "Gemini error"), { status: chunk.error.code || 500 });
       const cand = chunk.candidates?.[0];
       for (const p of cand?.content?.parts || []) if (typeof p.text === "string" && !p.thought) text += p.text;
       if (cand?.finishReason) finish = cand.finishReason;
@@ -401,12 +430,23 @@ const EXACT_SCHEMA = {
   required: ["lines"],
 };
 
+// At most this many Gemini requests at once across all pages, so Google's "too busy" limit isn't hit.
+const MAX_REQUESTS = 6;
+let inFlight = 0; const waiting = [];
+async function withSlot(fn) {
+  if (inFlight >= MAX_REQUESTS) await new Promise((r) => waiting.push(r));
+  inFlight++;
+  try { return await fn(); } finally { inFlight--; waiting.shift()?.(); }
+}
+let thinkingRejected = new Set(); // models that refused a thinking setting once
+
 /** One Gemini request returning JSON; retried when Google is busy, given up after TIMEOUT_MS. */
-async function askJson(parts, schema, thinking = THINKING) {
+function askJson(parts, schema, thinking = THINKING) { return withSlot(() => askJsonNow(parts, schema, thinking)); }
+async function askJsonNow(parts, schema, thinking) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const generationConfig = { responseMimeType: "application/json", responseJsonSchema: schema };
-  if (thinking !== "off") generationConfig.thinkingConfig = { thinkingLevel: thinking, includeThoughts: true };
+  if (thinking !== "off" && !thinkingRejected.has(getModel())) generationConfig.thinkingConfig = { thinkingLevel: thinking, includeThoughts: true };
   const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS + "\n\n" + EXACT_RULES }] }, contents: [{ role: "user", parts }], generationConfig };
   try {
     for (let attempt = 0; ; attempt++) {
@@ -417,13 +457,19 @@ async function askJson(parts, schema, thinking = THINKING) {
         return JSON.parse(text);
       } catch (e) {
         if (e.name === "AbortError") throw new ReadError("Gemini took too long. Try again, or try a clearer photo.");
-        if (e.status === 400 && generationConfig.thinkingConfig && /think/i.test(e.message)) { delete generationConfig.thinkingConfig; continue; }
+        if (e.status === 400 && generationConfig.thinkingConfig && /think/i.test(e.message)) { thinkingRejected.add(getModel()); delete generationConfig.thinkingConfig; continue; }
         // The automatically chosen model isn't available after all: use Flash.
-        if ((e.status === 404 || (e.status === 400 && /model/i.test(e.message))) && chosenModel() === AUTO && getModel() !== DEFAULT_MODEL) {
+        const noAllowance = e.status === 429 && /limit:\s*0\b/.test(e.message);
+        const noModel = e.status === 404 || (e.status === 400 && /model\b.*\b(not found|not supported|does not exist|is not available)/i.test(e.message));
+        if ((noModel || noAllowance) && chosenModel() === AUTO && getModel() !== DEFAULT_MODEL) {
           console.warn(`${getModel()} not available (${e.message}); using ${DEFAULT_MODEL}`);
           autoModel = DEFAULT_MODEL; continue;
         }
-        if ((e.status === 429 || e.status >= 500) && attempt < 2) { await new Promise((r) => setTimeout(r, 4000 * (attempt + 1) ** 2)); continue; }
+        // Busy, a server error, a dropped connection, or a cut-off answer: try again, waiting longer each time.
+        const network = e instanceof TypeError && !e.status;
+        if ((e.status === 429 || e.status >= 500 || network || e instanceof SyntaxError) && attempt < 3) {
+          await new Promise((r) => setTimeout(r, 3000 * (attempt + 1) ** 2)); continue;
+        }
         if (e.status === 400 && /API key/i.test(e.message)) throw new ReadError("Your Gemini key isn't accepted. Check it in Settings.");
         if (e instanceof SyntaxError) throw new ReadError("Gemini's answer could not be read. Try again.");
         throw e;
@@ -436,11 +482,12 @@ async function askJson(parts, schema, thinking = THINKING) {
 
 const clamp = (n) => Math.min(1000, Math.max(0, Math.round(Number(n) || 0)));
 function cleanLines(lines) {
-  return lines.map((l) => {
+  return (Array.isArray(lines) ? lines : []).filter((l) => l && typeof l === "object").map((l) => {
     let [top, bottom, left, right] = [l.top, l.bottom, l.left, l.right].map(clamp);
     if (bottom < top) [top, bottom] = [bottom, top];
     if (right < left) [left, right] = [right, left];
-    const text = String(l.text || "").trim();
+    if (bottom - top < 6) { top = Math.max(0, top - 10); bottom = Math.min(1000, bottom + 10); } // a box with no height
+    const text = String(l.text || "").replace(/\s+/g, " ").trim();
     const words = new Set(text.split(/\s+/));
     const unclear = (l.unclear || []).filter((w) => typeof w === "string" && words.has(w));
     for (const w of words) if (w.includes("□") && !unclear.includes(w)) unclear.push(w); // unreadable letters
@@ -467,8 +514,10 @@ function segmentWords(bitmap, box) {
   const W = bitmap.width, H = bitmap.height;
   const x0 = (box.left / 1000) * W, x1 = (box.right / 1000) * W;
   const y0 = (box.top / 1000) * H, y1 = (box.bottom / 1000) * H;
-  const scale = 120 / Math.max(1, y1 - y0); // analysed at 120 px high
-  const cw = Math.max(1, Math.round((x1 - x0) * scale)), ch = 120;
+  if (y1 - y0 < 8 || x1 - x0 < 8) return null; // not a real line box
+  const scale = 120 / (y1 - y0); // analysed at 120 px high
+  const cw = Math.round((x1 - x0) * scale), ch = 120;
+  if (cw > 12000) return null; // a box this flat can't be split reliably
   const c = document.createElement("canvas"); c.width = cw; c.height = ch;
   const ctx = c.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(bitmap, x0, y0, x1 - x0, y1 - y0, 0, 0, cw, ch);
@@ -524,8 +573,12 @@ function segmentWords(bitmap, box) {
   if (!kept.length || kept.length > 30) return null;
   const toPage = (v) => box.left + (v / scale / W) * 1000;
   const pad = core * 0.25;
+  // Padding, but never more than half the space to the next word, so neighbouring pictures don't share ink.
   return kept
-    .map(([s, e]) => ({ top: box.top, bottom: box.bottom, left: Math.max(box.left, toPage(s - pad)), right: Math.min(box.right, toPage(e + pad)) }))
+    .map(([s, e], k) => {
+      const before = k ? (s - kept[k - 1][1]) / 2 : pad, after = k < kept.length - 1 ? (kept[k + 1][0] - e) / 2 : pad;
+      return { top: box.top, bottom: box.bottom, left: Math.max(box.left, toPage(s - Math.min(pad, before))), right: Math.min(box.right, toPage(e + Math.min(pad, after))) };
+    })
     .reverse(); // Hebrew reads right to left
 }
 
@@ -551,7 +604,10 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
   const perLine = lines.map((line, i) => {
     const h = line.bottom - line.top;
     const loose = { ...line, top: Math.max(0, line.top - h * 0.15), bottom: Math.min(1000, line.bottom + h * 0.15) };
-    const words = segmentWords(bitmap, loose);
+    // Latin words and numbers read left to right; cutting them into right-to-left pictures would reverse them.
+    if (/[A-Za-z]/.test(line.text) || (line.text.match(/\d+/g) || []).length > 1) return null;
+    let words = null;
+    try { words = segmentWords(bitmap, loose); } catch (e) { console.warn("Couldn't split a line into words:", e); }
     if (!words) return null;
     words.forEach((box, pos) => items.push({ line: i, pos, box }));
     return words.length;
@@ -561,24 +617,28 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
   const sure = lines.map((_, i) => (perLine[i] ? new Array(perLine[i]).fill(true) : null));
   const batches = [];
   for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
-  let done = 0;
+  let done = 0, answered = 0;
   onWords(0, items.length);
   const readBatch = async (batch) => {
-    const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per image, using the image's number.` }];
+    const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.` }];
     for (const [k, it] of batch.entries()) {
       const crop = cropLine(bitmap, it.box, 240);
       parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
     }
-    try {
+    // Once more if the answer left words out (a failed request was already retried inside askJson).
+    for (let attempt = 0; attempt < 2; attempt++) try {
       const res = await askJson(parts, WORD_SCHEMA, WORD_THINKING);
+      answered++;
       for (const r of res.words || []) {
-        const it = batch[r.image - 1];
-        if (!it || typeof r.text !== "string") continue;
-        texts[it.line][it.pos] = r.text.trim();
+        const it = batch[Number(r.image) - 1];
+        if (!it || typeof r.text !== "string" || !r.text.trim()) continue; // missing or empty: that line is read whole instead
+        texts[it.line][it.pos] = r.text.trim().replace(/\s+/g, " ");
         sure[it.line][it.pos] = r.sure !== false;
       }
+      if (batch.every((it) => texts[it.line][it.pos] !== null)) break;
     } catch (e) {
       console.warn("Word-by-word step failed for some words:", e);
+      break;
     }
     done += batch.length;
     onWords(done, items.length);
@@ -588,11 +648,14 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
   await Promise.all(Array.from({ length: Math.min(WORD_PARALLEL, pending.length) }, async () => {
     while (pending.length) await readBatch(pending.shift());
   }));
+  // Not one answer: Gemini is failing right now, so step 2 is skipped (the page reading is kept).
+  if (batches.length && !answered) throw new Error("the word-by-word step got no answers");
   return lines.map((_, i) => {
     if (!texts[i] || texts[i].some((t) => t === null)) return null; // a word is missing: don't trust this line's split
-    const words = texts[i].filter(Boolean);
     const boxes = items.filter((it) => it.line === i).sort((a, b) => a.pos - b.pos).map((it) => it.box);
-    return { text: joinWords(texts[i]), unsure: words.filter((w, k) => !sure[i][k]), segs: texts[i].map((t, k) => ({ text: t || "", box: boxes[k] })) };
+    // A picture may hold two words; each of its words counts as unsure.
+    const unsure = texts[i].flatMap((t, k) => (sure[i][k] ? [] : t.split(" ")));
+    return { text: joinWords(texts[i]), unsure, segs: texts[i].map((t, k) => ({ text: t || "", box: boxes[k] })) };
   });
 }
 
@@ -602,16 +665,17 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
  * to the word before, an opening parenthesis or bracket to the word after.
  */
 function joinWords(parts) {
-  let out = "", openNext = "";
+  let out = "", open = "", glue = false; // glue: the next word joins without a space (after a maqaf)
   for (const raw of parts) {
     const t = (raw || "").trim();
     if (!t) continue;
-    if (/^[(\[]+$/.test(t)) { openNext += t; continue; }
-    if (/^[.,:;!?)\]\u05f3\u05f4"']+$/.test(t) && out) { out += t; continue; }
-    out += (out ? " " : "") + openNext + t;
-    openNext = "";
+    if (/^[(\[]+$/.test(t)) { open += t; continue; }
+    if (t === "\u05be" && out && !open) { out += t; glue = true; continue; }
+    if (/^[.,:;!?)\]\u05f3\u05f4"']+$/.test(t) && out && !open) { out += t; glue = false; continue; }
+    out += (out && !glue ? " " : "") + open + t;
+    open = ""; glue = false;
   }
-  return out + (openNext ? " " + openNext : "");
+  return out + (open ? (out ? " " : "") + open : "");
 }
 
 // ---------- Sefaria word list ----------
@@ -636,20 +700,21 @@ const HEB = "אבגדהוזחטיכלמנסעפצקרשתךםןףץ";
 const FINAL = { כ: "ך", מ: "ם", נ: "ן", פ: "ף", צ: "ץ" };
 /** Split a written word into leading punctuation, the word, trailing punctuation. */
 function wordParts(w) {
-  const m = w.replace(/\u05f4/g, '"').replace(/\u05f3/g, "'").match(/^([^\u05d0-\u05ea]*)([\u05d0-\u05ea](?:.*[\u05d0-\u05ea])?["']?)([^\u05d0-\u05ea]*)$/);
+  const m = w.replace(/[\u0591-\u05c7]/g, (c) => (c === "\u05be" ? c : "")).replace(/\u05f4/g, '"').replace(/\u05f3/g, "'").match(/^([^\u05d0-\u05ea]*)([\u05d0-\u05ea](?:.*[\u05d0-\u05ea])?["']?)([^\u05d0-\u05ea]*)$/);
   return m ? { pre: m[1], core: m[2], post: m[3] } : null;
 }
 function isKnownWord(w) {
   if (w.includes("□")) return true; // already flagged as unreadable
   const p = wordParts(w);
   if (!p) return true; // no Hebrew letters
-  return p.core.split(/[\u05be\-–]/).filter(Boolean).every((part) =>
+  return p.core.split(/[\u05be\-–/]/).filter(Boolean).every((part) =>
     lexicon.has(part) || lexicon.has(part.replace(/["']$/, "")));
 }
 /** Real words one letter away (a letter added, dropped, swapped or changed), most common first. */
 function suggestWords(w, max = 5) {
   const p = wordParts(w);
-  if (!p || /[\u05be\-–]/.test(p.core)) return [];
+  if (!p || /[\u05be\-–/]/.test(p.core)) return [];
+  const hebrewMarks = /[\u05f3\u05f4]/.test(w);
   const core = p.core, found = new Map();
   const add = (c) => {
     if (c === core || !c) return;
@@ -664,7 +729,8 @@ function suggestWords(w, max = 5) {
       add(core.slice(0, i) + ch + core.slice(i));
     }
   }
-  return [...found].sort((a, b) => a[1] - b[1]).slice(0, max).map(([c]) => p.pre + c + p.post);
+  const back = (c) => (hebrewMarks ? c.replace(/"/g, "\u05f4").replace(/'/g, "\u05f3") : c);
+  return [...found].sort((a, b) => a[1] - b[1]).slice(0, max).map(([c]) => p.pre + back(c) + p.post);
 }
 
 const PICK_SCHEMA = {
@@ -691,7 +757,8 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
       unclear.add(w);
       const sug = suggestWords(w);
       sug.forEach((alt) => alts.push({ word: w, alt, dict: true }));
-      const seg = segsPerLine?.[i]?.find((sg) => sg.box && sg.text.split(/\s+/).includes(w));
+      const core = (t) => wordParts(t)?.core;
+      const seg = segsPerLine?.[i]?.find((sg) => sg.box && sg.text.split(/\s+/).some((t) => t === w || (core(t) && core(t) === core(w))));
       if (sug.length && seg) asks.push({ line: i, word: w, candidates: sug, box: seg.box });
     }
     return { ...line, unclear: [...unclear], alts };
@@ -706,7 +773,7 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
     try {
       const res = await askJson(parts, PICK_SCHEMA, WORD_THINKING);
       for (const r of res.answers || []) {
-        const a = batch[r.image - 1];
+        const a = batch[Number(r.image) - 1];
         const choice = String(r.choice || "").replace(/[«»]/g, "").trim();
         if (!a || !a.candidates.includes(choice)) continue;
         const line = out[a.line];
@@ -733,7 +800,7 @@ async function readLinesExactly(bitmap, lines, known) {
   const batches = [];
   for (let i = 0; i < order.length; i += EXACT_BATCH) batches.push(order.slice(i, i + EXACT_BATCH));
   await Promise.all(batches.map(async (batch) => {
-    const parts = [...known, { text: `Below are ${batch.length} images, each one handwritten line cut out of a page, in random order (they do not form a text together). For each image, transcribe exactly the letters written on the main line in the middle of the image, letter by letter and word by word, right to left. Ignore cut-off bits of the lines above or below it. Do not guess from meaning: a word you can't read fully goes in "unclear" with the letters you can see. Keep the writer's spelling and grammar exactly, even when wrong. Answer with one entry per image, using the image's number.` }];
+    const parts = [...known, { text: `Below are ${batch.length} images, each one handwritten line cut out of a page, in random order (they do not form a text together). For each image, transcribe exactly the letters written on the main line in the middle of the image, letter by letter and word by word, right to left. Ignore cut-off bits of the lines above or below it. Do not guess from meaning: a word you can't read fully goes in "unclear" with the letters you can see. Keep the writer's spelling and grammar exactly, even when wrong. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.` }];
     for (const [k, idx] of batch.entries()) {
       const box = lines[idx];
       // A little extra height, since line boxes are approximate.
@@ -745,9 +812,9 @@ async function readLinesExactly(bitmap, lines, known) {
     try {
       const res = await askJson(parts, EXACT_SCHEMA);
       for (const r of res.lines || []) {
-        const idx = batch[r.image - 1];
+        const idx = batch[Number(r.image) - 1];
         if (idx === undefined || typeof r.text !== "string" || !r.text.trim()) continue;
-        out[idx] = { text: r.text.trim(), unclear: (r.unclear || []).filter((w) => typeof w === "string") };
+        out[idx] = { text: r.text.replace(/\s+/g, " ").trim(), unclear: (Array.isArray(r.unclear) ? r.unclear : []).filter((w) => typeof w === "string") };
       }
     } catch (e) {
       console.warn("Word-by-word step failed for some lines, keeping the page reading there:", e);
@@ -783,8 +850,9 @@ async function learnedParts(writer, pageId, max = EXAMPLES) {
   if (examples.length) {
     parts.push({ text: `MOST IMPORTANT: this page was written by a writer whose handwriting has been read before. Here are ${examples.length} lines from their earlier pages, each with the correct transcription their reader confirmed. Study how this person forms each letter, joins letters, and writes final letters and punctuation, and read the new page with that in mind.` });
     for (const [i, e] of examples.entries()) {
+      // The label comes before its picture, the same way as the numbered images later.
+      parts.push({ text: `Example line ${i + 1} (not a numbered image), correct reading: «${e.text}»${e.ai && e.ai !== e.text ? ` (first misread as «${e.ai}»)` : ""}:` });
       parts.push({ inlineData: { mimeType: "image/jpeg", data: await blobBase64(e.crop) } });
-      parts.push({ text: `Example ${i + 1} — correct reading: «${e.text}»${e.ai && e.ai !== e.text ? ` (first misread as «${e.ai}»)` : ""}` });
     }
   }
   const counts = new Map();
@@ -807,52 +875,108 @@ async function readPage(doc, page, onStep) {
   const known = await learnedParts(writer, page.id);
   onStep(1);
   let lines = await ask([...known, pagePart, { text: "Transcribe all the handwriting on this page." }]);
+  let segs = null;
   if (PASSES > 1 && lines.length) {
     onStep(2, lines);
-    // Every word read on its own; lines that can't be split are read as whole lines instead.
-    const knownWords = await learnedParts(writer, page.id, WORD_EXAMPLES);
-    const byWord = await readWordsExactly(bitmap, lines, knownWords, (done, total) => onStep(2, null, { done, total }));
-    const missing = lines.map((l, i) => (byWord[i] ? null : i)).filter((i) => i !== null);
-    const byLine = missing.length ? await readLinesExactly(bitmap, missing.map((i) => lines[i]), known) : [];
-    missing.forEach((i, k) => { if (byLine[k]) byWord[i] = { text: byLine[k].text, unsure: byLine[k].unclear, segs: null }; });
-    // The literal reading wins. Wherever the page reading differs, the word is
-    // flagged, with the page reading offered as the other choice.
-    lines = lines.map((line, i) => {
-      const e = byWord[i];
-      if (!e || !e.text) return line;
-      const gaps = wordGaps(e.text, line.text);
-      // One-click choices only for short differences; a line read completely differently is just flagged.
-      const short = (t) => t.split(" ").length <= 3;
-      const alts = gaps.filter((f) => f.from && f.to && short(f.from) && short(f.to)).map((f) => ({ word: f.from, alt: f.to }));
-      const flagged = new Set(e.unsure);
-      for (const f of gaps) f.from.split(" ").filter(Boolean).forEach((w) => flagged.add(w));
-      const words = new Set(e.text.split(/\s+/));
-      for (const w of words) if (w.includes("□")) flagged.add(w);
-      return { ...line, text: e.text, alts, unclear: [...flagged].filter((w) => words.has(w)) };
-    });
-    lines = await checkAgainstLexicon(bitmap, lines, byWord.map((e) => e?.segs));
-  } else {
-    lines = await checkAgainstLexicon(bitmap, lines, null);
+    // If anything in this step fails, the page reading from step 1 is kept.
+    try {
+      const step2 = await readEveryWord(bitmap, lines, writer, page, known, onStep);
+      lines = step2.lines; segs = step2.segs;
+    } catch (e) {
+      console.error("Step 2 failed; keeping the page reading:", e);
+    }
+  }
+  try {
+    lines = await checkAgainstLexicon(bitmap, lines, segs);
+  } catch (e) {
+    console.error("Word-list check failed:", e);
   }
   return lines.map((l) => ({ ...l, ai: l.text }));
 }
 
+/** Align two word lists: [{a: [...], b: [...]}], equal stretches have a and b the same. */
+function alignWords(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--)
+    dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = []; let i = 0, j = 0, ga = [], gb = [];
+  const flush = () => { if (ga.length || gb.length) out.push({ a: ga, b: gb, same: false }); ga = []; gb = []; };
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) { flush(); out.push({ a: [a[i]], b: [b[j]], same: true }); i++; j++; }
+    else if (j < b.length && (i === a.length || dp[i][j + 1] >= dp[i + 1][j])) gb.push(b[j++]);
+    else ga.push(a[i++]);
+  }
+  flush();
+  return out;
+}
+
+/**
+ * Step 2: every word read on its own (lines that can't be split are read as
+ * whole lines). The literal reading wins; wherever the page reading differs,
+ * the word is flagged with the page reading as the other choice. Words only
+ * the page reading has (for example a word a line box cut off) are never
+ * dropped silently: they are kept, flagged, with "remove" as the other choice.
+ */
+async function readEveryWord(bitmap, lines, writer, page, known, onStep) {
+  const knownWords = await learnedParts(writer, page.id, WORD_EXAMPLES);
+  const byWord = await readWordsExactly(bitmap, lines, knownWords, (done, total) => onStep(2, null, { done, total }));
+  const missing = lines.map((l, i) => (byWord[i] ? null : i)).filter((i) => i !== null);
+  const byLine = missing.length ? await readLinesExactly(bitmap, missing.map((i) => lines[i]), known) : [];
+  missing.forEach((i, k) => { if (byLine[k]) byWord[i] = { text: byLine[k].text, unsure: byLine[k].unclear.flatMap((w) => w.split(/\s+/)), segs: null }; });
+  const short = (t) => t.length <= 3;
+  const out = lines.map((line, i) => {
+    const e = byWord[i];
+    if (!e || !e.text) return line;
+    const lit = e.text.split(/\s+/).filter(Boolean), pg = line.text.split(/\s+/).filter(Boolean);
+    // Readings that hardly agree mean the line was cut up wrongly: keep the page reading, flagged.
+    const agree = alignWords(lit, pg).filter((x) => x.same).length;
+    if (Math.abs(lit.length - pg.length) > Math.max(2, pg.length * 0.3) && agree < pg.length * 0.5) {
+      return { ...line, unclear: [...new Set([...line.unclear, ...pg])] };
+    }
+    const words = [], flagged = new Set(e.unsure), alts = [];
+    for (const part of alignWords(lit, pg)) {
+      if (part.same) { words.push(...part.a); continue; }
+      if (part.a.length) {
+        words.push(...part.a);
+        part.a.forEach((w) => flagged.add(w));
+        if (part.b.length && short(part.a) && short(part.b)) alts.push({ word: part.a.join(" "), alt: part.b.join(" ") });
+      } else {
+        // Only the page reading has these words.
+        words.push(...part.b);
+        part.b.forEach((w) => flagged.add(w));
+        if (short(part.b)) alts.push({ word: part.b.join(" "), alt: "" });
+      }
+    }
+    for (const w of words) if (w.includes("□")) flagged.add(w);
+    const text = words.join(" ");
+    const has = new Set(words);
+    return { ...line, text, alts, unclear: [...flagged].filter((w) => has.has(w)) };
+  });
+  return { lines: out, segs: byWord.map((e) => e?.segs) };
+}
+
 // ---------- Reading queue ----------
 const queue = []; let running = 0;
-function enqueue(docId, pageId) { queue.push({ docId, pageId }); pump(); }
+const active = new Set(); // pages queued or being read
+function enqueue(docId, pageId) {
+  if (active.has(pageId)) return;
+  active.add(pageId);
+  queue.push({ docId, pageId }); pump();
+}
 function pump() {
   while (running < CONCURRENCY && queue.length) {
     const job = queue.shift(); running++;
-    runJob(job).finally(() => { running--; pump(); });
+    runJob(job).catch((e) => console.error(e)).finally(() => { running--; active.delete(job.pageId); pump(); });
   }
 }
 async function updatePage(docId, pageId, patch) {
-  const doc = await getOne("docs", docId);
-  const page = doc?.pages.find((p) => p.id === pageId);
-  if (!page) return null;
-  Object.assign(page, patch);
-  doc.updatedAt = new Date().toISOString();
-  await putOne("docs", doc);
+  const doc = await modify("docs", docId, (d) => {
+    const page = d.pages.find((p) => p.id === pageId);
+    if (!page) return false; // removed meanwhile
+    Object.assign(page, patch);
+    d.updatedAt = new Date().toISOString();
+  });
+  if (!doc) return null;
   if (state.doc?.id === docId) {
     const live = state.doc.pages.find((p) => p.id === pageId);
     if (live) { Object.assign(live, patch); renderPage(live); updateDocStatus(); }
@@ -875,24 +999,53 @@ async function runJob({ docId, pageId }) {
 }
 
 // ---------- Learning from corrections ----------
+/**
+ * Keep each corrected line (its handwriting picture and the correct text) as
+ * an example of the writer's handwriting. An example belongs to one line of
+ * one reading (identified by its box), so it stays correct when lines are
+ * added or removed, and what an earlier reading of the page taught is kept
+ * when the page is read again. Changing a line back to what was read removes
+ * its example.
+ */
+const exampleKey = (page, l) => `${page.id}:${l.top},${l.bottom},${l.left},${l.right}:${l.ai}`;
 async function learnFromPage(doc, page) {
   if (!doc.writerId || page.status !== "done") return;
-  const writer = await getOne("writers", doc.writerId);
-  if (!writer) return;
+  const lines = page.lines.filter((l) => l.top != null && l.ai);
+  const corrected = lines.filter((l) => l.text.trim() && l.text.trim() !== l.ai.trim());
+  const current = new Set(lines.map((l) => exampleKey(page, l)));
+  // Cut the pictures first (that takes time), then change the record in one step.
+  const before = await getOne("writers", doc.writerId);
+  if (!before) return;
+  const have = new Set((before.examples || []).map((e) => e.id));
+  const crops = new Map();
   let bitmap = null;
-  const keep = (writer.examples || []).filter((e) => e.pageId !== page.id);
-  const old = new Map((writer.examples || []).filter((e) => e.pageId === page.id).map((e) => [e.id, e]));
-  const fresh = [];
-  for (const [i, line] of page.lines.entries()) {
-    if (!line.ai || !line.text.trim() || line.text.trim() === line.ai.trim()) continue;
-    const id = `${page.id}:${i}`;
-    const prev = old.get(id);
-    if (prev) { fresh.push({ ...prev, text: line.text, updatedAt: new Date().toISOString() }); continue; }
+  for (const l of corrected) {
+    const id = exampleKey(page, l);
+    if (have.has(id)) continue;
     bitmap ??= await loadBitmap(page.image);
-    fresh.push({ id, docId: doc.id, pageId: page.id, text: line.text, ai: line.ai, crop: await canvasBlob(cropLine(bitmap, line, 160), 0.88), updatedAt: new Date().toISOString() });
+    crops.set(id, await canvasBlob(cropLine(bitmap, l, 160), 0.88));
   }
-  writer.examples = [...fresh, ...keep].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 2000);
-  await putOne("writers", writer);
+  await modify("writers", doc.writerId, (w) => {
+    const now = new Date().toISOString();
+    const byId = new Map((w.examples || []).map((e) => [e.id, e]));
+    let changed = false;
+    const forgotten = new Set(w.forgotten || []);
+    // Examples saved by older versions of this file (id "page:lineNumber") are replaced by the current kind.
+    for (const [id, e] of byId) if (e.pageId === page.id && /^[^:]+:\d+$/.test(id)) { byId.delete(id); changed = true; }
+    for (const l of lines) {
+      const id = exampleKey(page, l);
+      if (forgotten.has(id)) continue;
+      const isFix = corrected.includes(l), e = byId.get(id);
+      if (!isFix) { if (e) { byId.delete(id); changed = true; } continue; }
+      if (e) { if (e.text !== l.text) { e.text = l.text; e.updatedAt = now; changed = true; } continue; }
+      const crop = crops.get(id);
+      if (!crop) continue; // the record changed meanwhile; the next save adds it
+      byId.set(id, { id, docId: doc.id, pageId: page.id, text: l.text, ai: l.ai, crop, updatedAt: now });
+      changed = true;
+    }
+    if (!changed) return false;
+    w.examples = [...byId.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 2000);
+  });
 }
 
 // ---------- App state and views ----------
@@ -904,7 +1057,8 @@ function show(id) {
 }
 
 async function showHome() {
-  state.doc = null; location.hash = "";
+  state.doc = null;
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
   if (!getKey()) return show("setup");
   show("home");
   showBackupNote();
@@ -956,12 +1110,19 @@ async function showWriter(id) {
     const txt = document.createElement("div"); txt.className = "he";
     txt.innerHTML = `${esc(e.text)}<div class="muted" style="font-size:13px">first read as: ${esc(e.ai)}</div>`;
     const b = document.createElement("button"); b.className = "secondary"; b.textContent = "Forget";
-    b.onclick = async () => { const fresh = await getOne("writers", id); fresh.examples = fresh.examples.filter((x) => x.id !== e.id); await putOne("writers", fresh); showWriter(id); };
+    b.onclick = async () => {
+      await modify("writers", id, (w) => {
+        w.examples = (w.examples || []).filter((x) => x.id !== e.id);
+        w.forgotten = [...new Set([...(w.forgotten || []), e.id])].slice(-5000); // so it isn't learned again
+      });
+      showWriter(id);
+    };
     row.append(img, txt, b); list.append(row);
   }
 }
 
-function route() {
+async function route() {
+  if (state.doc) await flushSave(); // leaving a document (Back, Forward, a link): keep its edits
   const m = location.hash.match(/^#(doc|writer)=(.+)$/);
   if (!getKey()) return show("setup");
   if (m?.[1] === "doc") return showDoc(m[2]);
@@ -989,7 +1150,7 @@ async function crops(page, lines) {
   const key = page.id + ":" + lines.map((l) => `${l.top},${l.bottom},${l.left},${l.right}`).join(";");
   if (!state.crops.has(key)) {
     const bitmap = await loadBitmap(page.image);
-    state.crops.set(key, lines.map((l) => cropLine(bitmap, l).toDataURL("image/jpeg", 0.85)));
+    state.crops.set(key, lines.map((l) => (l.top == null ? null : cropLine(bitmap, l).toDataURL("image/jpeg", 0.85))));
   }
   return state.crops.get(key);
 }
@@ -997,12 +1158,15 @@ async function crops(page, lines) {
 function openLightbox(src) {
   const lb = document.createElement("div"); lb.className = "lightbox";
   const img = document.createElement("img"); img.src = src; lb.append(img);
-  lb.onclick = () => lb.remove(); document.body.append(lb);
+  lb.onclick = () => { lb.remove(); if (src.startsWith("blob:")) URL.revokeObjectURL(src); };
+  document.body.append(lb);
 }
 
 async function renderPage(page) {
   const el = document.getElementById("page-" + page.id);
   if (!el) return;
+  // Only the newest drawing of a page may show (an older one may finish later).
+  const seq = (el._seq = (el._seq || 0) + 1);
   const head = document.createElement("div"); head.className = "page-head";
   const h = document.createElement("h3"); h.textContent = page.name;
   const st = document.createElement("span"); st.className = "state";
@@ -1026,7 +1190,10 @@ async function renderPage(page) {
   if (page.status === "done" || page.status === "error") {
     const again = document.createElement("button"); again.className = "secondary"; again.textContent = "Read again";
     again.onclick = async () => {
-      if (page.status === "done" && !(await dialog("Read this page again? Your edits on it will be replaced.", { ok: "Read again", cancel: "Cancel" }))) return;
+      if (again.disabled) return;
+      again.disabled = true;
+      if (page.status === "done" && !(await dialog("Read this page again? Your edits on it will be replaced.", { ok: "Read again", cancel: "Cancel" }))) { again.disabled = false; return; }
+      if (page.status === "queued" || page.status === "working") return;
       await flushSave(); await updatePage(state.doc.id, page.id, { status: "queued", error: null }); enqueue(state.doc.id, page.id);
     };
     head.append(again);
@@ -1035,9 +1202,9 @@ async function renderPage(page) {
   rm.onclick = async () => {
     if (!(await dialog("Remove this page from the document?", { ok: "Remove", cancel: "Cancel", danger: true }))) return;
     await flushSave();
-    const doc = await getOne("docs", state.doc.id);
-    doc.pages = doc.pages.filter((p) => p.id !== page.id); await putOne("docs", doc);
-    state.doc = doc; renderPages(); updateDocStatus();
+    await modify("docs", state.doc.id, (d) => { d.pages = d.pages.filter((p) => p.id !== page.id); d.updatedAt = new Date().toISOString(); });
+    state.doc.pages = state.doc.pages.filter((p) => p.id !== page.id);
+    document.getElementById("page-" + page.id)?.remove(); updateDocStatus();
   };
   head.append(rm);
 
@@ -1049,7 +1216,8 @@ async function renderPage(page) {
     draft.forEach((l, i) => {
       const row = document.createElement("div"); row.className = "row";
       row.innerHTML = `<img alt=""><div class="draft-text" dir="rtl" lang="he"></div>`;
-      row.querySelector("img").src = imgs[i]; row.querySelector(".draft-text").textContent = l.text;
+      if (imgs[i]) row.querySelector("img").src = imgs[i]; else row.querySelector("img").remove();
+      row.querySelector(".draft-text").textContent = l.text;
       body.append(row);
     });
   } else if (page.status === "done" && !page.lines.length) {
@@ -1058,11 +1226,11 @@ async function renderPage(page) {
     const imgs = await crops(page, page.lines);
     page.lines.forEach((line, i) => {
       const row = document.createElement("div"); row.className = "row" + (line.unclear.length ? " unclear" : "");
-      const img = document.createElement("img"); img.src = imgs[i]; img.alt = `Line ${i + 1}`;
-      img.onclick = () => openLightbox(imgs[i]);
+      const img = imgs[i] ? document.createElement("img") : document.createElement("div");
+      if (imgs[i]) { img.src = imgs[i]; img.alt = `Line ${i + 1}`; img.onclick = () => openLightbox(imgs[i]); }
       const ta = document.createElement("textarea"); ta.dir = "rtl"; ta.lang = "he"; ta.rows = 1; ta.spellcheck = false; ta.value = line.text;
       const grow = () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + 2 + "px"; };
-      ta.oninput = () => { line.text = ta.value.replace(/\n/g, " "); grow(); scheduleSave(); };
+      ta.oninput = () => { line.text = ta.value.replace(/\n/g, " "); grow(); scheduleSave(page); };
       ta.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); row.nextElementSibling?.querySelector("textarea")?.focus(); } };
       row.append(img, ta); requestAnimationFrame(grow);
       if (line.unclear.length) {
@@ -1070,23 +1238,27 @@ async function renderPage(page) {
         f.append("Please check: " + line.unclear.join(", "));
         // The other reading of a doubtful word, one click away.
         for (const a of line.alts || []) {
-          if (!line.text.includes(a.word)) continue;
+          if (findTokens(line.text, a.word) < 0) continue;
           const use = document.createElement("button");
-          use.textContent = `${a.word} → ${a.alt}${a.picked ? " ★" : ""}`;
+          // Each Hebrew part in its own <bdi>, so the order reads clearly in an English sentence.
+          use.innerHTML = a.alt
+            ? `«<bdi>${esc(a.alt)}</bdi>» instead of «<bdi>${esc(a.word)}</bdi>»${a.picked ? " ★" : ""}`
+            : `Remove «<bdi>${esc(a.word)}</bdi>»`;
           use.title = a.dict
             ? (a.picked ? "A real word from Sefaria's word list; Gemini says it matches the handwriting" : "A real word from Sefaria's word list, one letter different")
-            : "Use the other reading";
+            : a.alt ? "Use the other reading" : "Only the first reading had this; remove it";
           use.onclick = () => {
-            line.text = line.text.replace(a.word, a.alt);
-            line.alts = line.alts.filter((x) => x !== a);
+            line.text = replaceTokens(line.text, a.word, a.alt);
+            // This word is decided: drop its other choices.
+            line.alts = line.alts.filter((x) => x.word !== a.word);
             const now = new Set(line.text.split(/\s+/));
             line.unclear = line.unclear.filter((w) => now.has(w) && !a.word.split(" ").includes(w));
-            scheduleSave(); renderPage(page);
+            scheduleSave(page); renderPage(page);
           };
           f.append(use);
         }
         const ok = document.createElement("button"); ok.textContent = "Checked ✓";
-        ok.onclick = () => { line.unclear = []; line.alts = []; scheduleSave(); renderPage(page); };
+        ok.onclick = () => { line.unclear = []; line.alts = []; scheduleSave(page); renderPage(page); };
         f.append(ok); row.append(f);
       }
       body.append(row);
@@ -1094,62 +1266,129 @@ async function renderPage(page) {
   } else if (page.status === "done") {
     const d = document.createElement("div"); d.className = "doc"; d.dir = "rtl"; d.lang = "he"; d.contentEditable = "true"; d.spellcheck = false;
     d.innerHTML = page.lines.map((l) => highlight(l.text, l.unclear)).join("\n");
+    const original = page.lines.map((l) => ({ ...l }));
     d.oninput = () => {
       const texts = d.innerText.replace(/\n$/, "").split("\n");
-      page.lines = texts.map((t, i) => ({ ...(page.lines[i] || { top: null, bottom: null, left: null, right: null, ai: "" }), text: t, unclear: page.lines[i]?.unclear || [] }));
-      scheduleSave();
+      page.lines = matchLines(original, texts);
+      scheduleSave(page);
     };
     body.append(d);
   }
+  if (el._seq !== seq) return;
   el.replaceChildren(head, body);
 }
 
+/** Highlight whole words only (a short word inside a longer one is left alone). */
 function highlight(text, unclear) {
-  let html = esc(text);
-  for (const w of unclear) html = html.split(esc(w)).join(`<mark>${esc(w)}</mark>`);
-  return html;
+  const marked = new Set(unclear);
+  return text.split(/(\s+)/).map((t) => (marked.has(t) ? `<mark>${esc(t)}</mark>` : esc(t))).join("");
 }
 
-function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(flushSave, 800); }
-async function flushSave() {
+/** Where the words of `phrase` appear as whole words in `text` (index of the first), or -1. */
+function findTokens(text, phrase) {
+  const t = text.split(/\s+/).filter(Boolean), p = phrase.split(/\s+/).filter(Boolean);
+  if (!p.length) return -1;
+  for (let i = 0; i + p.length <= t.length; i++) if (p.every((w, k) => t[i + k] === w)) return i;
+  return -1;
+}
+/** Replace the whole words `phrase` with `replacement` (first occurrence). */
+function replaceTokens(text, phrase, replacement) {
+  const t = text.split(/\s+/).filter(Boolean), n = phrase.split(/\s+/).filter(Boolean).length;
+  const i = findTokens(text, phrase);
+  if (i < 0) return text;
+  t.splice(i, n, ...replacement.split(/\s+/).filter(Boolean));
+  return t.join(" ");
+}
+
+/**
+ * After editing in the Document view, give each new line the handwriting box
+ * (and first reading) of the line it came from, matched by content, so lines
+ * added or deleted in the middle don't shift every later line onto the wrong
+ * picture. Unchanged lines match exactly; between them, changed lines pair up
+ * in order; extra new lines get no box.
+ */
+function matchLines(old, texts) {
+  const a = old.map((l) => l.text), n = a.length, m = texts.length;
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
+    dp[i][j] = a[i] === texts[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = []; let i = 0, j = 0, gapOld = [], gapNew = [];
+  const blank = { top: null, bottom: null, left: null, right: null, ai: "", unclear: [], alts: [] };
+  const flush = () => {
+    gapNew.forEach((t, k) => {
+      const from = gapOld[k];
+      out.push(from ? { ...from, text: t, unclear: from.unclear.filter((w) => t.split(/\s+/).includes(w)) } : { ...blank, text: t });
+    });
+    gapOld = []; gapNew = [];
+  };
+  while (i < n || j < m) {
+    if (i < n && j < m && a[i] === texts[j]) { flush(); out.push({ ...old[i] }); i++; j++; }
+    else if (j < m && (i === n || dp[i][j + 1] >= dp[i + 1][j])) gapNew.push(texts[j++]);
+    else gapOld.push(old[i++]);
+  }
+  flush();
+  return out;
+}
+
+// Pages whose text the person changed since the last save (only those are learned from again).
+const dirtyPages = new Set();
+function scheduleSave(page) {
+  if (page?.id) dirtyPages.add(page.id);
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSave, 600);
+}
+let saving = Promise.resolve();
+/** Save the open document's edits (one save at a time, in order). */
+function flushSave() {
   clearTimeout(saveTimer); saveTimer = null;
   const live = state.doc;
-  if (!live) return;
-  const doc = await getOne("docs", live.id);
-  if (!doc) return;
-  doc.title = $("#docTitle").value.trim() || doc.title;
-  for (const p of doc.pages) {
-    const l = live.pages.find((x) => x.id === p.id);
-    if (l && p.status === "done" && l.status === "done") p.lines = l.lines;
-  }
-  doc.updatedAt = new Date().toISOString();
-  await putOne("docs", doc);
-  for (const p of doc.pages) await learnFromPage(doc, p);
+  if (!live) return saving;
+  const title = $("#docTitle").value.trim();
+  const changed = [...dirtyPages]; dirtyPages.clear();
+  saving = saving.then(async () => {
+    const doc = await modify("docs", live.id, (d) => {
+      if (title) d.title = title;
+      for (const p of d.pages) {
+        const l = live.pages.find((x) => x.id === p.id);
+        if (l && p.status === "done" && l.status === "done" && changed.includes(p.id)) p.lines = structuredClone(l.lines);
+      }
+      d.updatedAt = new Date().toISOString();
+    });
+    if (doc) for (const p of doc.pages) if (changed.includes(p.id)) await learnFromPage(doc, p);
+  }).catch((e) => { console.error(e); notify("Couldn't save: " + e.message); });
+  return saving;
 }
 
 // ---------- Adding pages ----------
 async function addFiles(files) {
   const ok = files.filter((f) => f && (f.type.startsWith("image/") || f.type === "application/pdf"));
   if (!ok.length) return files.length && notify("Only images (JPG, PNG, WebP) and PDFs can be read.");
+  if (state.doc) await flushSave(); // keep edits typed just before
   let doc = state.doc && (await getOne("docs", state.doc.id));
   if (!doc) {
     const writerId = await pickWriter();
     if (writerId === undefined) return;
-    if (writerId) { const w = await getOne("writers", writerId); w.usedAt = new Date().toISOString(); await putOne("writers", w); }
+    if (writerId) await modify("writers", writerId, (w) => { w.usedAt = new Date().toISOString(); });
     const now = new Date().toISOString();
     doc = { id: uid(), title: ok[0].name.replace(/\.[^.]+$/, ""), writerId, createdAt: now, updatedAt: now, pages: [] };
     await putOne("docs", doc);
-    location.hash = "#doc=" + doc.id;
+    // Open it directly (changing the address this way doesn't reload it), so
+    // pages added next always appear.
+    history.replaceState(null, "", "#doc=" + doc.id);
+    await showDoc(doc.id);
   }
   for (const file of ok) {
     try {
       const canvases = file.type === "application/pdf" ? await pdfPages(file) : [toCanvas(await loadBitmap(file), STORE_EDGE)];
       for (const [i, c] of canvases.entries()) {
         const page = { id: uid(), name: canvases.length > 1 ? `${file.name} – page ${i + 1}` : file.name, image: await canvasBlob(c, 0.9), status: "queued", lines: [] };
-        const fresh = await getOne("docs", doc.id);
-        fresh.pages.push(page); fresh.updatedAt = new Date().toISOString();
-        await putOne("docs", fresh);
-        if (state.doc?.id === doc.id) { state.doc = fresh; renderPages(); updateDocStatus(); }
+        const saved = await modify("docs", doc.id, (d) => { d.pages.push(page); d.updatedAt = new Date().toISOString(); });
+        if (!saved) return; // the document was deleted meanwhile
+        if (state.doc?.id === doc.id && !state.doc.pages.some((p) => p.id === page.id)) {
+          state.doc.pages.push({ ...page });
+          const el = document.createElement("div"); el.className = "card"; el.id = "page-" + page.id;
+          $("#pages").append(el); renderPage(state.doc.pages.at(-1)); updateDocStatus();
+        }
         enqueue(doc.id, page.id);
       }
     } catch (e) {
@@ -1175,11 +1414,11 @@ function zip(files) {
   for (const [name, text] of files) {
     const data = enc.encode(text), n = enc.encode(name), crc = crc32(data);
     const h = new DataView(new ArrayBuffer(30));
-    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true);
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(12, 0x0021, true); // 1 Jan 1980
     h.setUint32(14, crc, true); h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, n.length, true);
     parts.push(h, n, data);
     const c = new DataView(new ArrayBuffer(46));
-    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true);
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(14, 0x0021, true);
     c.setUint32(16, crc, true); c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, n.length, true); c.setUint32(42, offset, true);
     central.push(c, n);
     offset += 30 + n.length + data.length;
@@ -1191,8 +1430,8 @@ function zip(files) {
   return new Blob([...parts, ...central, end], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
 }
 function docx(paragraphs) {
-  const x = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  const p = (t, bold) => `<w:p><w:pPr><w:bidi/><w:jc w:val="left"/></w:pPr><w:r><w:rPr><w:rtl/>${bold ? "<w:b/><w:bCs/>" : ""}<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="26"/><w:szCs w:val="26"/></w:rPr><w:t xml:space="preserve">${x(t)}</w:t></w:r></w:p>`;
+  const x = (s) => s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const p = (t, bold) => `<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rtl/>${bold ? "<w:b/><w:bCs/>" : ""}<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="26"/><w:szCs w:val="26"/></w:rPr><w:t xml:space="preserve">${x(t)}</w:t></w:r></w:p>`;
   const body = paragraphs.map(([t, b]) => p(t, b)).join("");
   return zip([
     ["[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'],
@@ -1267,14 +1506,15 @@ $("#settingsBtn").onclick = async () => {
     else notify(`Saved. Pages will be read with ${getModel()}.`);
   };
 };
-$("#backHome").onclick = async () => { await flushSave(); location.hash = ""; showHome(); };
-$("#docTitle").oninput = scheduleSave;
+$("#backHome").onclick = async () => { await flushSave(); showHome(); };
+$("#docTitle").oninput = () => scheduleSave();
 $("#viewLines").onclick = () => { state.view = "lines"; $("#viewLines").classList.add("on"); $("#viewDoc").classList.remove("on"); flushSave().then(renderPages); };
 $("#viewDoc").onclick = () => { state.view = "doc"; $("#viewDoc").classList.add("on"); $("#viewLines").classList.remove("on"); flushSave().then(renderPages); };
 $("#addPages").onclick = () => fileInput.click();
 $("#deleteDoc").onclick = async () => {
   if (!(await dialog("Delete this whole document? This can't be undone.", { ok: "Delete", cancel: "Cancel", danger: true }))) return;
-  const id = state.doc.id; state.doc = null; await delOne("docs", id); location.hash = ""; showHome();
+  clearTimeout(saveTimer); saveTimer = null; dirtyPages.clear();
+  const id = state.doc.id; state.doc = null; await delOne("docs", id); showHome();
 };
 $("#writerSelect").onchange = async () => {
   let id = $("#writerSelect").value;
@@ -1285,14 +1525,12 @@ $("#writerSelect").onchange = async () => {
     await putOne("writers", w); id = w.id;
   }
   await flushSave();
-  const doc = await getOne("docs", state.doc.id);
-  const before = doc.writerId;
-  doc.writerId = id || null; await putOne("docs", doc);
+  const before = state.doc.writerId;
+  const doc = await modify("docs", state.doc.id, (d) => { d.writerId = id || null; });
+  if (!doc) return showHome();
+  state.doc.writerId = doc.writerId;
   // What was learned from this document belongs to the new person.
-  if (before && before !== doc.writerId) {
-    const old = await getOne("writers", before);
-    if (old) { old.examples = (old.examples || []).filter((e) => e.docId !== doc.id); await putOne("writers", old); }
-  }
+  if (before && before !== doc.writerId) await modify("writers", before, (w) => { w.examples = (w.examples || []).filter((e) => e.docId !== doc.id); });
   for (const p of doc.pages) await learnFromPage(doc, p);
   showDoc(doc.id);
 };
@@ -1308,34 +1546,51 @@ $("#exportWord").onclick = () => {
   });
   download(docx(paras), fileName() + ".docx");
 };
-$("#writerBack").onclick = () => { location.hash = ""; showHome(); };
+$("#writerBack").onclick = () => showHome();
 $("#writerRename").onclick = async () => {
   const id = $("#writerView").dataset.id; const w = await getOne("writers", id);
+  if (!w) return showHome();
   const name = await dialog("New name:", { ok: "Save", cancel: "Cancel", input: w.name });
-  if (name) { w.name = name; await putOne("writers", w); showWriter(id); }
+  if (name) { await modify("writers", id, (x) => { x.name = name; }); showWriter(id); }
 };
 $("#writerDelete").onclick = async () => {
   const id = $("#writerView").dataset.id;
   if (!(await dialog("Delete this person and everything learned about their handwriting?", { ok: "Delete", cancel: "Cancel", danger: true }))) return;
   await delOne("writers", id);
-  for (const d of await getAll("docs")) if (d.writerId === id) { d.writerId = null; await putOne("docs", d); }
-  location.hash = ""; showHome();
+  for (const d of await getAll("docs")) if (d.writerId === id) await modify("docs", d.id, (x) => { if (x.writerId !== id) return false; x.writerId = null; });
+  showHome();
 };
 window.addEventListener("beforeunload", () => { if (saveTimer) flushSave(); });
+// Closing the window may not wait for a save, so save as soon as it is hidden.
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden" && saveTimer) flushSave(); });
 
 // ---------- Backup and restore ----------
 const toDataUrl = (blob) => new Promise((resolve) => { const fr = new FileReader(); fr.onload = () => resolve(fr.result); fr.readAsDataURL(blob); });
 const fromDataUrl = async (url) => (await fetch(url)).blob();
 
 $("#backupBtn").onclick = async () => {
-  await flushSave();
-  const docs = await getAll("docs"), writers = await getAll("writers");
-  for (const d of docs) for (const p of d.pages) p.image = await toDataUrl(p.image);
-  for (const w of writers) for (const e of w.examples || []) e.crop = await toDataUrl(e.crop);
-  const data = { app: "hebrew-converter", version: 1, savedAt: new Date().toISOString(), docs, writers };
-  download(new Blob([JSON.stringify(data)], { type: "application/json" }), `hebrew-converter-backup-${new Date().toISOString().slice(0, 10)}.json`);
-  try { localStorage.setItem("last_backup", new Date().toISOString()); } catch {}
-  showBackupNote();
+  const btn = $("#backupBtn"); btn.disabled = true;
+  try {
+    await flushSave();
+    const docs = await getAll("docs"), writers = await getAll("writers");
+    for (const d of docs) for (const p of d.pages) p.image = await toDataUrl(p.image);
+    for (const w of writers) for (const e of w.examples || []) e.crop = await toDataUrl(e.crop);
+    const data = { app: "hebrew-converter", version: 1, savedAt: new Date().toISOString(), docs, writers };
+    // Written piece by piece, so a large backup doesn't need one huge text in memory.
+    const parts = ['{"app":"hebrew-converter","version":1,"savedAt":', JSON.stringify(data.savedAt), ',"docs":['];
+    docs.forEach((d, i) => parts.push((i ? "," : "") + JSON.stringify(d)));
+    parts.push('],"writers":[');
+    writers.forEach((w, i) => parts.push((i ? "," : "") + JSON.stringify(w)));
+    parts.push("]}");
+    download(new Blob(parts, { type: "application/json" }), `hebrew-converter-backup-${new Date().toISOString().slice(0, 10)}.json`);
+    try { localStorage.setItem("last_backup", new Date().toISOString()); } catch {}
+    showBackupNote();
+  } catch (e) {
+    console.error(e);
+    notify("The backup couldn't be made: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
 };
 $("#restoreBtn").onclick = () => $("#restoreInput").click();
 $("#restoreInput").onchange = async () => {
@@ -1345,9 +1600,20 @@ $("#restoreInput").onchange = async () => {
   let data;
   try { data = JSON.parse(await file.text()); } catch { return notify("That file isn't a converter backup."); }
   if (data?.app !== "hebrew-converter") return notify("That file isn't a converter backup.");
-  if (!(await dialog(`Restore ${data.docs.length} documents and ${data.writers.length} people from this backup? Items with the same name in both are replaced by the backup's version; everything else here is kept.`, { ok: "Restore", cancel: "Cancel" }))) return;
-  for (const d of data.docs) { for (const p of d.pages) p.image = await fromDataUrl(p.image); await putOne("docs", d); }
-  for (const w of data.writers) { for (const e of w.examples || []) e.crop = await fromDataUrl(e.crop); await putOne("writers", w); }
+  if (!Array.isArray(data.docs) || !Array.isArray(data.writers)) return notify("That backup file is damaged.");
+  if (!(await dialog(`Restore ${data.docs.length} documents and ${data.writers.length} people from this backup? A document or person that is in the backup and also here is replaced by the backup's version; everything else here is kept.`, { ok: "Restore", cancel: "Cancel" }))) return;
+  let restored = 0;
+  try {
+    for (const d of data.docs) {
+      for (const p of d.pages) p.image = await fromDataUrl(p.image);
+      await putOne("docs", d); restored++;
+    }
+    for (const w of data.writers) { for (const e of w.examples || []) e.crop = await fromDataUrl(e.crop); await putOne("writers", w); }
+  } catch (e) {
+    console.error(e);
+    return notify(`The restore stopped after ${restored} documents: ${e.message}`);
+  }
+  await resumeUnfinished(); // pages that were being read when the backup was made
   notify("Restored.");
   showHome();
 };
@@ -1361,10 +1627,16 @@ function showBackupNote() {
 navigator.storage?.persist?.().catch(() => {});
 
 // Pages that were being read when the window was closed are read again.
-(async () => {
-  for (const d of await getAll("docs")) for (const p of d.pages) if (p.status === "queued" || p.status === "working") {
-    p.status = "queued"; await putOne("docs", d); enqueue(d.id, p.id);
+async function resumeUnfinished() {
+  for (const d of await getAll("docs")) {
+    const ids = d.pages.filter((p) => (p.status === "queued" || p.status === "working") && !active.has(p.id)).map((p) => p.id);
+    if (!ids.length) continue;
+    await modify("docs", d.id, (x) => { for (const p of x.pages) if (ids.includes(p.id)) Object.assign(p, { status: "queued", draft: null, words: null }); });
+    ids.forEach((id) => enqueue(d.id, id));
   }
+}
+(async () => {
+  await resumeUnfinished().catch((e) => console.error(e));
   route();
 })();
 </script>
