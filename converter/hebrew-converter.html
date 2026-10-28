@@ -143,7 +143,23 @@ mark { background: var(--warn-bg); color: inherit; border-radius: 3px; }
 
 // ---------- Settings ----------
 const DEFAULT_MODEL = "gemini-flash-latest";
-function getModel() { try { return localStorage.getItem("gemini_model") || DEFAULT_MODEL; } catch { return DEFAULT_MODEL; } }
+const AUTO = "auto";
+let autoModel = null; // the best model this key can use, found once per session
+function chosenModel() { try { return localStorage.getItem("gemini_model") || AUTO; } catch { return AUTO; } }
+function getModel() { const m = chosenModel(); return m === AUTO ? autoModel || DEFAULT_MODEL : m; }
+/** Pick the strongest Pro model the key can use (newest version; a "latest" alias first). */
+async function pickBestModel() {
+  if (chosenModel() !== AUTO || autoModel) return;
+  try {
+    const models = (await listModels()).map((m) => m.id).filter((id) => /pro/i.test(id) && !/preview|exp|tts|vision|lite|customtools/i.test(id));
+    const version = (id) => parseFloat((id.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || "0");
+    models.sort((a, b) => (/latest/.test(b) - /latest/.test(a)) || version(b) - version(a));
+    autoModel = models[0] || DEFAULT_MODEL;
+  } catch (e) {
+    console.warn("Couldn't list models, using", DEFAULT_MODEL, e);
+    autoModel = DEFAULT_MODEL;
+  }
+}
 function setModel(m) { try { localStorage.setItem("gemini_model", m); } catch {} }
 const THINKING = "HIGH";
 const PASSES = 2;
@@ -366,7 +382,9 @@ async function streamOnce(body, signal) {
 // Added to the instructions: Gemini tends to "improve" what people write.
 const EXACT_RULES = `KEEP THE WRITER'S EXACT WORDS, SPELLING AND GRAMMAR. Never add or remove a letter to make a word "correct": if the writer wrote הסטוריה, write הסטוריה, not היסטוריה; if they wrote אמא, don't write אימא; if they used the wrong gender, tense or preposition, or left a word out, keep it exactly that way. Never add, drop, reorder or replace words, and never add punctuation the writer didn't write. Read each word from its own letters, not from what the sentence suggests. The texts are often Torah or Gemara study notes mixing Hebrew and Aramaic (for example דבלא, היגיע, מזונותיה, דצורת, ממילא, ואי); their spellings and words are correct as written. Never turn them into everyday modern Hebrew.
 
-WHEN YOU CAN'T READ A LETTER, WRITE ? IN ITS PLACE. For example, if you can read מז and נותיה but not the letter between them, write מז?נותיה. If you can't read a whole word, write one ? for each letter you think it has, or just ???. A ? is always right; a guessed letter or word is always wrong. Never fill a hard-to-read spot with a word that fits the sentence.`;
+WHEN YOU CAN'T READ A LETTER, WRITE □ IN ITS PLACE. For example, if you can read מז and נותיה but not the letter between them, write מז□נותיה. If you can't read a whole word, write one □ for each letter you think it has, or just □□□. A □ is always right; a guessed letter or word is always wrong. Never fill a hard-to-read spot with a word that fits the sentence. (Use □ only for unreadable letters; a question mark the writer wrote is written as ?.)
+
+COPY EVERY PUNCTUATION MARK AND SYMBOL the writer made, exactly where it is: period . comma , colon : semicolon ; question mark ? exclamation mark ! parentheses ( ) brackets [ ] quotation marks, gershayim ״ and geresh ׳ (the one or two short strokes in abbreviations and above letters), maqaf ־, dashes – and slashes /. Small dots and commas are easy to miss: look for them at the end of words and lines. A mark attached to a word is written attached to that word (זה, or (בערך)). Never add a mark the writer didn't make.`;
 
 const EXACT_SCHEMA = {
   type: "object",
@@ -400,6 +418,11 @@ async function askJson(parts, schema, thinking = THINKING) {
       } catch (e) {
         if (e.name === "AbortError") throw new ReadError("Gemini took too long. Try again, or try a clearer photo.");
         if (e.status === 400 && generationConfig.thinkingConfig && /think/i.test(e.message)) { delete generationConfig.thinkingConfig; continue; }
+        // The automatically chosen model isn't available after all: use Flash.
+        if ((e.status === 404 || (e.status === 400 && /model/i.test(e.message))) && chosenModel() === AUTO && getModel() !== DEFAULT_MODEL) {
+          console.warn(`${getModel()} not available (${e.message}); using ${DEFAULT_MODEL}`);
+          autoModel = DEFAULT_MODEL; continue;
+        }
         if ((e.status === 429 || e.status >= 500) && attempt < 2) { await new Promise((r) => setTimeout(r, 4000 * (attempt + 1) ** 2)); continue; }
         if (e.status === 400 && /API key/i.test(e.message)) throw new ReadError("Your Gemini key isn't accepted. Check it in Settings.");
         if (e instanceof SyntaxError) throw new ReadError("Gemini's answer could not be read. Try again.");
@@ -420,7 +443,7 @@ function cleanLines(lines) {
     const text = String(l.text || "").trim();
     const words = new Set(text.split(/\s+/));
     const unclear = (l.unclear || []).filter((w) => typeof w === "string" && words.has(w));
-    for (const w of words) if (w.includes("?") && !unclear.includes(w)) unclear.push(w); // unreadable letters
+    for (const w of words) if (w.includes("□") && !unclear.includes(w)) unclear.push(w); // unreadable letters
     return { text, top, bottom, left, right, unclear };
   }).filter((l) => l.text);
 }
@@ -487,7 +510,17 @@ function segmentWords(bitmap, box) {
     if (runs[i][0] - cur[1] - 1 >= minGap) { words.push(cur); cur = [...runs[i]]; } else cur[1] = runs[i][1];
   }
   words.push(cur);
-  const kept = words.filter(([s, e]) => e - s >= 3);
+  // Small specks of ink (periods, commas, a lone parenthesis or quote mark) are
+  // kept: each joins the nearest word, so its mark is read with it.
+  const big = (w) => w[1] - w[0] >= 3;
+  let kept = words.filter(big);
+  if (!kept.length) kept = words;
+  for (const w of words) {
+    if (big(w)) continue;
+    let near = null, dist = Infinity;
+    for (const k of kept) { const d = Math.max(k[0] - w[1], w[0] - k[1], 0); if (d < dist) { dist = d; near = k; } }
+    if (near && near !== w) { near[0] = Math.min(near[0], w[0]); near[1] = Math.max(near[1], w[1]); }
+  }
   if (!kept.length || kept.length > 30) return null;
   const toPage = (v) => box.left + (v / scale / W) * 1000;
   const pad = core * 0.25;
@@ -531,7 +564,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
   let done = 0;
   onWords(0, items.length);
   const readBatch = async (batch) => {
-    const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. If you can't make out a letter, write ? in its place (a ? is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per image, using the image's number.` }];
+    const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per image, using the image's number.` }];
     for (const [k, it] of batch.entries()) {
       const crop = cropLine(bitmap, it.box, 240);
       parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
@@ -559,8 +592,26 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
     if (!texts[i] || texts[i].some((t) => t === null)) return null; // a word is missing: don't trust this line's split
     const words = texts[i].filter(Boolean);
     const boxes = items.filter((it) => it.line === i).sort((a, b) => a.pos - b.pos).map((it) => it.box);
-    return { text: words.join(" "), unsure: words.filter((w, k) => !sure[i][k]), segs: texts[i].map((t, k) => ({ text: t || "", box: boxes[k] })) };
+    return { text: joinWords(texts[i]), unsure: words.filter((w, k) => !sure[i][k]), segs: texts[i].map((t, k) => ({ text: t || "", box: boxes[k] })) };
   });
+}
+
+/**
+ * Join words read one by one into a line. A picture holding only a mark is
+ * attached to its word, as it is written: closing marks (. , : ; ! ? ) ״ ׳)
+ * to the word before, an opening parenthesis or bracket to the word after.
+ */
+function joinWords(parts) {
+  let out = "", openNext = "";
+  for (const raw of parts) {
+    const t = (raw || "").trim();
+    if (!t) continue;
+    if (/^[(\[]+$/.test(t)) { openNext += t; continue; }
+    if (/^[.,:;!?)\]\u05f3\u05f4"']+$/.test(t) && out) { out += t; continue; }
+    out += (out ? " " : "") + openNext + t;
+    openNext = "";
+  }
+  return out + (openNext ? " " + openNext : "");
 }
 
 // ---------- Sefaria word list ----------
@@ -589,7 +640,7 @@ function wordParts(w) {
   return m ? { pre: m[1], core: m[2], post: m[3] } : null;
 }
 function isKnownWord(w) {
-  if (w.includes("?")) return true; // already flagged as unreadable
+  if (w.includes("□")) return true; // already flagged as unreadable
   const p = wordParts(w);
   if (!p) return true; // no Hebrew letters
   return p.core.split(/[\u05be\-–]/).filter(Boolean).every((part) =>
@@ -748,6 +799,7 @@ async function learnedParts(writer, pageId, max = EXAMPLES) {
 }
 
 async function readPage(doc, page, onStep) {
+  await pickBestModel();
   const bitmap = await loadBitmap(page.image);
   const small = await canvasBlob(toCanvas(bitmap, IMAGE_EDGE), 0.9);
   const pagePart = { inlineData: { mimeType: "image/jpeg", data: await blobBase64(small) }, mediaResolution: { level: "MEDIA_RESOLUTION_HIGH" } };
@@ -775,7 +827,7 @@ async function readPage(doc, page, onStep) {
       const flagged = new Set(e.unsure);
       for (const f of gaps) f.from.split(" ").filter(Boolean).forEach((w) => flagged.add(w));
       const words = new Set(e.text.split(/\s+/));
-      for (const w of words) if (w.includes("?")) flagged.add(w);
+      for (const w of words) if (w.includes("□")) flagged.add(w);
       return { ...line, text: e.text, alts, unclear: [...flagged].filter((w) => words.has(w)) };
     });
     lines = await checkAgainstLexicon(bitmap, lines, byWord.map((e) => e?.segs));
@@ -1190,25 +1242,29 @@ $("#settingsBtn").onclick = async () => {
     <div class="actions"><button type="submit">Save</button><button type="button" class="secondary" id="setCancel">Cancel</button></div></form>`;
   document.body.append(wrap);
   const pick = wrap.querySelector("#modelPick");
-  const current = getModel();
+  const current = chosenModel();
   listModels().then((models) => {
     pick.innerHTML = "";
-    if (!models.some((m) => m.id === current)) models.unshift({ id: current, label: current });
+    pick.add(new Option("Best available, chosen automatically (recommended)", AUTO, false, current === AUTO));
+    if (current !== AUTO && !models.some((m) => m.id === current)) models.unshift({ id: current, label: current });
     // Pro and Flash first, newest-looking names first.
     models.sort((a, b) => (/pro/i.test(b.id) - /pro/i.test(a.id)) || (/latest/.test(b.id) - /latest/.test(a.id)) || b.id.localeCompare(a.id));
     for (const m of models) pick.add(new Option(`${m.label}  (${m.id})`, m.id, false, m.id === current));
   }).catch((e) => {
     pick.innerHTML = "";
-    pick.add(new Option(`${current} (couldn't list models: ${e.message})`, current, true, true));
+    pick.add(new Option("Best available, chosen automatically (recommended)", AUTO, false, current === AUTO));
+    if (current !== AUTO) pick.add(new Option(current, current, false, true));
+    pick.add(new Option(`(couldn't list models: ${e.message})`, "", false, false));
   });
   wrap.querySelector("#setCancel").onclick = () => wrap.remove();
   wrap.querySelector("form").onsubmit = (e) => {
     e.preventDefault();
     const k = wrap.querySelector("#keyNew").value.trim();
     if (k) setKey(k);
-    if (pick.value && !pick.value.startsWith("Loading")) setModel(pick.value);
+    if (pick.value && !pick.value.startsWith("Loading")) { setModel(pick.value); autoModel = null; }
     wrap.remove();
-    notify(`Saved. Pages will be read with ${getModel()}.`);
+    if (chosenModel() === AUTO) pickBestModel().then(() => notify(`Saved. Pages will be read with ${getModel()}, the best model your key can use.`));
+    else notify(`Saved. Pages will be read with ${getModel()}.`);
   };
 };
 $("#backHome").onclick = async () => { await flushSave(); location.hash = ""; showHome(); };
