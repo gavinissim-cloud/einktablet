@@ -939,7 +939,10 @@ async function readEveryWord(bitmap, lines, writer, page, known, onStep) {
       if (part.a.length) {
         words.push(...part.a);
         part.a.forEach((w) => flagged.add(w));
-        if (part.b.length && short(part.a) && short(part.b)) alts.push({ word: part.a.join(" "), alt: part.b.join(" ") });
+        // The other reading stays one click away; when it has more words, even for longer stretches,
+        // so words only the page reading has are never lost.
+        const fits = (short(part.a) && short(part.b)) || (part.b.length > part.a.length && part.a.length <= 8 && part.b.length <= 10);
+        if (part.b.length && fits) alts.push({ word: part.a.join(" "), alt: part.b.join(" ") });
       } else {
         // Only the page reading has these words.
         words.push(...part.b);
@@ -1011,8 +1014,8 @@ const exampleKey = (page, l) => `${page.id}:${l.top},${l.bottom},${l.left},${l.r
 async function learnFromPage(doc, page) {
   if (!doc.writerId || page.status !== "done") return;
   const lines = page.lines.filter((l) => l.top != null && l.ai);
-  const corrected = lines.filter((l) => l.text.trim() && l.text.trim() !== l.ai.trim());
-  const current = new Set(lines.map((l) => exampleKey(page, l)));
+  // A line split or joined in the Document view no longer matches its picture (noLearn): not an example.
+  const corrected = lines.filter((l) => !l.noLearn && l.text.trim() && l.text.trim() !== l.ai.trim());
   // Cut the pictures first (that takes time), then change the record in one step.
   const before = await getOne("writers", doc.writerId);
   if (!before) return;
@@ -1121,8 +1124,11 @@ async function showWriter(id) {
   }
 }
 
+let routeSeq = 0;
 async function route() {
+  const seq = ++routeSeq;
   if (state.doc) await flushSave(); // leaving a document (Back, Forward, a link): keep its edits
+  if (seq !== routeSeq) return; // a newer navigation happened meanwhile
   const m = location.hash.match(/^#(doc|writer)=(.+)$/);
   if (!getKey()) return show("setup");
   if (m?.[1] === "doc") return showDoc(m[2]);
@@ -1315,9 +1321,11 @@ function matchLines(old, texts) {
   const out = []; let i = 0, j = 0, gapOld = [], gapNew = [];
   const blank = { top: null, bottom: null, left: null, right: null, ai: "", unclear: [], alts: [] };
   const flush = () => {
+    // Fewer or more lines than before here: lines were split or joined, so their pictures no longer match.
+    const reshaped = gapNew.length !== gapOld.length;
     gapNew.forEach((t, k) => {
       const from = gapOld[k];
-      out.push(from ? { ...from, text: t, unclear: from.unclear.filter((w) => t.split(/\s+/).includes(w)) } : { ...blank, text: t });
+      out.push(from ? { ...from, text: t, unclear: from.unclear.filter((w) => t.split(/\s+/).includes(w)), ...(reshaped ? { noLearn: true } : {}) } : { ...blank, text: t });
     });
     gapOld = []; gapNew = [];
   };
@@ -1354,8 +1362,14 @@ function flushSave() {
       }
       d.updatedAt = new Date().toISOString();
     });
-    if (doc) for (const p of doc.pages) if (changed.includes(p.id)) await learnFromPage(doc, p);
-  }).catch((e) => { console.error(e); notify("Couldn't save: " + e.message); });
+    if (doc) for (const p of doc.pages) if (changed.includes(p.id)) {
+      try { await learnFromPage(doc, p); } catch (e) { console.error("Learning from a page failed:", e); }
+    }
+  }).catch((e) => {
+    console.error(e);
+    changed.forEach((id) => dirtyPages.add(id)); // try these again with the next save
+    notify("Couldn't save: " + e.message);
+  });
   return saving;
 }
 
@@ -1374,7 +1388,7 @@ async function addFiles(files) {
     await putOne("docs", doc);
     // Open it directly (changing the address this way doesn't reload it), so
     // pages added next always appear.
-    history.replaceState(null, "", "#doc=" + doc.id);
+    history.pushState(null, "", "#doc=" + doc.id);
     await showDoc(doc.id);
   }
   for (const file of ok) {
@@ -1506,7 +1520,8 @@ $("#settingsBtn").onclick = async () => {
     else notify(`Saved. Pages will be read with ${getModel()}.`);
   };
 };
-$("#backHome").onclick = async () => { await flushSave(); showHome(); };
+const goHome = () => { if (location.hash) history.pushState(null, "", location.pathname + location.search); showHome(); };
+$("#backHome").onclick = async () => { await flushSave(); goHome(); };
 $("#docTitle").oninput = () => scheduleSave();
 $("#viewLines").onclick = () => { state.view = "lines"; $("#viewLines").classList.add("on"); $("#viewDoc").classList.remove("on"); flushSave().then(renderPages); };
 $("#viewDoc").onclick = () => { state.view = "doc"; $("#viewDoc").classList.add("on"); $("#viewLines").classList.remove("on"); flushSave().then(renderPages); };
@@ -1546,7 +1561,7 @@ $("#exportWord").onclick = () => {
   });
   download(docx(paras), fileName() + ".docx");
 };
-$("#writerBack").onclick = () => showHome();
+$("#writerBack").onclick = () => goHome();
 $("#writerRename").onclick = async () => {
   const id = $("#writerView").dataset.id; const w = await getOne("writers", id);
   if (!w) return showHome();
