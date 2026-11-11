@@ -12,7 +12,7 @@ await page.setInputFiles("#fileInput", [`${S}/e2e/p1.png`, `${S}/e2e/p2.png`, `$
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Tester"); await page.click(".dialog button[type=submit]");
 // type into the first page as soon as it's done, while the others are still being read
 await page.waitForFunction(() => /\d+ lines/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 90000 });
-await page.locator(".row textarea").first().fill("נערך בזמן הקריאה");
+await page.locator(".row .line-edit").first().fill("נערך בזמן הקריאה");
 await settled(page, 3);
 await page.waitForTimeout(1500);
 let db = await dbDump(page);

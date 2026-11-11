@@ -12,7 +12,7 @@ await page.setInputFiles("#fileInput", [`${S}/e2e/p1.png`, `${S}/e2e/p2.png`]);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "T"); await page.click(".dialog button[type=submit]");
 await settled(page, 2);
 // a line with characters that are invalid in a Word file, and XML-special characters
-await page.locator(".row textarea").first().fill("בדיקה <a> & \"x\" \u0001\u000b סוף");
+await page.locator(".row .line-edit").first().fill("בדיקה <a> & \"x\" \u0001\u000b סוף");
 await page.waitForTimeout(1200);
 const get = async (sel, name) => { const [dl] = await Promise.all([page.waitForEvent("download"), page.click(sel)]); await dl.saveAs(`${S}/e2e/${name}`); return `${S}/e2e/${name}`; };
 const docx = await get("#exportWord", "out.docx");

@@ -44,7 +44,7 @@ await page.evaluate(async (b64) => {
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "T"); await page.click(".dialog button[type=submit]");
 await settled(page);
 const secs = (Date.now() - t0) / 1000;
-const texts = await page.locator(".row textarea").evaluateAll((e) => e.map((x) => x.value));
+const texts = await page.locator(".row .line-edit").evaluateAll((e) => e.map((x) => x.innerText));
 check("pasted image read", texts.length === 40);
 const bad = texts.map((t, i) => [i, t, big.lines[i].text]).filter(([, a, b]) => a !== b);
 check("40-line page: all lines exact", !bad.length, JSON.stringify(bad));

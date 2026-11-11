@@ -41,11 +41,19 @@ h2 { font-size: 17px; margin: 0 0 10px; }
 .page-head h3 { margin: 0; font-size: 15px; flex: 1; }
 .state { color: var(--muted); font-size: 14px; }
 .state.err { color: var(--err); }
-.row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 8px 14px; border-bottom: 1px solid var(--line); align-items: center; }
+.row { padding: 10px 14px 12px; border-bottom: 1px solid var(--line); }
 .row:last-child { border-bottom: 0; }
 .row.unclear { background: var(--warn-bg); }
-.row img { max-width: 100%; max-height: 140px; border-radius: 4px; cursor: zoom-in; background: #fff; }
-.row textarea { width: 100%; font: 19px/1.6 "Segoe UI", Arial, sans-serif; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; resize: none; background: var(--bg); color: var(--ink); overflow: hidden; }
+.row img { display: block; max-width: 100%; max-height: 130px; border-radius: 4px; cursor: zoom-in; background: #fff; }
+.line-edit { margin-top: 6px; font: 21px/1.7 "Segoe UI", Arial, sans-serif; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; background: var(--card); color: var(--ink); min-height: 1.7em; white-space: pre-wrap; unicode-bidi: plaintext; text-align: right; outline: none; }
+.line-edit:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
+.line-edit mark { padding: 0 2px; }
+.choices { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 15px; color: var(--warn-ink); }
+.choice-group { display: inline-flex; gap: 4px; align-items: center; }
+.choice-group mark { font-size: 17px; padding: 0 4px; }
+.choices button { padding: 1px 9px; font-size: 16px; background: var(--card); color: var(--ink); border-color: var(--line); }
+.choices button.keep { color: #1a7f37; font-weight: 700; }
+
 .flag { grid-column: 2; font-size: 13px; color: var(--warn-ink); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .flag button { padding: 2px 8px; font-size: 12px; background: transparent; color: var(--warn-ink); border-color: var(--warn-ink); }
 .draft-note { padding: 10px 14px; color: var(--muted); font-size: 14px; border-bottom: 1px solid var(--line); }
@@ -617,7 +625,7 @@ async function askJsonNow(parts, schema, thinking) {
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const generationConfig = { responseMimeType: "application/json", responseJsonSchema: schema };
   if (thinking !== "off" && !thinkingRejected.has(getModel())) generationConfig.thinkingConfig = { thinkingLevel: thinking, includeThoughts: true };
-  const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS + "\n\n" + EXACT_RULES }] }, contents: [{ role: "user", parts }], generationConfig };
+  const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS + "\n\n" + EXACT_RULES + abbrevPrompt() }] }, contents: [{ role: "user", parts }], generationConfig };
   try {
     for (let attempt = 0; ; attempt++) {
       try {
@@ -866,6 +874,71 @@ async function loadLexicon() {
   text.split("\n").forEach((w, i) => lexicon.set(w, i));
   return lexicon;
 }
+// ---------- Abbreviations (ראשי תיבות) ----------
+// The word list holds every abbreviation used in Sefaria's library (tens of thousands:
+// רש"י, ת"ר, א"ר, וכו', הנ"ל…). From it: the most common ones are listed for Gemini, and a
+// table maps what a misread abbreviation looks like (marks missed, or gershayim read as
+// two yods) back to the abbreviation.
+let abbrevTable = null; // misread form -> {abbr, rank}
+const isAbbrev = (w) => /^[\u05d0-\u05ea]+"[\u05d0-\u05ea]+$/.test(w) || /^[\u05d0-\u05ea]{2,}'$/.test(w);
+function buildAbbrevTable() {
+  if (abbrevTable || !lexicon?.size) return abbrevTable;
+  abbrevTable = new Map();
+  const put = (form, abbr, rank) => { if (form !== abbr && (!abbrevTable.has(form) || abbrevTable.get(form).rank > rank)) abbrevTable.set(form, { abbr, rank }); };
+  for (const [w, rank] of lexicon) {
+    if (!isAbbrev(w)) continue;
+    put(w.replace(/["']/g, ""), w, rank); // marks missed
+    if (w.includes('"')) put(w.replace('"', "יי"), w, rank); // gershayim read as two yods
+  }
+  return abbrevTable;
+}
+const hebrewMarks = (w) => w.replace(/"/g, "\u05f4").replace(/'/g, "\u05f3");
+let abbrevPromptText = null;
+/** The most common abbreviations, for Gemini's instructions. */
+function abbrevPrompt() {
+  if (abbrevPromptText !== null || !lexicon?.size) return abbrevPromptText || "";
+  const top = [];
+  for (const [w] of lexicon) { if (isAbbrev(w)) top.push(hebrewMarks(w)); if (top.length >= 300) break; }
+  abbrevPromptText = top.length ? `\n\nABBREVIATIONS (ראשי תיבות) are very common in these texts. The writer marks them with gershayim ״ (two small strokes, usually before the last letter, sometimes looking like two tiny yods or a short double line above the word) or a geresh ׳ after a shortened word. Recognize them and write them with their mark, exactly where the writer put it. The most common ones: ${top.join(" ")}. There are thousands more of the same kind.` : "";
+  return abbrevPromptText;
+}
+/**
+ * Turn misread abbreviations back into abbreviations. When the abbreviation is far more common
+ * than what was read (or what was read isn't a word at all), it is replaced and highlighted, with
+ * what was read one click away; when what was read is a common word too, it is only highlighted,
+ * with the abbreviation as the choice.
+ */
+function fixAbbreviations(l) {
+  if (!buildAbbrevTable()) return l;
+  const tokens = l.text.split(/\s+/).filter(Boolean);
+  const unclear = new Set(l.unclear), alts = [...(l.alts || [])];
+  let changed = false;
+  tokens.forEach((t, i) => {
+    const p = wordParts(t);
+    if (!p || p.core.length < 2 || /["']/.test(p.core.slice(0, -1))) return;
+    const core = p.core.replace(/'$/, "");
+    const hit = abbrevTable.get(core);
+    if (!hit) return;
+    const abbr = p.pre + hebrewMarks(hit.abbr) + p.post;
+    const readRank = lexicon.get(core);
+    if (readRank === undefined || readRank > hit.rank * 50) {
+      // What was read is not a word, or a rare one next to a very common abbreviation.
+      tokens[i] = abbr; changed = true;
+      unclear.add(abbr);
+      alts.push({ word: abbr, alt: t, abbrev: true });
+    } else if (readRank > hit.rank * 3) {
+      // Both are real, the abbreviation clearly more common: suggest it.
+      unclear.add(t);
+      alts.push({ word: t, alt: abbr, abbrev: true });
+    }
+    // Otherwise what was read is a common word in its own right (של, כל, מה…): left alone.
+  });
+  if (changed) l.text = tokens.join(" ");
+  l.unclear = [...unclear].filter((w) => l.text.split(/\s+/).includes(w));
+  l.alts = alts;
+  return l;
+}
+
 const HEB = "אבגדהוזחטיכלמנסעפצקרשתךםןףץ";
 const FINAL = { כ: "ך", מ: "ם", נ: "ן", פ: "ף", צ: "ץ" };
 /** Split a written word into leading punctuation, the word, trailing punctuation. */
@@ -1065,6 +1138,7 @@ const LINE_GROUP = 3; // lines per request: all groups go out at once
  */
 async function readPage(doc, page, onStep) {
   await pickBestModel();
+  await loadLexicon().catch((e) => console.warn("Word list not loaded:", e));
   const bitmap = await loadBitmap(page.image);
   const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
   const known = await learnedParts(writer, page.id, readMode() === "careful" ? EXAMPLES : WORD_EXAMPLES);
@@ -1101,6 +1175,7 @@ async function readPage(doc, page, onStep) {
     lines = cleanLines((await askJson([...known, pagePart, { text: "Transcribe all the handwriting on this page." }], LINE_SCHEMA, lineThinking())).lines || []);
   }
   try {
+    lines = lines.map((l) => fixAbbreviations({ ...l, alts: l.alts || [] }));
     lines = await checkAgainstLexicon(bitmap, lines, null);
   } catch (e) {
     console.error("Word-list check failed:", e);
@@ -1168,7 +1243,9 @@ async function checkWords(docId, pageId) {
     const has = new Set(r.text.split(/\s+/));
     l.unclear = [...new Set([...l.unclear.filter((w) => has.has(w)), ...r.flagged])].filter((w) => has.has(w));
     l.alts = [...(l.alts || []).filter((a) => !a.check && findTokens(r.text, a.word) >= 0), ...r.alts];
-    l.text = l.ai = r.text;
+    l.text = r.text;
+    fixAbbreviations(l);
+    l.ai = l.text;
     addLexiconFlags(l);
     return true;
   };
@@ -1498,7 +1575,7 @@ async function renderPage(page) {
     const draft = page.draft; // the reading may finish while the pictures are cut
     const imgs = await crops(page, draft);
     draft.forEach((l, i) => {
-      const row = document.createElement("div"); row.className = "row";
+      const row = document.createElement("div"); row.className = "row"; row.dir = "rtl";
       row.innerHTML = `<img alt=""><div class="draft-text" dir="rtl" lang="he"></div>`;
       if (imgs[i]) row.querySelector("img").src = imgs[i]; else row.querySelector("img").remove();
       row.querySelector(".draft-text").textContent = l.done ? l.text : "reading…";
@@ -1509,53 +1586,7 @@ async function renderPage(page) {
     body.innerHTML = '<p class="pad muted" style="margin:0">No handwriting found on this page.</p>';
   } else if (page.status === "done" && state.view === "lines") {
     const imgs = await crops(page, page.lines);
-    page.lines.forEach((line, i) => {
-      const row = document.createElement("div"); row.className = "row" + (line.unclear.length ? " unclear" : "");
-      const img = imgs[i] ? document.createElement("img") : document.createElement("div");
-      if (imgs[i]) { img.src = imgs[i]; img.alt = `Line ${i + 1}`; img.onclick = () => openLightbox(imgs[i]); }
-      const ta = document.createElement("textarea"); ta.dir = "rtl"; ta.lang = "he"; ta.rows = 1; ta.spellcheck = false; ta.value = line.text;
-      const grow = () => { ta.style.height = "auto"; ta.style.height = ta.scrollHeight + 2 + "px"; };
-      ta.oninput = () => { line.text = ta.value.replace(/\n/g, " "); grow(); scheduleSave(page); };
-      ta.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); row.nextElementSibling?.querySelector("textarea")?.focus(); } };
-      row.append(img, ta); requestAnimationFrame(grow);
-      if (line.empty && !line.text) {
-        row.classList.add("unclear");
-        const f = document.createElement("div"); f.className = "flag";
-        f.append("Nothing was read on this line. If there is writing in the picture, type it here.");
-        const ok = document.createElement("button"); ok.textContent = "Remove line";
-        ok.onclick = () => { page.lines = page.lines.filter((x) => x !== line); scheduleSave(page); renderPage(page); };
-        f.append(ok); row.append(f);
-      }
-      if (line.unclear.length) {
-        const f = document.createElement("div"); f.className = "flag";
-        f.append("Please check: " + line.unclear.join(", "));
-        // The other reading of a doubtful word, one click away.
-        for (const a of line.alts || []) {
-          if (findTokens(line.text, a.word) < 0) continue;
-          const use = document.createElement("button");
-          // Each Hebrew part in its own <bdi>, so the order reads clearly in an English sentence.
-          use.innerHTML = a.alt
-            ? `«<bdi>${esc(a.alt)}</bdi>» instead of «<bdi>${esc(a.word)}</bdi>»${a.picked ? " ★" : ""}`
-            : `Remove «<bdi>${esc(a.word)}</bdi>»`;
-          use.title = a.dict
-            ? (a.picked ? "A real word from Sefaria's word list; Gemini says it matches the handwriting" : "A real word from Sefaria's word list, one letter different")
-            : a.alt ? "Use the other reading" : "Only the first reading had this; remove it";
-          use.onclick = () => {
-            line.text = replaceTokens(line.text, a.word, a.alt);
-            // This word is decided: drop its other choices.
-            line.alts = line.alts.filter((x) => x.word !== a.word);
-            const now = new Set(line.text.split(/\s+/));
-            line.unclear = line.unclear.filter((w) => now.has(w) && !a.word.split(" ").includes(w));
-            scheduleSave(page); renderPage(page);
-          };
-          f.append(use);
-        }
-        const ok = document.createElement("button"); ok.textContent = "Checked ✓";
-        ok.onclick = () => { line.unclear = []; line.alts = []; scheduleSave(page); renderPage(page); };
-        f.append(ok); row.append(f);
-      }
-      body.append(row);
-    });
+    page.lines.forEach((line, i) => body.append(lineRow(page, line, imgs[i])));
   } else if (page.status === "done") {
     const d = document.createElement("div"); d.className = "doc"; d.dir = "rtl"; d.lang = "he"; d.contentEditable = "true"; d.spellcheck = false;
     d.innerHTML = page.lines.map((l) => highlight(l.text, l.unclear)).join("\n");
@@ -1572,6 +1603,93 @@ async function renderPage(page) {
 }
 
 /** Highlight whole words only (a short word inside a longer one is left alone). */
+/**
+ * One line, laid out right to left the way Hebrew reads: the handwriting on top,
+ * the text right under it (doubtful words highlighted in place, edit by clicking
+ * into it), and under that each doubtful word with its other readings and ✓.
+ */
+function lineRow(page, line, img) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.dir = "rtl";
+  const doubtful = () => line.unclear.filter((w) => line.text.split(/\s+/).includes(w));
+  row.classList.toggle("unclear", doubtful().length > 0 || !!(line.empty && !line.text));
+  if (img) {
+    const pic = document.createElement("img");
+    pic.src = img; pic.alt = "handwriting"; pic.onclick = () => openLightbox(img);
+    row.append(pic);
+  }
+  const ed = document.createElement("div");
+  ed.className = "line-edit"; ed.lang = "he"; ed.dir = "rtl"; ed.spellcheck = false;
+  try { ed.contentEditable = "plaintext-only"; } catch { ed.contentEditable = "true"; }
+  if (ed.contentEditable !== "plaintext-only") ed.contentEditable = "true";
+  ed.innerHTML = highlight(line.text, doubtful());
+  let typed = false;
+  ed.oninput = () => { line.text = ed.innerText.replace(/\n/g, " "); typed = true; scheduleSave(page); };
+  ed.onkeydown = (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault(); // one box per handwritten line: Enter goes to the next line
+    const next = row.nextElementSibling?.querySelector(".line-edit");
+    if (next) { next.focus(); const r = document.createRange(); r.selectNodeContents(next); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); }
+  };
+  ed.onblur = () => {
+    if (!typed) return;
+    typed = false;
+    line.text = line.text.replace(/\s+/g, " ").trim();
+    line.unclear = doubtful();
+    line.alts = (line.alts || []).filter((a) => findTokens(line.text, a.word) >= 0);
+    row.replaceWith(lineRow(page, line, img)); // fresh highlights and choices
+  };
+  row.append(ed);
+  if (line.empty && !line.text) {
+    const note = document.createElement("div"); note.className = "choices"; note.dir = "ltr";
+    note.append("Nothing was read on this line. If there is writing in the picture, type it above.");
+    const rm = button("Remove line", "secondary", () => { page.lines = page.lines.filter((x) => x !== line); scheduleSave(page); renderPage(page); });
+    note.append(rm); row.append(note);
+  }
+  const words = doubtful();
+  if (words.length) {
+    const box = document.createElement("div"); box.className = "choices";
+    // Group the choices by the word (or words) they replace.
+    const groups = new Map();
+    for (const a of line.alts || []) {
+      if (findTokens(line.text, a.word) < 0) continue;
+      if (!groups.has(a.word)) groups.set(a.word, []);
+      groups.get(a.word).push(a);
+    }
+    for (const w of words) if (![...groups.keys()].some((k) => k.split(" ").includes(w))) groups.set(w, []);
+    const settle = (phrase, replacement) => {
+      if (replacement !== null) line.text = replaceTokens(line.text, phrase, replacement);
+      const gone = phrase.split(" ");
+      line.alts = (line.alts || []).filter((x) => x.word !== phrase && findTokens(line.text, x.word) >= 0);
+      line.unclear = line.unclear.filter((u) => !gone.includes(u) && line.text.split(/\s+/).includes(u));
+      scheduleSave(page);
+      row.replaceWith(lineRow(page, line, img));
+    };
+    for (const [phrase, alts] of groups) {
+      const g = document.createElement("span"); g.className = "choice-group";
+      const m = document.createElement("mark"); m.textContent = phrase; g.append(m);
+      for (const a of alts) {
+        const b = document.createElement("button");
+        b.className = "alt";
+        b.textContent = a.alt ? a.alt + (a.picked ? " ★" : "") : "✕";
+        b.title = a.abbrev ? "Use this abbreviation (from Sefaria's word list)" : a.dict
+          ? (a.picked ? "A real word from Sefaria's word list; Gemini says it matches the handwriting" : "A real word from Sefaria's word list, one letter different")
+          : a.alt ? `Use «${a.alt}» instead of «${phrase}»` : `Remove «${phrase}»`;
+        b.onclick = () => settle(phrase, a.alt);
+        g.append(b);
+      }
+      const keep = document.createElement("button");
+      keep.className = "keep"; keep.textContent = "✓"; keep.title = `«${phrase}» is right`;
+      keep.onclick = () => settle(phrase, null);
+      g.append(keep);
+      box.append(g);
+    }
+    row.append(box);
+  }
+  return row;
+}
+
 function highlight(text, unclear) {
   const marked = new Set(unclear);
   return text.split(/(\s+)/).map((t) => (marked.has(t) ? `<mark>${esc(t)}</mark>` : esc(t))).join("");

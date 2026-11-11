@@ -15,7 +15,7 @@ await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "R
 await allDone(3);
 check("3-page PDF read", (await page.locator(".page-head h3").allTextContents()).join("|").includes("page 3"));
 // a correction, then move the document to another person: the learning moves too
-await page.locator(".row textarea").nth(1).fill("שלום לכולם, היום נלמד!");
+await page.locator(".row .line-edit").nth(1).fill("שלום לכולם, היום נלמד!");
 await page.waitForTimeout(1200);
 await page.selectOption("#writerSelect", "__new");
 await page.fill(".dialog input", "Moshe"); await page.click(".dialog button[type=submit]");

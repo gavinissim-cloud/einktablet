@@ -14,7 +14,7 @@ async function run(name, fakeOpts, extra = {}) {
   await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "T"); await page.click(".dialog button[type=submit]");
   await page.waitForFunction(() => { const t = document.querySelector(".page-head .state")?.textContent || ""; return /Error/.test(t) || (/\d+ lines/.test(t) && !/checking/.test(t)); }, null, { timeout: 180000 });
   const state = await page.textContent(".page-head .state");
-  const texts = await page.locator(".row textarea").evaluateAll((e) => e.map((x) => x.value));
+  const texts = await page.locator(".row .line-edit").evaluateAll((e) => e.map((x) => x.innerText));
   await browser.close();
   return { state, texts, stats, errors };
 }

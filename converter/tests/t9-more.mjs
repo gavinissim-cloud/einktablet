@@ -12,11 +12,11 @@ await settled(page);
 
 // a save that fails once: the edit is saved by the next save
 await page.evaluate(() => { const orig = window.modify; let once = true; window.modify = (store, id, fn) => (store === "docs" && once && !(once = false) ? Promise.reject(new Error("disk full (test)")) : orig(store, id, fn)); });
-await page.locator(".row textarea").nth(1).fill("עריכה שנכשלה בשמירה");
+await page.locator(".row .line-edit").nth(1).fill("עריכה שנכשלה בשמירה");
 await page.waitForTimeout(1200);
 check("failed save tells the person", (await page.textContent(".dialog p")).includes("Couldn't save"));
 await page.click(".dialog button[type=submit]");
-await page.locator(".row textarea").nth(2).fill("עריכה שנייה");
+await page.locator(".row .line-edit").nth(2).fill("עריכה שנייה");
 await page.waitForTimeout(1200);
 let db = await dbDump(page);
 check("the edit from the failed save is saved with the next one", db.docs[0].pages[0].lines[1].text === "עריכה שנכשלה בשמירה" && db.docs[0].pages[0].lines[2].text === "עריכה שנייה", JSON.stringify(db.docs[0].pages[0].lines.slice(1, 3).map((l) => l.text)));
@@ -32,7 +32,7 @@ await page.evaluate(() => {
 await page.waitForTimeout(1200);
 db = await dbDump(page);
 check("split line not learned as an example", db.writers[0].examples.length === before, `${before} -> ${db.writers[0].examples.length}`);
-await page.click("#viewLines"); await page.waitForSelector(".row textarea");
+await page.click("#viewLines"); await page.waitForSelector(".row .line-edit");
 
 // browser Back and Forward
 await page.click("#backHome");
