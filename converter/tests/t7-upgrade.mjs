@@ -1,4 +1,4 @@
-import { launch, makePage, tagCrops, installFake, checker, dbDump } from "./harness.mjs";
+import { settled, launch, makePage, tagCrops, installFake, checker, dbDump } from "./harness.mjs";
 const [S, NEW, OLD] = process.argv.slice(2);
 const { browser, ctx } = await launch();
 const { check, done } = checker();
@@ -43,7 +43,7 @@ db = await dbDump(page);
 const np = db.writers.find((w) => w.name === "New person");
 check("switching person moves the learning", np && np.examples.length >= 1, JSON.stringify(db.writers.map((w) => [w.name, w.examples.length])));
 await page.locator(".page-head button", { hasText: "Read again" }).click(); await page.click(".dialog button[type=submit]");
-await page.waitForFunction(() => /lines/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 120000 });
+await settled(page);
 await page.click("#backHome");
 await page.locator("#writerList a", { hasText: "New person" }).click();
 await page.waitForSelector("#writerView:not([hidden])");

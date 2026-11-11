@@ -146,10 +146,25 @@ const DEFAULT_MODEL = "gemini-flash-latest";
 const AUTO = "auto";
 let autoModel = null; // the best model this key can use, found once per session
 function chosenModel() { try { return localStorage.getItem("gemini_model") || AUTO; } catch { return AUTO; } }
-function getModel() { const m = chosenModel(); return m === AUTO ? autoModel || DEFAULT_MODEL : m; }
+// "fast": Gemini Flash with light thinking, every line read at once (seconds a page).
+// "careful": the strongest Pro model with deep thinking (slower, for very hard pages).
+function readMode() { try { return localStorage.getItem("read_mode") === "careful" ? "careful" : "fast"; } catch { return "fast"; } }
+function setReadMode(m) { try { localStorage.setItem("read_mode", m); } catch {} }
+try {
+  if (localStorage.getItem("settings_version") !== "2") {
+    localStorage.removeItem("gemini_model"); // earlier versions chose the slow model by default
+    localStorage.setItem("settings_version", "2");
+  }
+} catch {}
+function getModel() {
+  const m = chosenModel();
+  if (m !== AUTO) return m;
+  return readMode() === "careful" ? autoModel || DEFAULT_MODEL : DEFAULT_MODEL;
+}
+const lineThinking = () => (readMode() === "careful" ? "HIGH" : "LOW");
 /** Pick the strongest Pro model the key can use (newest version; a "latest" alias first). */
 async function pickBestModel() {
-  if (chosenModel() !== AUTO || autoModel) return;
+  if (chosenModel() !== AUTO || readMode() !== "careful" || autoModel) return;
   try {
     const models = (await listModels()).map((m) => m.id).filter((id) => /pro/i.test(id) && !/preview|exp|tts|vision|lite|customtools/i.test(id));
     const version = (id) => parseFloat((id.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || "0");
@@ -162,7 +177,6 @@ async function pickBestModel() {
 }
 function setModel(m) { try { localStorage.setItem("gemini_model", m); } catch {} }
 const THINKING = "HIGH";
-const PASSES = 2;
 const EXAMPLES = 24;          // learned lines shown to Gemini per request
 const IMAGE_EDGE = 2400;      // Gemini scales images down itself; bigger only makes requests slower
 const STORE_EDGE = 3000;      // page images kept for the line pictures
@@ -366,6 +380,160 @@ function cropLine(bitmap, box, height = 0) {
   return c;
 }
 
+// ---------- Finding the lines on a page (in the browser, no Gemini needed) ----------
+/** Ink map of an image scaled to `width`: Uint8Array (1 = ink), with ruled lines removed. */
+function inkMap(src, width) {
+  const scale = Math.min(1, width / src.width);
+  const W = Math.max(1, Math.round(src.width * scale)), H = Math.max(1, Math.round(src.height * scale));
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.fillStyle = "#fff"; g.fillRect(0, 0, W, H); g.drawImage(src, 0, 0, W, H);
+  const px = g.getImageData(0, 0, W, H).data;
+  const gray = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) gray[i] = px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114;
+  // Ink is clearly darker than its surroundings (copes with shadows and uneven light).
+  const I = new Float64Array((W + 1) * (H + 1));
+  for (let y = 0; y < H; y++) { let row = 0; for (let x = 0; x < W; x++) { row += gray[y * W + x]; I[(y + 1) * (W + 1) + x + 1] = I[y * (W + 1) + x + 1] + row; } }
+  const r = Math.max(8, Math.round(W / 60));
+  const ink = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const y0 = Math.max(0, y - r), y1 = Math.min(H, y + r + 1);
+    for (let x = 0; x < W; x++) {
+      const x0 = Math.max(0, x - r), x1 = Math.min(W, x + r + 1);
+      const mean = (I[y1 * (W + 1) + x1] - I[y0 * (W + 1) + x1] - I[y1 * (W + 1) + x0] + I[y0 * (W + 1) + x0]) / ((y1 - y0) * (x1 - x0));
+      ink[y * W + x] = gray[y * W + x] < mean - 18 && gray[y * W + x] < 200 ? 1 : 0;
+    }
+  }
+  // Printed ruled lines: very long horizontal runs of ink. Handwriting never runs that far flat.
+  const long = W / 7;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W;) {
+      if (!ink[y * W + x]) { x++; continue; }
+      let e = x; while (e < W && (ink[y * W + e] || ink[y * W + e + 1])) e++;
+      if (e - x > long) for (let k = x; k < e; k++) ink[y * W + k] = 0;
+      x = e + 1;
+    }
+  }
+  return { ink, W, H, scale };
+}
+
+/** The page's tilt in degrees (lines of writing are made horizontal by rotating by minus this). */
+function estimateSkew(src) {
+  const { ink, W, H } = inkMap(src, 800);
+  const pts = [];
+  for (let y = 0; y < H; y += 1) for (let x = 0; x < W; x += 1) if (ink[y * W + x]) pts.push(x, y);
+  const step = Math.max(1, Math.floor(pts.length / 2 / 60000)) * 2;
+  let best = 0, bestScore = -1;
+  for (let a = -6; a <= 6.001; a += 0.25) {
+    const t = Math.tan((a * Math.PI) / 180), prof = new Float64Array(H + 200);
+    for (let i = 0; i < pts.length; i += step) { const y = Math.round(pts[i + 1] - pts[i] * t) + 100; if (y >= 0 && y < prof.length) prof[y]++; }
+    let s = 0; for (const v of prof) s += v * v;
+    if (s > bestScore) { bestScore = s; best = a; }
+  }
+  return best;
+}
+
+/** A copy of the page turned so its lines are level (or the page itself when it already is). */
+function levelPage(src) {
+  const a = estimateSkew(src);
+  if (Math.abs(a) < 0.3) return { canvas: null, angle: 0 };
+  const rad = (-a * Math.PI) / 180 * -1; // rotate by -a: lines that rise by a degrees become level
+  const W = src.width, H = src.height;
+  const cw = Math.round(Math.abs(W * Math.cos(rad)) + Math.abs(H * Math.sin(rad)));
+  const chh = Math.round(Math.abs(W * Math.sin(rad)) + Math.abs(H * Math.cos(rad)));
+  const c = document.createElement("canvas"); c.width = cw; c.height = chh;
+  const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, cw, chh);
+  g.translate(cw / 2, chh / 2); g.rotate(-rad); g.drawImage(src, -W / 2, -H / 2);
+  return { canvas: c, angle: a };
+}
+
+/**
+ * The lines of writing on a (level) page, top to bottom, as 0–1000 boxes; null
+ * when the page doesn't look like lines of writing (then Gemini finds them).
+ * Works without blank space between lines: it finds the regular spacing of the
+ * lines, the middle of each line, and cuts halfway where the ink is thinnest.
+ */
+function findLines(src) {
+  const { ink, W, H } = inkMap(src, 1000);
+  const rows = new Float64Array(H);
+  for (let y = 0; y < H; y++) { let n = 0; for (let x = 0; x < W; x++) n += ink[y * W + x]; rows[y] = n; }
+  const total = rows.reduce((a, b) => a + b, 0);
+  if (total < W * 2) return null; // hardly any writing
+  const smoothBy = (k) => {
+    const out = new Float64Array(H);
+    for (let y = 0; y < H; y++) { let s = 0, n = 0; for (let d = -k; d <= k; d++) if (y + d >= 0 && y + d < H) { s += rows[y + d]; n++; } out[y] = s / n; }
+    return out;
+  };
+  // The distance from one line to the next: the strongest repeat in the ink profile.
+  const mean = total / H, centred = rows.map((v) => v - mean);
+  const lo = Math.max(6, Math.round(H / 150)), hi = Math.round(H / 2);
+  const corr = new Float64Array(hi + 2);
+  for (let lag = lo; lag <= hi; lag++) { let c = 0; for (let y = 0; y + lag < H; y++) c += centred[y] * centred[y + lag]; corr[lag] = c / (H - lag); }
+  // The first clear repeat (twice the spacing repeats too, but the first one is the line spacing).
+  const top = Math.max(...corr.slice(lo, hi + 1));
+  let pitch = 0;
+  if (top > 0) for (let lag = lo + 1; lag < hi; lag++) if (corr[lag] >= corr[lag - 1] && corr[lag] >= corr[lag + 1] && corr[lag] >= top * 0.5) { pitch = lag; break; }
+  // Too little repetition (a single line, or very few): measure the ink band itself.
+  if (!pitch) {
+    let t = 0, b = H - 1; const m = Math.max(...rows);
+    while (t < H && rows[t] < m * 0.2) t++;
+    while (b > t && rows[b] < m * 0.2) b--;
+    pitch = Math.max(8, (b - t + 1) * 1.6);
+  }
+  const smooth = smoothBy(Math.max(1, Math.round(pitch / 5)));
+  const max = Math.max(...smooth);
+  // The middle of each line: the highest points of the profile, at least ~2/3 of a line apart.
+  // A line stands out from the paper around it: either it has plenty of ink, or (a short line
+  // such as a title) it rises clearly above the dips on both sides.
+  const prominence = (y) => {
+    const w = Math.round(pitch);
+    let l = Infinity, r = Infinity;
+    for (let k = Math.max(0, y - w); k <= y; k++) l = Math.min(l, smooth[k]);
+    for (let k = y; k <= Math.min(H - 1, y + w); k++) r = Math.min(r, smooth[k]);
+    return smooth[y] - Math.max(l, r);
+  };
+  const cand = [];
+  for (let y = 1; y < H - 1; y++) {
+    if (!(smooth[y] >= smooth[y - 1] && smooth[y] > smooth[y + 1] && smooth[y] > max * 0.03)) continue;
+    if (smooth[y] > max * 0.25 || prominence(y) >= smooth[y] * 0.7) cand.push(y);
+  }
+  cand.sort((a, b) => smooth[b] - smooth[a]);
+  const peaks = [];
+  for (const y of cand) if (peaks.every((p) => Math.abs(p - y) >= pitch * 0.6)) peaks.push(y);
+  peaks.sort((a, b) => a - b);
+  if (!peaks.length || peaks.length > 80) return null;
+  // Cut halfway between neighbouring lines, where the ink is thinnest.
+  const cuts = [];
+  for (let i = 0; i + 1 < peaks.length; i++) {
+    let cut = peaks[i], low = Infinity;
+    for (let y = peaks[i]; y <= peaks[i + 1]; y++) if (smooth[y] < low) { low = smooth[y]; cut = y; }
+    cuts.push(cut);
+  }
+  const bands = peaks.map((p, i) => {
+    let t = i ? cuts[i - 1] : Math.max(0, Math.round(p - pitch)), b = i < cuts.length ? cuts[i] : Math.min(H - 1, Math.round(p + pitch));
+    // Trim empty paper above and below.
+    const thin = smooth[p] * 0.04;
+    while (t < p && smooth[t] <= thin) t++;
+    while (b > p && smooth[b] <= thin) b--;
+    return [t, b];
+  });
+  const kept = bands;
+  return kept.map(([t, b]) => {
+    const cols = new Float64Array(W);
+    for (let y = t; y <= b; y++) for (let x = 0; x < W; x++) cols[x] += ink[y * W + x];
+    const sum = cols.reduce((s, v) => s + v, 0);
+    let acc = 0, left = 0, right = W - 1;
+    for (let x = 0; x < W; x++) { acc += cols[x]; if (acc > sum * 0.003) { left = x; break; } }
+    acc = 0;
+    for (let x = W - 1; x >= 0; x--) { acc += cols[x]; if (acc > sum * 0.003) { right = x; break; } }
+    const padX = pitch * 0.3, padY = pitch * 0.08;
+    return {
+      top: Math.max(0, Math.round(((t - padY) / H) * 1000)), bottom: Math.min(1000, Math.round(((b + padY) / H) * 1000)),
+      left: Math.max(0, Math.round(((left - padX) / W) * 1000)), right: Math.min(1000, Math.round(((right + padX) / W) * 1000)),
+    };
+  });
+}
+
 // ---------- Gemini ----------
 class ReadError extends Error {}
 
@@ -431,17 +599,19 @@ const EXACT_SCHEMA = {
 };
 
 // At most this many Gemini requests at once across all pages, so Google's "too busy" limit isn't hit.
-const MAX_REQUESTS = 6;
-let inFlight = 0; const waiting = [];
-async function withSlot(fn) {
-  if (inFlight >= MAX_REQUESTS) await new Promise((r) => waiting.push(r));
+const MAX_REQUESTS = 10;
+let inFlight = 0; const waiting = [], waitingLow = [];
+// Reading the lines a person is waiting for goes first; background word checks wait their turn.
+let lowPriority = false;
+async function withSlot(fn, low = false) {
+  if (inFlight >= MAX_REQUESTS || (low && waiting.length)) await new Promise((r) => (low ? waitingLow : waiting).push(r));
   inFlight++;
-  try { return await fn(); } finally { inFlight--; waiting.shift()?.(); }
+  try { return await fn(); } finally { inFlight--; (waiting.shift() || waitingLow.shift())?.(); }
 }
 let thinkingRejected = new Set(); // models that refused a thinking setting once
 
 /** One Gemini request returning JSON; retried when Google is busy, given up after TIMEOUT_MS. */
-function askJson(parts, schema, thinking = THINKING) { return withSlot(() => askJsonNow(parts, schema, thinking)); }
+function askJson(parts, schema, thinking = THINKING, low = false) { return withSlot(() => askJsonNow(parts, schema, thinking), low); }
 async function askJsonNow(parts, schema, thinking) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -599,7 +769,7 @@ const WORD_SCHEMA = {
  * a sentence or topic to guess from. Returns per line {text, unsure: [words]},
  * or null for lines that couldn't be split into words.
  */
-async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
+async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = false) {
   const items = []; // {line, pos, box}
   const perLine = lines.map((line, i) => {
     const h = line.bottom - line.top;
@@ -627,7 +797,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}) {
     }
     // Once more if the answer left words out (a failed request was already retried inside askJson).
     for (let attempt = 0; attempt < 2; attempt++) try {
-      const res = await askJson(parts, WORD_SCHEMA, WORD_THINKING);
+      const res = await askJson(parts, WORD_SCHEMA, WORD_THINKING, low);
       answered++;
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
@@ -745,6 +915,20 @@ const PICK_SCHEMA = {
  * which choice (if any) matches its letters exactly; that one is offered first.
  * The text itself is never changed here.
  */
+/** Highlight words of a line that aren't in the word list, with the nearest real words as choices (the list must be loaded). */
+function addLexiconFlags(l) {
+  if (!lexicon?.size) return l;
+  const unknown = [...new Set(l.text.split(/\s+/).filter((w) => w && !isKnownWord(w)))];
+  if (!unknown.length) return l;
+  const unclear = new Set(l.unclear), alts = [...(l.alts || [])];
+  for (const w of unknown) {
+    unclear.add(w);
+    for (const alt of suggestWords(w)) if (!alts.some((a) => a.word === w && a.alt === alt)) alts.push({ word: w, alt, dict: true });
+  }
+  l.unclear = [...unclear]; l.alts = alts;
+  return l;
+}
+
 async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
   await loadLexicon();
   if (!lexicon.size) return lines;
@@ -793,12 +977,13 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
  * "improve") the sentence. Returns the literal text per line (null where a
  * line could not be read).
  */
-async function readLinesExactly(bitmap, lines, known) {
+async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thinking = THINKING, onLines = () => {} } = {}) {
   const order = lines.map((_, i) => i);
   for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
   const out = new Array(lines.length).fill(null);
   const batches = [];
-  for (let i = 0; i < order.length; i += EXACT_BATCH) batches.push(order.slice(i, i + EXACT_BATCH));
+  for (let i = 0; i < order.length; i += group) batches.push(order.slice(i, i + group));
+  let failures = 0;
   await Promise.all(batches.map(async (batch) => {
     const parts = [...known, { text: `Below are ${batch.length} images, each one handwritten line cut out of a page, in random order (they do not form a text together). For each image, transcribe exactly the letters written on the main line in the middle of the image, letter by letter and word by word, right to left. Ignore cut-off bits of the lines above or below it. Do not guess from meaning: a word you can't read fully goes in "unclear" with the letters you can see. Keep the writer's spelling and grammar exactly, even when wrong. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.` }];
     for (const [k, idx] of batch.entries()) {
@@ -810,14 +995,17 @@ async function readLinesExactly(bitmap, lines, known) {
       parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
     }
     try {
-      const res = await askJson(parts, EXACT_SCHEMA);
+      const res = await askJson(parts, EXACT_SCHEMA, thinking);
       for (const r of res.lines || []) {
         const idx = batch[Number(r.image) - 1];
-        if (idx === undefined || typeof r.text !== "string" || !r.text.trim()) continue;
+        if (idx === undefined || typeof r.text !== "string") continue;
         out[idx] = { text: r.text.replace(/\s+/g, " ").trim(), unclear: (Array.isArray(r.unclear) ? r.unclear : []).filter((w) => typeof w === "string") };
       }
+      onLines(out);
     } catch (e) {
-      console.warn("Word-by-word step failed for some lines, keeping the page reading there:", e);
+      console.warn("Reading some lines failed:", e);
+      failures++;
+      if (failures === batches.length) throw e; // nothing could be read: say why
     }
   }));
   return out;
@@ -866,32 +1054,137 @@ async function learnedParts(writer, pageId, max = EXAMPLES) {
   return parts;
 }
 
+const LINE_GROUP = 3; // lines per request: all groups go out at once
+
+/**
+ * Read a page fast: the lines are found here in the browser, then every line is
+ * read at the same time (in small groups of shuffled lines, so a group isn't a
+ * sentence to guess from); each line's text shows as soon as its group returns.
+ * If the lines can't be found here, Gemini reads the whole page instead.
+ * The word-by-word check runs afterwards, in the background (checkWords).
+ */
 async function readPage(doc, page, onStep) {
   await pickBestModel();
   const bitmap = await loadBitmap(page.image);
-  const small = await canvasBlob(toCanvas(bitmap, IMAGE_EDGE), 0.9);
-  const pagePart = { inlineData: { mimeType: "image/jpeg", data: await blobBase64(small) }, mediaResolution: { level: "MEDIA_RESOLUTION_HIGH" } };
   const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
-  const known = await learnedParts(writer, page.id);
+  const known = await learnedParts(writer, page.id, readMode() === "careful" ? EXAMPLES : WORD_EXAMPLES);
   onStep(1);
-  let lines = await ask([...known, pagePart, { text: "Transcribe all the handwriting on this page." }]);
-  let segs = null;
-  if (PASSES > 1 && lines.length) {
-    onStep(2, lines);
-    // If anything in this step fails, the page reading from step 1 is kept.
-    try {
-      const step2 = await readEveryWord(bitmap, lines, writer, page, known, onStep);
-      lines = step2.lines; segs = step2.segs;
-    } catch (e) {
-      console.error("Step 2 failed; keeping the page reading:", e);
+  let boxes = null;
+  try { boxes = findLines(bitmap); } catch (e) { console.warn("Couldn't find the lines here:", e); }
+  let lines = null;
+  if (boxes?.length) {
+    onStep(1, boxes.map((b) => ({ ...b, text: "", unclear: [] })));
+    const read = await readLinesExactly(bitmap, boxes, known, {
+      group: LINE_GROUP, thinking: lineThinking(),
+      onLines: (out) => onStep(1, boxes.map((b, i) => ({ ...b, text: out[i]?.text ?? "", unclear: out[i]?.unclear || [], done: !!out[i] }))),
+    }).catch((e) => {
+      if (/key isn't accepted/.test(e.message)) throw e; // reading the whole page wouldn't help
+      console.warn("Reading the lines failed; Gemini reads the whole page instead:", e);
+      return null;
+    });
+    // Lines whose group failed are tried once more, on their own.
+    const missing = read ? read.map((r, i) => (r ? null : i)).filter((i) => i !== null) : [];
+    if (missing.length) {
+      const again = await readLinesExactly(bitmap, missing.map((i) => boxes[i]), known, { group: 1, thinking: lineThinking() }).catch(() => []);
+      missing.forEach((i, k) => { if (again[k]) read[i] = again[k]; });
     }
+    if (read && read.every(Boolean)) {
+      // A line answered with nothing stays (empty, flagged) next to its picture, never silently dropped.
+      lines = boxes.map((b, i) => ({ ...b, text: read[i].text, unclear: read[i].unclear.flatMap((w) => w.split(/\s+/)), ...(read[i].text ? {} : { empty: true }) }));
+      for (const l of lines) for (const w of l.text.split(/\s+/)) if (w.includes("□") && !l.unclear.includes(w)) l.unclear.push(w);
+    }
+    // Otherwise (some lines couldn't be read at all) Gemini reads the whole page instead.
+  }
+  if (!lines) {
+    const small = await canvasBlob(toCanvas(bitmap, IMAGE_EDGE), 0.9);
+    const pagePart = { inlineData: { mimeType: "image/jpeg", data: await blobBase64(small) }, mediaResolution: { level: "MEDIA_RESOLUTION_HIGH" } };
+    lines = cleanLines((await askJson([...known, pagePart, { text: "Transcribe all the handwriting on this page." }], LINE_SCHEMA, lineThinking())).lines || []);
   }
   try {
-    lines = await checkAgainstLexicon(bitmap, lines, segs);
+    lines = await checkAgainstLexicon(bitmap, lines, null);
   } catch (e) {
     console.error("Word-list check failed:", e);
   }
   return lines.map((l) => ({ ...l, ai: l.text }));
+}
+
+/**
+ * The word-by-word check, after a page is read: every word is cut out and read
+ * on its own (all the page's words mixed together), so a word made up from the
+ * sentence shows up as a disagreement. The text is not changed: words where the
+ * two readings differ are highlighted, with the other reading one click away.
+ * Lines the person already edited are left alone. Runs in the background.
+ */
+async function checkWords(docId, pageId) {
+  const doc = await getOne("docs", docId);
+  const page = doc?.pages.find((p) => p.id === pageId);
+  if (!page || page.status !== "done" || !page.lines.length) return;
+  const readId = page.readId;
+  const bitmap = await loadBitmap(page.image);
+  const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
+  const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
+  const lines = page.lines;
+  let byWord;
+  try {
+    byWord = await readWordsExactly(bitmap, lines, known, (done, total) => {
+      if (done < total) updatePage(docId, pageId, { checking: { done, total } }, { quiet: true });
+    }, true);
+  } catch (e) {
+    console.warn("The word check couldn't run:", e);
+    return updatePage(docId, pageId, { checking: null }, { quiet: true });
+  }
+  const short = (t) => t.length <= 3;
+  // The word-by-word reading wins (a word made up from the sentence is replaced by what the letters
+  // say); wherever the readings differ the word is highlighted, with the line reading one click away.
+  const mergeFor = (line, e) => {
+    const lit = e.text.split(/\s+/).filter(Boolean), rd = line.ai.split(/\s+/).filter(Boolean);
+    const parts = alignWords(lit, rd);
+    // Readings that hardly agree mean the line was cut up wrongly: keep the line reading, flagged.
+    if (parts.filter((x) => x.same).length < rd.length * 0.4) return { text: line.ai, flagged: new Set(rd), alts: [] };
+    const words = [], flagged = new Set(e.unsure), alts = [];
+    for (const part of parts) {
+      if (part.same) { words.push(...part.a); continue; }
+      if (part.a.length) {
+        words.push(...part.a);
+        part.a.forEach((w) => flagged.add(w));
+        const fits = (short(part.a) && short(part.b)) || (part.b.length > part.a.length && part.a.length <= 8 && part.b.length <= 10);
+        if (part.b.length && fits) alts.push({ word: part.a.join(" "), alt: part.b.join(" "), check: true });
+      } else {
+        // Only the line reading has these words (the word cutting may have missed them): kept, flagged.
+        words.push(...part.b);
+        part.b.forEach((w) => flagged.add(w));
+        if (short(part.b)) alts.push({ word: part.b.join(" "), alt: "", check: true });
+      }
+    }
+    for (const w of words) if (w.includes("□")) flagged.add(w);
+    return { text: words.join(" "), flagged, alts };
+  };
+  // Results are matched to lines by box and first reading, not by number (lines may have been added or removed).
+  const keyOf = (l) => `${l.top},${l.bottom},${l.left},${l.right}|${l.ai}`;
+  const results = new Map();
+  lines.forEach((line, i) => { if (byWord[i]?.text) results.set(keyOf(line), mergeFor(line, byWord[i])); });
+  const apply = (l, r) => {
+    if (!r || l.text !== l.ai) return false; // edited by the person: leave it
+    const has = new Set(r.text.split(/\s+/));
+    l.unclear = [...new Set([...l.unclear.filter((w) => has.has(w)), ...r.flagged])].filter((w) => has.has(w));
+    l.alts = [...(l.alts || []).filter((a) => !a.check && findTokens(r.text, a.word) >= 0), ...r.alts];
+    l.text = l.ai = r.text;
+    addLexiconFlags(l);
+    return true;
+  };
+  const saved = await modify("docs", docId, (d) => {
+    const p = d.pages.find((x) => x.id === pageId);
+    if (!p || p.readId !== readId) return false; // read again meanwhile
+    p.lines.forEach((l) => apply(l, results.get(keyOf(l))));
+    p.checking = null;
+  });
+  if (!saved) return;
+  const live = state.doc?.id === docId && state.doc.pages.find((p) => p.id === pageId);
+  if (live && live.readId === readId) {
+    live.lines.forEach((l) => apply(l, results.get(keyOf(l))));
+    live.checking = null;
+    renderPageSoon(live);
+  }
 }
 
 /** Align two word lists: [{a: [...], b: [...]}], equal stretches have a and b the same. */
@@ -910,54 +1203,6 @@ function alignWords(a, b) {
   return out;
 }
 
-/**
- * Step 2: every word read on its own (lines that can't be split are read as
- * whole lines). The literal reading wins; wherever the page reading differs,
- * the word is flagged with the page reading as the other choice. Words only
- * the page reading has (for example a word a line box cut off) are never
- * dropped silently: they are kept, flagged, with "remove" as the other choice.
- */
-async function readEveryWord(bitmap, lines, writer, page, known, onStep) {
-  const knownWords = await learnedParts(writer, page.id, WORD_EXAMPLES);
-  const byWord = await readWordsExactly(bitmap, lines, knownWords, (done, total) => onStep(2, null, { done, total }));
-  const missing = lines.map((l, i) => (byWord[i] ? null : i)).filter((i) => i !== null);
-  const byLine = missing.length ? await readLinesExactly(bitmap, missing.map((i) => lines[i]), known) : [];
-  missing.forEach((i, k) => { if (byLine[k]) byWord[i] = { text: byLine[k].text, unsure: byLine[k].unclear.flatMap((w) => w.split(/\s+/)), segs: null }; });
-  const short = (t) => t.length <= 3;
-  const out = lines.map((line, i) => {
-    const e = byWord[i];
-    if (!e || !e.text) return line;
-    const lit = e.text.split(/\s+/).filter(Boolean), pg = line.text.split(/\s+/).filter(Boolean);
-    // Readings that hardly agree mean the line was cut up wrongly: keep the page reading, flagged.
-    const agree = alignWords(lit, pg).filter((x) => x.same).length;
-    if (Math.abs(lit.length - pg.length) > Math.max(2, pg.length * 0.3) && agree < pg.length * 0.5) {
-      return { ...line, unclear: [...new Set([...line.unclear, ...pg])] };
-    }
-    const words = [], flagged = new Set(e.unsure), alts = [];
-    for (const part of alignWords(lit, pg)) {
-      if (part.same) { words.push(...part.a); continue; }
-      if (part.a.length) {
-        words.push(...part.a);
-        part.a.forEach((w) => flagged.add(w));
-        // The other reading stays one click away; when it has more words, even for longer stretches,
-        // so words only the page reading has are never lost.
-        const fits = (short(part.a) && short(part.b)) || (part.b.length > part.a.length && part.a.length <= 8 && part.b.length <= 10);
-        if (part.b.length && fits) alts.push({ word: part.a.join(" "), alt: part.b.join(" ") });
-      } else {
-        // Only the page reading has these words.
-        words.push(...part.b);
-        part.b.forEach((w) => flagged.add(w));
-        if (short(part.b)) alts.push({ word: part.b.join(" "), alt: "" });
-      }
-    }
-    for (const w of words) if (w.includes("□")) flagged.add(w);
-    const text = words.join(" ");
-    const has = new Set(words);
-    return { ...line, text, alts, unclear: [...flagged].filter((w) => has.has(w)) };
-  });
-  return { lines: out, segs: byWord.map((e) => e?.segs) };
-}
-
 // ---------- Reading queue ----------
 const queue = []; let running = 0;
 const active = new Set(); // pages queued or being read
@@ -972,7 +1217,7 @@ function pump() {
     runJob(job).catch((e) => console.error(e)).finally(() => { running--; active.delete(job.pageId); pump(); });
   }
 }
-async function updatePage(docId, pageId, patch) {
+async function updatePage(docId, pageId, patch, { quiet = false } = {}) {
   const doc = await modify("docs", docId, (d) => {
     const page = d.pages.find((p) => p.id === pageId);
     if (!page) return false; // removed meanwhile
@@ -982,7 +1227,11 @@ async function updatePage(docId, pageId, patch) {
   if (!doc) return null;
   if (state.doc?.id === docId) {
     const live = state.doc.pages.find((p) => p.id === pageId);
-    if (live) { Object.assign(live, patch); renderPage(live); updateDocStatus(); }
+    if (live) {
+      Object.assign(live, patch);
+      if (quiet) refreshLabel(live); else renderPageSoon(live);
+      updateDocStatus();
+    }
   }
   return doc;
 }
@@ -991,13 +1240,15 @@ async function runJob({ docId, pageId }) {
   const page = doc?.pages.find((p) => p.id === pageId);
   if (!page) return;
   try {
-    await updatePage(docId, pageId, { status: "working", step: 0, draft: null, words: null, error: null });
-    const lines = await readPage(doc, page, (step, draft, words) =>
-      updatePage(docId, pageId, { step, ...(draft ? { draft } : {}), ...(words ? { words } : {}) }));
-    await updatePage(docId, pageId, { status: "done", lines, draft: null, step: 0 });
+    const readId = uid();
+    await updatePage(docId, pageId, { status: "working", step: 0, draft: null, words: null, checking: null, error: null, readId });
+    const lines = await readPage(doc, page, (step, draft) => updatePage(docId, pageId, { step, ...(draft ? { draft } : {}) }));
+    await updatePage(docId, pageId, { status: "done", lines, draft: null, step: 0, checking: { done: 0, total: 0 } });
+    // The page is ready to edit; the word check adds its highlights in the background.
+    checkWords(docId, pageId).catch((e) => console.warn("Word check failed:", e));
   } catch (e) {
     console.error(e);
-    await updatePage(docId, pageId, { status: "error", draft: null, error: e.message || String(e) });
+    await updatePage(docId, pageId, { status: "error", draft: null, checking: null, error: e.message || String(e) });
   }
 }
 
@@ -1168,6 +1419,45 @@ function openLightbox(src) {
   document.body.append(lb);
 }
 
+/** The page's status text (reading progress, lines to check, the background word check). */
+function fillLabel(st, page) {
+  st.classList.toggle("err", page.status === "error");
+  if (page.status === "queued") st.textContent = "Waiting…";
+  if (page.status === "working") {
+    const d = page.draft, done = d ? d.filter((l) => l.done).length : 0;
+    st.innerHTML = `<span class="spinner"></span>${d?.length ? `Reading the lines: ${done} of ${d.length}…` : "Finding the lines…"}`;
+  }
+  if (page.status === "error") st.textContent = "Error: " + page.error;
+  if (page.status === "done") {
+    const n = page.lines.filter((l) => l.unclear.length || (l.empty && !l.text)).length;
+    const c = page.checking;
+    st.innerHTML = esc(`${page.lines.length} lines${n ? ` · ${n} to check` : ""}`)
+      + (c ? ` · <span class="spinner"></span>checking every word${c.total ? ` (${c.done} of ${c.total})` : ""}…` : "");
+  }
+}
+function refreshLabel(page) {
+  const st = document.getElementById("page-" + page.id)?.querySelector(".page-head .state");
+  if (st) fillLabel(st, page);
+}
+/** Redraw a page, but not while the person is typing in it (then right after they leave it). */
+function renderPageSoon(page) {
+  const el = document.getElementById("page-" + page.id);
+  if (el && el.contains(document.activeElement) && document.activeElement.matches("textarea, [contenteditable]")) {
+    if (!el._pending) {
+      el._pending = true;
+      el.addEventListener("focusout", () => setTimeout(() => {
+        if (el.contains(document.activeElement)) return renderPageSoon(page);
+        el._pending = false;
+        const live = state.doc?.pages.find((p) => p.id === page.id);
+        if (live) renderPage(live);
+      }, 0), { once: true });
+    }
+    refreshLabel(page); // the status text still updates while they type
+    return;
+  }
+  renderPage(page);
+}
+
 async function renderPage(page) {
   const el = document.getElementById("page-" + page.id);
   if (!el) return;
@@ -1177,19 +1467,7 @@ async function renderPage(page) {
   const h = document.createElement("h3"); h.textContent = page.name;
   const st = document.createElement("span"); st.className = "state";
   head.append(h, st);
-  if (page.status === "queued") st.textContent = "Waiting…";
-  if (page.status === "working") {
-    const w = page.words;
-    const label = page.step === 2
-      ? `Step 2 of 2: reading every word on its own${w?.total ? ` (${w.done} of ${w.total})` : ""}…`
-      : "Step 1 of 2: Gemini is reading the page…";
-    st.innerHTML = `<span class="spinner"></span>${label}`;
-  }
-  if (page.status === "error") { st.classList.add("err"); st.textContent = "Error: " + page.error; }
-  if (page.status === "done") {
-    const n = page.lines.filter((l) => l.unclear.length).length;
-    st.textContent = `${page.lines.length} lines${n ? ` · ${n} to check` : ""}`;
-  }
+  fillLabel(st, page);
   const view = document.createElement("button"); view.className = "secondary"; view.textContent = "View page";
   view.onclick = () => openLightbox(URL.createObjectURL(page.image));
   head.append(view);
@@ -1216,14 +1494,15 @@ async function renderPage(page) {
 
   const body = document.createElement("div");
   if (page.status === "working" && page.draft?.length) {
-    body.innerHTML = '<div class="draft-note">First reading. Gemini is now reading every word on its own, letter by letter; you can edit when it\'s done.</div>';
+    body.innerHTML = '<div class="draft-note">Every line is being read at the same time; you can edit as soon as they are all in.</div>';
     const draft = page.draft; // the reading may finish while the pictures are cut
     const imgs = await crops(page, draft);
     draft.forEach((l, i) => {
       const row = document.createElement("div"); row.className = "row";
       row.innerHTML = `<img alt=""><div class="draft-text" dir="rtl" lang="he"></div>`;
       if (imgs[i]) row.querySelector("img").src = imgs[i]; else row.querySelector("img").remove();
-      row.querySelector(".draft-text").textContent = l.text;
+      row.querySelector(".draft-text").textContent = l.done ? l.text : "reading…";
+      if (!l.done) row.querySelector(".draft-text").classList.add("muted");
       body.append(row);
     });
   } else if (page.status === "done" && !page.lines.length) {
@@ -1239,6 +1518,14 @@ async function renderPage(page) {
       ta.oninput = () => { line.text = ta.value.replace(/\n/g, " "); grow(); scheduleSave(page); };
       ta.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); row.nextElementSibling?.querySelector("textarea")?.focus(); } };
       row.append(img, ta); requestAnimationFrame(grow);
+      if (line.empty && !line.text) {
+        row.classList.add("unclear");
+        const f = document.createElement("div"); f.className = "flag";
+        f.append("Nothing was read on this line. If there is writing in the picture, type it here.");
+        const ok = document.createElement("button"); ok.textContent = "Remove line";
+        ok.onclick = () => { page.lines = page.lines.filter((x) => x !== line); scheduleSave(page); renderPage(page); };
+        f.append(ok); row.append(f);
+      }
       if (line.unclear.length) {
         const f = document.createElement("div"); f.className = "flag";
         f.append("Please check: " + line.unclear.join(", "));
@@ -1393,7 +1680,9 @@ async function addFiles(files) {
   }
   for (const file of ok) {
     try {
-      const canvases = file.type === "application/pdf" ? await pdfPages(file) : [toCanvas(await loadBitmap(file), STORE_EDGE)];
+      const raw = file.type === "application/pdf" ? await pdfPages(file) : [toCanvas(await loadBitmap(file), STORE_EDGE)];
+      // A tilted photo is turned level, so each line is a straight strip.
+      const canvases = raw.map((c) => { try { const lv = levelPage(c); return lv.canvas ? toCanvas(lv.canvas, STORE_EDGE) : c; } catch { return c; } });
       for (const [i, c] of canvases.entries()) {
         const page = { id: uid(), name: canvases.length > 1 ? `${file.name} – page ${i + 1}` : file.name, image: await canvasBlob(c, 0.9), status: "queued", lines: [] };
         const saved = await modify("docs", doc.id, (d) => { d.pages.push(page); d.updatedAt = new Date().toISOString(); });
@@ -1488,24 +1777,28 @@ $("#settingsBtn").onclick = async () => {
   const wrap = document.createElement("div");
   wrap.className = "dialog-wrap";
   wrap.innerHTML = `<form class="dialog"><p><b>Settings</b></p>
-    <p class="muted">Reading model. <b>Flash</b> is fast and cheap. <b>Pro</b> is usually more accurate on hard handwriting, but slower and several times the price per page.</p>
-    <p><select id="modelPick" style="width:100%"><option>Loading the models your key can use…</option></select></p>
+    <p><b>Reading</b></p>
+    <p><label><input type="radio" name="readMode" value="fast"> <b>Fast</b> (recommended): every line read at once with Gemini Flash; a page takes seconds.</label></p>
+    <p><label><input type="radio" name="readMode" value="careful"> <b>Most careful</b>: the strongest Pro model, thinking deeply; slower and costs more, for very hard pages.</label></p>
+    <details><summary class="muted">Choose a specific model (advanced)</summary>
+    <p><select id="modelPick" style="width:100%"><option>Loading the models your key can use…</option></select></p></details>
     <p class="muted">Gemini key (saved only in this browser). Paste a new one to replace it, or leave empty to keep it.</p>
     <p><input type="password" id="keyNew" placeholder="New key (optional)"></p>
     <div class="actions"><button type="submit">Save</button><button type="button" class="secondary" id="setCancel">Cancel</button></div></form>`;
   document.body.append(wrap);
   const pick = wrap.querySelector("#modelPick");
   const current = chosenModel();
+  wrap.querySelector(`input[name=readMode][value=${readMode()}]`).checked = true;
   listModels().then((models) => {
     pick.innerHTML = "";
-    pick.add(new Option("Best available, chosen automatically (recommended)", AUTO, false, current === AUTO));
+    pick.add(new Option("Automatic, by the choice above (recommended)", AUTO, false, current === AUTO));
     if (current !== AUTO && !models.some((m) => m.id === current)) models.unshift({ id: current, label: current });
     // Pro and Flash first, newest-looking names first.
     models.sort((a, b) => (/pro/i.test(b.id) - /pro/i.test(a.id)) || (/latest/.test(b.id) - /latest/.test(a.id)) || b.id.localeCompare(a.id));
     for (const m of models) pick.add(new Option(`${m.label}  (${m.id})`, m.id, false, m.id === current));
   }).catch((e) => {
     pick.innerHTML = "";
-    pick.add(new Option("Best available, chosen automatically (recommended)", AUTO, false, current === AUTO));
+    pick.add(new Option("Automatic, by the choice above (recommended)", AUTO, false, current === AUTO));
     if (current !== AUTO) pick.add(new Option(current, current, false, true));
     pick.add(new Option(`(couldn't list models: ${e.message})`, "", false, false));
   });
@@ -1514,10 +1807,10 @@ $("#settingsBtn").onclick = async () => {
     e.preventDefault();
     const k = wrap.querySelector("#keyNew").value.trim();
     if (k) setKey(k);
+    setReadMode(wrap.querySelector("input[name=readMode]:checked")?.value || "fast");
     if (pick.value && !pick.value.startsWith("Loading")) { setModel(pick.value); autoModel = null; }
     wrap.remove();
-    if (chosenModel() === AUTO) pickBestModel().then(() => notify(`Saved. Pages will be read with ${getModel()}, the best model your key can use.`));
-    else notify(`Saved. Pages will be read with ${getModel()}.`);
+    pickBestModel().then(() => notify(`Saved. Pages will be read ${readMode() === "careful" ? "carefully" : "fast"}, with ${getModel()}.`));
   };
 };
 const goHome = () => { if (location.hash) history.pushState(null, "", location.pathname + location.search); showHome(); };
@@ -1644,9 +1937,11 @@ navigator.storage?.persist?.().catch(() => {});
 // Pages that were being read when the window was closed are read again.
 async function resumeUnfinished() {
   for (const d of await getAll("docs")) {
+    // A word check that was running when the window closed isn't resumed; its highlights are optional.
+    if (d.pages.some((p) => p.checking)) await modify("docs", d.id, (x) => { x.pages.forEach((p) => { p.checking = null; }); });
     const ids = d.pages.filter((p) => (p.status === "queued" || p.status === "working") && !active.has(p.id)).map((p) => p.id);
     if (!ids.length) continue;
-    await modify("docs", d.id, (x) => { for (const p of x.pages) if (ids.includes(p.id)) Object.assign(p, { status: "queued", draft: null, words: null }); });
+    await modify("docs", d.id, (x) => { for (const p of x.pages) if (ids.includes(p.id)) Object.assign(p, { status: "queued", draft: null, words: null, checking: null }); });
     ids.forEach((id) => enqueue(d.id, id));
   }
 }

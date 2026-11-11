@@ -1,4 +1,4 @@
-import { start, makePage, tagCrops, installFake, checker, TRUTH } from "./harness.mjs";
+import { settled, start, makePage, tagCrops, installFake, checker, TRUTH } from "./harness.mjs";
 import fs from "node:fs";
 const [S, FILE] = process.argv.slice(2);
 const { browser, ctx, page, errors } = await start(FILE);
@@ -10,7 +10,7 @@ await installFake(page, truth);
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", [`${S}/e2e/p1.png`, `${S}/e2e/p2.png`]);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "T"); await page.click(".dialog button[type=submit]");
-await page.waitForFunction(() => [...document.querySelectorAll(".page-head .state")].filter((s) => s.textContent.includes("lines")).length === 2, null, { timeout: 120000 });
+await settled(page, 2);
 // a line with characters that are invalid in a Word file, and XML-special characters
 await page.locator(".row textarea").first().fill("בדיקה <a> & \"x\" \u0001\u000b סוף");
 await page.waitForTimeout(1200);

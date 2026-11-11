@@ -1,4 +1,4 @@
-import { start, makePage, tagCrops, installFake, corrupt, checker, dbDump, TRUTH } from "./harness.mjs";
+import { settled, start, makePage, tagCrops, installFake, corrupt, checker, dbDump, TRUTH } from "./harness.mjs";
 const [S, FILE] = process.argv.slice(2);
 const { browser, ctx, page, errors } = await start(FILE);
 const { check, done } = checker();
@@ -6,7 +6,7 @@ const truth = await makePage(page, `${S}/e2e/page.png`);
 await tagCrops(page);
 let delay = 50;
 await installFake(page, truth, { pageText: corrupt, get delay() { return delay; } });
-const allDone = (n) => page.waitForFunction((n) => [...document.querySelectorAll(".page-head .state")].filter((s) => s.textContent.includes("lines")).length === n, n, { timeout: 180000 });
+const allDone = (n) => settled(page, n);
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 
 // a 3-page PDF
@@ -27,7 +27,7 @@ check("learning moved to the new person", (rivka.examples || []).length === 0 &&
 // backup while a page is being read
 delay = 1500;
 await page.setInputFiles("#fileInput", `${S}/e2e/p1.png`);
-await page.waitForFunction(() => [...document.querySelectorAll(".page-head .state")].some((s) => /Step|Waiting/.test(s.textContent)));
+await page.waitForFunction(() => [...document.querySelectorAll(".page-head .state")].some((s) => /Reading|Finding|Waiting/.test(s.textContent)));
 await page.click("#backHome");
 const [dl] = await Promise.all([page.waitForEvent("download"), page.click("#backupBtn")]);
 await dl.saveAs(`${S}/e2e/backup.json`);

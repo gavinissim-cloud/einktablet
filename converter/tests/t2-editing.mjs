@@ -1,14 +1,14 @@
-import { start, makePage, tagCrops, installFake, corrupt, checker, dbDump, TRUTH } from "./harness.mjs";
+import { start, makePage, tagCrops, installFake, corruptLines, settled, checker, dbDump, TRUTH } from "./harness.mjs";
 const [S, FILE] = process.argv.slice(2);
 const { browser, ctx, page, errors } = await start(FILE);
 const { check, done } = checker();
 const truth = await makePage(page, `${S}/e2e/page.png`);
 await tagCrops(page);
-await installFake(page, truth, { pageText: corrupt });
+await installFake(page, truth, { lineText: (t) => (t.startsWith("הקנס") ? t + " נוסף" : corruptLines(t)) });
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", `${S}/e2e/page.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Tester"); await page.click(".dialog button[type=submit]");
-await page.waitForFunction(() => /lines/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 60000 });
+await settled(page);
 const texts = () => page.locator(".row textarea").evaluateAll((e) => e.map((x) => x.value));
 const save = () => page.waitForTimeout(1500);
 
@@ -19,7 +19,7 @@ check("choice replaced only that word", t[3] === TRUTH[3].replace("באשתו", 
 // 2. Remove choice
 await page.locator(".row").nth(4).locator(".flag button", { hasText: "Remove" }).click();
 t = await texts();
-check("remove choice removed the cut-off word", t[4] === TRUTH[4].split(" ").slice(0, -1).join(" "), t[4]);
+check("remove choice removed the extra word", t[4] === TRUTH[4], t[4]);
 // 3. Typing a correction
 await page.locator(".row textarea").nth(1).fill("שלום לכולם, היום נלמד על ההיסטוריה של העיר!");
 await save();

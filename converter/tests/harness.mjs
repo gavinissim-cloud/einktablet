@@ -128,7 +128,11 @@ export async function installFake(page, truth, opts = {}) {
     if (kind === "pick") return route.fulfill(sse({ answers: numbered.map(({ n: k }) => ({ image: k, choice: "none" })) }));
     if (kind === "lines") {
       const lines = [];
-      for (const { n: k, data } of numbered) lines.push({ image: k, text: wordsIn(truth, { ...(await boxOf(data)), left: 0, right: 1000 }).join(" "), unclear: [] });
+      for (const { n: k, data } of numbered) {
+        let text = wordsIn(truth, { ...(await boxOf(data)), left: 0, right: 1000 }).join(" ");
+        if (opts.lineText) text = opts.lineText(text);
+        lines.push({ image: k, text, unclear: [] });
+      }
       return route.fulfill(sse({ lines }));
     }
     let fake = truth.map((l) => ({ text: l.text, top: Math.round(l.top), bottom: Math.round(l.bottom), left: Math.round(l.left), right: Math.round(l.right), unclear: [] }));
@@ -162,3 +166,16 @@ export function checker() {
 }
 
 export const dbDump = (page) => page.evaluate(async () => ({ docs: await getAll("docs"), writers: (await getAll("writers")).map((w) => ({ ...w, examples: (w.examples || []).map((e) => ({ ...e, crop: !!e.crop })) })) }));
+
+/** Made-up words in the line reading (the word-by-word check must catch them). */
+export const corruptLines = (text) => {
+  if (text.startsWith("באשתו")) return "כשנאנס וחייב בתשלומי׳ כאילו הגיע זמן דאז של זה";
+  if (text.startsWith("שלום")) return text.replace("לכולם,", "לכולם");
+  return text;
+};
+
+/** Wait until every page is read and its word check has finished. */
+export const settled = (page, n = 1, timeout = 180000) => page.waitForFunction((n) => {
+  const s = [...document.querySelectorAll(".page-head .state")];
+  return s.length >= n && s.filter((x) => /\d+ lines/.test(x.textContent) && !/checking/.test(x.textContent)).length >= n;
+}, n, { timeout });

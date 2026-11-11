@@ -1,4 +1,4 @@
-import { start, tagCrops, installFake, checker, dbDump, sse } from "./harness.mjs";
+import { start, tagCrops, installFake, settled, checker, dbDump, sse } from "./harness.mjs";
 import fs from "node:fs";
 const [S, FILE] = process.argv.slice(2);
 const { browser, ctx, page, errors } = await start(FILE);
@@ -23,6 +23,7 @@ const stats = await installFake(page, big.lines, { models: ["gemini-flash-latest
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 // Settings: choose Flash
 await page.click("#settingsBtn");
+await page.click("details summary");
 await page.waitForFunction(() => document.querySelector("#modelPick")?.options.length >= 3);
 await page.selectOption("#modelPick", "gemini-flash-latest");
 await page.click(".dialog button[type=submit]");
@@ -41,7 +42,7 @@ await page.evaluate(async (b64) => {
   document.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt }));
 }, fs.readFileSync(`${S}/e2e/big.jpg`).toString("base64"));
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "T"); await page.click(".dialog button[type=submit]");
-await page.waitForFunction(() => /lines/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 180000 });
+await settled(page);
 const secs = (Date.now() - t0) / 1000;
 const texts = await page.locator(".row textarea").evaluateAll((e) => e.map((x) => x.value));
 check("pasted image read", texts.length === 40);
