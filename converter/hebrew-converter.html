@@ -414,6 +414,11 @@ function inkMap(src, width) {
   // Ink is clearly darker than its surroundings (copes with shadows and uneven light).
   const I = new Float64Array((W + 1) * (H + 1));
   for (let y = 0; y < H; y++) { let row = 0; for (let x = 0; x < W; x++) { row += gray[y * W + x]; I[(y + 1) * (W + 1) + x + 1] = I[y * (W + 1) + x + 1] + row; } }
+  // Pen ink is far darker than the paper; printed ruled lines, grid lines and shadows are only a
+  // little darker. So ink must also be well on the way from the paper's shade to the darkest ink.
+  const sorted = Float32Array.from(gray).sort();
+  const paper = sorted[Math.floor(sorted.length * 0.6)], darkest = sorted[Math.floor(sorted.length * 0.003)];
+  const inkLevel = paper - Math.max(40, (paper - darkest) * 0.42);
   const r = Math.max(8, Math.round(W / 60));
   const ink = new Uint8Array(W * H);
   for (let y = 0; y < H; y++) {
@@ -421,15 +426,32 @@ function inkMap(src, width) {
     for (let x = 0; x < W; x++) {
       const x0 = Math.max(0, x - r), x1 = Math.min(W, x + r + 1);
       const mean = (I[y1 * (W + 1) + x1] - I[y0 * (W + 1) + x1] - I[y1 * (W + 1) + x0] + I[y0 * (W + 1) + x0]) / ((y1 - y0) * (x1 - x0));
-      ink[y * W + x] = gray[y * W + x] < mean - 18 && gray[y * W + x] < 200 ? 1 : 0;
+      const g = gray[y * W + x];
+      ink[y * W + x] = g < mean - 18 && g < inkLevel ? 1 : 0;
     }
   }
+  // Background around the paper (a table, a shadow, a dark border): dark over a wide area, unlike
+  // thin pen strokes. Such areas, and a margin around them, are not writing.
+  const R = r * 4, bgLevel = paper - (paper - darkest) * 0.5;
+  for (let y = 0; y < H; y++) {
+    const y0 = Math.max(0, y - R), y1 = Math.min(H, y + R + 1);
+    for (let x = 0; x < W; x++) {
+      if (!ink[y * W + x]) continue;
+      const x0 = Math.max(0, x - R), x1 = Math.min(W, x + R + 1);
+      const wide = (I[y1 * (W + 1) + x1] - I[y0 * (W + 1) + x1] - I[y1 * (W + 1) + x0] + I[y0 * (W + 1) + x0]) / ((y1 - y0) * (x1 - x0));
+      if (wide < bgLevel) ink[y * W + x] = 0;
+    }
+  }
+  // A dark border around the paper (the table under a photo) is not writing: rows and columns that
+  // are almost all dark are cleared.
+  for (let y = 0; y < H; y++) { let n = 0; for (let x = 0; x < W; x++) n += gray[y * W + x] < inkLevel; if (n > W * 0.5) for (let x = 0; x < W; x++) ink[y * W + x] = 0; }
+  for (let x = 0; x < W; x++) { let n = 0; for (let y = 0; y < H; y++) n += gray[y * W + x] < inkLevel; if (n > H * 0.5) for (let y = 0; y < H; y++) ink[y * W + x] = 0; }
   // Printed ruled lines: very long horizontal runs of ink. Handwriting never runs that far flat.
   const long = W / 7;
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W;) {
       if (!ink[y * W + x]) { x++; continue; }
-      let e = x; while (e < W && (ink[y * W + e] || ink[y * W + e + 1])) e++;
+      let e = x; while (e < W && (ink[y * W + e] || ink[y * W + e + 1] || ink[y * W + e + 2] || ink[y * W + e + 3])) e++;
       if (e - x > long) for (let k = x; k < e; k++) ink[y * W + k] = 0;
       x = e + 1;
     }
@@ -442,15 +464,18 @@ function estimateSkew(src) {
   const { ink, W, H } = inkMap(src, 800);
   const pts = [];
   for (let y = 0; y < H; y += 1) for (let x = 0; x < W; x += 1) if (ink[y * W + x]) pts.push(x, y);
+  if (pts.length < 400) return 0; // hardly any writing: nothing to level
   const step = Math.max(1, Math.floor(pts.length / 2 / 60000)) * 2;
-  let best = 0, bestScore = -1;
+  let best = 0, bestScore = -1, score0 = 0;
   for (let a = -6; a <= 6.001; a += 0.25) {
     const t = Math.tan((a * Math.PI) / 180), prof = new Float64Array(H + 200);
     for (let i = 0; i < pts.length; i += step) { const y = Math.round(pts[i + 1] - pts[i] * t) + 100; if (y >= 0 && y < prof.length) prof[y]++; }
     let s = 0; for (const v of prof) s += v * v;
     if (s > bestScore) { bestScore = s; best = a; }
+    if (Math.abs(a) < 0.01) score0 = s;
   }
-  return best;
+  // Only turn the page when that clearly lines the writing up better.
+  return bestScore > score0 * 1.03 ? best : 0;
 }
 
 /** A copy of the page turned so its lines are level (or the page itself when it already is). */
