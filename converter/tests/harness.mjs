@@ -97,7 +97,7 @@ export function sse(data) {
  * the n-th request of a kind ("page" | "words" | "lines" | "pick").
  */
 export async function installFake(page, truth, opts = {}) {
-  const stats = { page: 0, words: 0, lines: 0, pick: 0, wordImages: 0, models: [] };
+  const stats = { page: 0, words: 0, lines: 0, pick: 0, options: 0, wordImages: 0, models: [] };
   const err = (status, message) => ({ status, headers: { "content-type": "application/json", "access-control-allow-origin": "*" }, body: JSON.stringify({ error: { code: status, message } }) });
   await page.route("https://generativelanguage.googleapis.com/**", async (route) => {
     if (route.request().method() === "GET") return route.fulfill({ status: 200, headers: { "content-type": "application/json", "access-control-allow-origin": "*" }, body: JSON.stringify({ models: (opts.models || ["gemini-flash-latest"]).map((n) => ({ name: "models/" + n, supportedGenerationMethods: ["generateContent"] })) }) });
@@ -106,7 +106,7 @@ export async function installFake(page, truth, opts = {}) {
     const body = route.request().postDataJSON();
     const parts = body.contents[0].parts;
     const raw = JSON.stringify(parts.filter((p) => p.text));
-    const kind = raw.includes("ONE handwritten Hebrew word") ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
+    const kind = raw.includes("possible readings") ? "options" : raw.includes("ONE handwritten Hebrew word") ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
     const n = ++stats[kind];
     if (opts.delay) await new Promise((r) => setTimeout(r, opts.delay));
     const f = opts.fail?.(kind, n, url);
@@ -123,6 +123,11 @@ export async function installFake(page, truth, opts = {}) {
         if (opts.emptyWord && text === opts.emptyWord) text = "";
         words.push({ image: k, text, sure: true });
       }
+      return route.fulfill(sse({ words }));
+    }
+    if (kind === "options") {
+      const words = [];
+      for (const { n: k, data } of numbered) { const w = wordsIn(truth, await boxOf(data)).join(" "); words.push({ image: k, options: [w, w + "ה", "ו" + w] }); }
       return route.fulfill(sse({ words }));
     }
     if (kind === "pick") return route.fulfill(sse({ answers: numbered.map(({ n: k }) => ({ image: k, choice: "none" })) }));

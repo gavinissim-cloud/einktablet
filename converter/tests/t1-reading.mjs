@@ -26,11 +26,11 @@ expected.forEach((t, i) => check(`after the word check, line ${i + 1} as expecte
 const m3 = await marksOf(page, 3), m1 = await marksOf(page, 1);
 check("made-up words highlighted in the text", m3.includes("באשתו") && m3.includes("בתשלומי׳"), JSON.stringify(m3));
 const c1 = await choicesOf(page, 3, "באשתו");
-check("clicking a word shows its other reading", c1.includes("כשנאנס") && c1.includes("✓") && c1.length <= 4, JSON.stringify(c1));
+check("clicking a word shows its other reading", c1.includes("כשנאנס") && c1.includes("✓") && c1.length <= 6, JSON.stringify(c1));
 const c2 = await choicesOf(page, 3, "בתשלומי׳");
 check("the writer's own spelling is one click away", c2.includes("במזנותיה"), JSON.stringify(c2));
 check("missing comma highlighted", m1.includes("לכולם,"), JSON.stringify(m1));
-check("at most 3 choices per word", (await Promise.all(m3.map((w) => choicesOf(page, 3, w)))).every((c) => c.length <= 4));
+check("at most 5 choices per word (plus ✓)", (await Promise.all(m3.map((w) => choicesOf(page, 3, w)))).every((c) => c.length <= 6));
 check("no page errors", errors.length === 0, errors.join("\n"));
 console.log(`editable after ${editableAfter.toFixed(1)}s with a fake reader answering in 0.4s; requests: ${JSON.stringify({ lines: stats.lines, words: stats.words, page: stats.page })}`);
 await page.screenshot({ path: `${S}/e2e/t1.png`, fullPage: true });

@@ -45,6 +45,8 @@ h2 { font-size: 17px; margin: 0 0 10px; }
 .row:last-child { border-bottom: 0; }
 .row.unclear { background: var(--warn-bg); }
 .row img { display: block; max-width: 100%; max-height: 130px; border-radius: 4px; cursor: zoom-in; background: #fff; }
+.pic { position: relative; width: fit-content; max-width: 100%; }
+.word-box { position: absolute; top: 0; bottom: 0; border: 3px solid var(--accent); border-radius: 6px; background: color-mix(in srgb, var(--accent) 12%, transparent); pointer-events: none; }
 .line-edit { margin-top: 6px; font: 21px/1.7 "Segoe UI", Arial, sans-serif; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; background: var(--card); color: var(--ink); min-height: 1.7em; white-space: pre-wrap; unicode-bidi: plaintext; text-align: right; outline: none; }
 .line-edit:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
 .line-edit mark { padding: 0 2px; }
@@ -1437,7 +1439,7 @@ async function showHome() {
 async function showDoc(id) {
   const doc = await getOne("docs", id);
   if (!doc) return showHome();
-  state.doc = doc; state.crops = new Map();
+  state.doc = doc; state.crops = new Map(); pageBitmaps.clear();
   show("docView");
   $("#docTitle").value = doc.title || "";
   const writers = await getAll("writers");
@@ -1535,7 +1537,8 @@ function fillLabel(st, page) {
     const n = page.lines.filter((l) => l.unclear.length || (l.empty && !l.text)).length;
     const c = page.checking;
     st.innerHTML = esc(`${page.lines.length} lines${page.readSeconds != null ? ` · read in ${page.readSeconds} s` : ""}${n ? ` · ${n} to check` : ""}`)
-      + (c ? ` · <span class="spinner"></span>checking every word${c.total ? ` (${c.done} of ${c.total})` : ""}…` : "");
+      + (c ? ` · <span class="spinner"></span>checking every word${c.total ? ` (${c.done} of ${c.total})` : ""}…` : "")
+      + (page.optionsProgress ? ` · <span class="spinner"></span>getting word options (${page.optionsProgress.done} of ${page.optionsProgress.total})…` : "");
   }
 }
 function refreshLabel(page) {
@@ -1574,6 +1577,16 @@ async function renderPage(page) {
   const view = document.createElement("button"); view.className = "secondary"; view.textContent = "View page";
   view.onclick = () => openLightbox(URL.createObjectURL(page.image));
   head.append(view);
+  if (page.status === "done" && !page.optionsProgress) {
+    const more = document.createElement("button"); more.className = "secondary"; more.textContent = "More word options";
+    more.title = "For pages that need a lot of editing: Gemini gives its 5 best readings of every word (takes a little while; you can keep editing)";
+    more.onclick = async () => {
+      more.disabled = true;
+      await flushSave();
+      fetchWordOptions(state.doc.id, page.id).catch((e) => { console.error(e); notify("Couldn't get more options: " + e.message); });
+    };
+    head.append(more);
+  }
   if (page.status === "done" || page.status === "error") {
     const again = document.createElement("button"); again.className = "secondary"; again.textContent = "Read again";
     again.onclick = async () => {
@@ -1641,9 +1654,12 @@ function lineRow(page, line, img) {
   const doubtful = () => line.unclear.filter((w) => line.text.split(/\s+/).includes(w));
   row.classList.toggle("unclear", doubtful().length > 0 || !!(line.empty && !line.text));
   if (img) {
+    const wrap = document.createElement("div"); wrap.className = "pic";
     const pic = document.createElement("img");
     pic.src = img; pic.alt = "handwriting"; pic.onclick = () => openLightbox(img);
-    row.append(pic);
+    const mark = document.createElement("div"); mark.className = "word-box"; mark.hidden = true;
+    wrap.append(pic, mark);
+    row.append(wrap);
   }
   const ed = document.createElement("div");
   ed.className = "line-edit"; ed.lang = "he"; ed.dir = "rtl"; ed.spellcheck = false;
@@ -1679,58 +1695,217 @@ function lineRow(page, line, img) {
     hint.textContent = "Click a yellow word to see its other readings, or just type over it.";
     row.append(hint);
   }
-  // Clicking a yellow word opens its choices right under it.
-  ed.addEventListener("click", (e) => {
-    const m = e.target.closest?.("mark");
-    if (m) openChoices(page, line, row, img, m);
+  // Clicking any word shows where it is in the handwriting, and its choices right under it.
+  ed.addEventListener("click", () => {
+    const at = caretToken(ed);
+    if (at) openWordMenu(page, line, row, img, at);
   });
   return row;
 }
 
-/** The other readings of one doubtful word (at most 3), in a small menu under the word. */
-function choicesFor(line, word) {
-  const rank = (a) => (a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
-  const seen = new Set();
-  return (line.alts || [])
-    .filter((a) => a.word.split(" ").includes(word) && findTokens(line.text, a.word) >= 0)
-    .sort((x, y) => rank(x) - rank(y))
-    .filter((a) => { const k = a.word + "|" + a.alt; if (seen.has(k)) return false; seen.add(k); return true; })
-    .slice(0, 3);
+/** Which word the caret is in: {index, start, end} in the line's text (words split by spaces). */
+function caretToken(ed) {
+  const sel = getSelection();
+  if (!sel.rangeCount || !ed.contains(sel.anchorNode)) return null;
+  const r = document.createRange(); r.selectNodeContents(ed); r.setEnd(sel.anchorNode, sel.anchorOffset);
+  const offset = r.toString().length, text = ed.innerText;
+  let index = -1, pos = 0;
+  for (const m of text.matchAll(/\S+/g)) {
+    index++;
+    if (offset <= m.index + m[0].length) { if (offset < m.index && index > 0) index--; return tokenAt(text, index); }
+    pos = m.index;
+  }
+  return index >= 0 ? tokenAt(text, index) : null;
 }
-function openChoices(page, line, row, img, mark) {
+function tokenAt(text, index) {
+  let i = -1;
+  for (const m of text.matchAll(/\S+/g)) if (++i === index) return { index, start: m.index, end: m.index + m[0].length, word: m[0] };
+  return null;
+}
+function replaceTokenAt(text, index, replacement) {
+  const t = text.split(/\s+/).filter(Boolean);
+  if (index < 0 || index >= t.length) return text;
+  t.splice(index, 1, ...replacement.split(/\s+/).filter(Boolean));
+  return t.join(" ");
+}
+
+// The page pictures, kept while the document is open, to find words in a line.
+const pageBitmaps = new Map();
+function pageBitmap(page) {
+  if (!pageBitmaps.has(page.id)) pageBitmaps.set(page.id, loadBitmap(page.image));
+  return pageBitmaps.get(page.id);
+}
+/**
+ * Where word number `index` (of `count`) sits in the line's picture, as fractions of
+ * the picture (0–1). Words are found by the blank space between them; when that count
+ * differs from the text's, the word is placed by its position in the text.
+ */
+async function wordSpot(page, line, index, count, text) {
+  if (line.top == null) return null;
+  const bitmap = await pageBitmap(page);
+  let boxes = null;
+  try { boxes = segmentWords(bitmap, line); } catch {}
+  if (!boxes?.length) return null;
+  // The picture shown is cropLine(bitmap, line): the same margins as there.
+  const W = bitmap.width, H = bitmap.height, h = ((line.bottom - line.top) / 1000) * H;
+  const x0 = Math.max(0, (line.left / 1000) * W - h * 0.05), x1 = Math.min(W, (line.right / 1000) * W + h * 0.05);
+  const span = x1 - x0;
+  let box;
+  if (boxes.length === count) box = boxes[index];
+  else {
+    // By position in the text: the share of letters before the middle of this word, right to left.
+    const words = text.split(/\s+/).filter(Boolean), total = words.join("").length || 1;
+    const before = words.slice(0, index).join("").length + (words[index]?.length || 0) / 2;
+    const xr = boxes[0].right, xl = boxes.at(-1).left, at = xr - (before / total) * (xr - xl);
+    box = boxes.reduce((best, b) => (Math.abs((b.left + b.right) / 2 - at) < Math.abs((best.left + best.right) / 2 - at) ? b : best));
+  }
+  return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span };
+}
+
+const OPTIONS_SCHEMA = {
+  type: "object",
+  properties: { words: { type: "array", items: { type: "object", properties: { image: { type: "integer" }, options: { type: "array", items: { type: "string" } } }, required: ["image", "options"] } } },
+  required: ["words"],
+};
+/**
+ * "More word options", for pages that need heavy editing: Gemini gives its 5 best
+ * readings of every word on the page (each word read alone), shown when a word is
+ * clicked. Optional and in the background, so normal reading stays fast.
+ */
+async function fetchWordOptions(docId, pageId) {
+  const doc = await getOne("docs", docId);
+  const page = doc?.pages.find((p) => p.id === pageId);
+  if (!page || page.status !== "done") return;
+  const bitmap = await loadBitmap(page.image);
+  const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
+  const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
+  const keyOf = (l) => `${l.top},${l.bottom},${l.left},${l.right}|${l.text}`;
+  const items = [], perLine = page.lines.map((l, i) => {
+    if (l.top == null) return null;
+    let words = null; try { words = segmentWords(bitmap, l); } catch {}
+    (words || []).forEach((box, pos) => items.push({ line: i, pos, box }));
+    return words ? words.map(() => null) : null;
+  });
+  const total = items.length;
+  let done = 0;
+  const progress = () => updatePage(docId, pageId, { optionsProgress: { done, total } }, { quiet: true });
+  await progress();
+  const batches = [];
+  for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
+  await Promise.all(batches.map(async (batch) => {
+    const parts = [...known, { text: `Below are ${batch.length} images, each ONE handwritten Hebrew word cut out of a page (in random order). For each image, give up to 5 possible readings of exactly the letters drawn, the most likely first, each a different reading (different letters, or with/without a mark like ״ ׳). Keep the writer's spelling. Answer with one entry per numbered image, using the number written just before it ("Image 1:" …); example lines shown earlier get no entry.` }];
+    for (const [k, it] of batch.entries()) {
+      parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)) } });
+    }
+    try {
+      const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, true);
+      for (const r of res.words || []) {
+        const it = batch[Number(r.image) - 1];
+        if (it && Array.isArray(r.options)) perLine[it.line][it.pos] = r.options.filter((o) => typeof o === "string" && o.trim()).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5);
+      }
+    } catch (e) { console.warn("Word options failed for some words:", e); }
+    done += batch.length; progress();
+  }));
+  // Match the pictures' options to the words of the text (they line up word for word where both agree).
+  const optionsByLine = new Map();
+  page.lines.forEach((l, i) => {
+    const segs = perLine[i];
+    if (!segs) return;
+    const tokens = l.text.split(/\s+/).filter(Boolean), map = {};
+    const first = segs.map((o) => o?.[0] || "");
+    if (segs.length === tokens.length) tokens.forEach((t, k) => { if (segs[k]?.length) map[t] = segs[k]; });
+    else {
+      let ti = 0;
+      for (const part of alignWords(first, tokens)) {
+        if (part.a.length === part.b.length) part.b.forEach((t, k) => { const o = segs[first.indexOf(part.a[k])]; if (o?.length) map[t] = o; });
+      }
+    }
+    optionsByLine.set(keyOf(l), map);
+  });
+  const apply = (l) => { const m = optionsByLine.get(keyOf(l)); if (m) l.options = { ...(l.options || {}), ...m }; };
+  await modify("docs", docId, (d) => {
+    const p = d.pages.find((x) => x.id === pageId);
+    if (!p) return false;
+    p.lines.forEach(apply);
+    p.optionsProgress = null;
+  });
+  const live = state.doc?.id === docId && state.doc.pages.find((p) => p.id === pageId);
+  if (live) { live.lines.forEach(apply); live.optionsProgress = null; renderPageSoon(live); }
+}
+
+/** Up to 5 other readings for one word: the check's reading, abbreviations, Gemini's options, real words one letter away. */
+function optionsFor(line, word) {
+  const out = [];
+  const add = (w, why) => { if (w !== undefined && w !== word && !out.some((o) => o.text === w) && out.length < 5) out.push({ text: w, why }); };
+  const rank = (a) => (a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
+  for (const a of [...(line.alts || [])].sort((x, y) => rank(x) - rank(y))) if (a.word === word) add(a.alt, a.check ? "the word-by-word reading" : a.abbrev ? "abbreviation" : "a real word one letter away");
+  for (const w of line.options?.[word] || []) add(w, "Gemini's other reading");
+  if (lexicon?.size) for (const w of suggestWords(word, 5)) add(w, "a real word one letter away");
+  return out;
+}
+
+/** The menu for one word, right under it: its choices, ✓, and where it is in the handwriting. */
+async function openWordMenu(page, line, row, img, at) {
   document.querySelector(".popover")?.remove();
-  const word = mark.textContent;
+  row.querySelectorAll(".word-box").forEach((b) => { b.hidden = true; });
+  const ed = row.querySelector(".line-edit");
+  const text = ed.innerText.replace(/\n/g, " ");
+  const count = text.split(/\s+/).filter(Boolean).length;
+  const word = at.word;
+  // Show where the word is in the picture.
+  const box = row.querySelector(".word-box");
+  if (box) wordSpot(page, line, at.index, count, text).then((spot) => {
+    if (!spot || !box.isConnected) return;
+    box.style.right = `${(1 - spot.right) * 100}%`; box.style.width = `${(spot.right - spot.left) * 100}%`; box.hidden = false;
+  }).catch(() => {});
   const pop = document.createElement("div");
   pop.className = "popover"; pop.dir = "rtl";
-  const settle = (phrase, replacement) => {
-    if (replacement !== null) line.text = replaceTokens(line.text, phrase, replacement);
-    const gone = phrase.split(" ");
-    line.alts = (line.alts || []).filter((x) => x.word !== phrase && findTokens(line.text, x.word) >= 0);
-    line.unclear = line.unclear.filter((u) => !gone.includes(u) && line.text.split(/\s+/).includes(u));
+  const flagged = line.unclear.includes(word);
+  const settle = (replacement) => {
+    line.text = replacement === null ? text : replaceTokenAt(text, at.index, replacement);
+    line.alts = (line.alts || []).filter((x) => x.word !== word && findTokens(line.text, x.word) >= 0);
+    line.unclear = line.unclear.filter((u) => u !== word && line.text.split(/\s+/).includes(u));
     pop.remove();
     scheduleSave(page);
     row.replaceWith(lineRow(page, line, img));
   };
-  for (const a of choicesFor(line, word)) {
+  const opts = optionsFor(line, word);
+  for (const o of opts) {
     const b = document.createElement("button");
-    b.className = "alt";
-    b.textContent = a.alt ? a.alt + (a.picked ? " ★" : "") : "✕";
-    b.title = a.alt ? `Use «${a.alt}»` : `Remove «${a.word}»`;
-    b.onclick = (e) => { e.stopPropagation(); settle(a.word, a.alt); };
+    b.className = "alt"; b.textContent = o.text || "✕"; b.title = o.text ? `Use «${o.text}» (${o.why})` : `Remove «${word}»`;
+    b.onmousedown = (e) => e.preventDefault(); // keep the caret where it is
+    b.onclick = (e) => { e.stopPropagation(); settle(o.text); };
     pop.append(b);
   }
-  const keep = document.createElement("button");
-  keep.className = "keep"; keep.textContent = "✓"; keep.title = `«${word}» is right`;
-  keep.onclick = (e) => { e.stopPropagation(); settle(word, null); };
-  pop.append(keep);
+  if (flagged || !opts.length) {
+    const keep = document.createElement("button");
+    keep.className = "keep"; keep.textContent = "✓"; keep.title = `«${word}» is right`;
+    keep.onmousedown = (e) => e.preventDefault();
+    keep.onclick = (e) => { e.stopPropagation(); settle(null); };
+    pop.append(keep);
+  }
+  // Position: under the word.
+  const r = document.createRange();
+  const walker = document.createTreeWalker(ed, NodeFilter.SHOW_TEXT);
+  let pos = 0, startNode = null, startOff = 0, endNode = null, endOff = 0;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const len = n.textContent.length;
+    if (!startNode && at.start <= pos + len) { startNode = n; startOff = at.start - pos; }
+    if (startNode && at.end <= pos + len) { endNode = n; endOff = at.end - pos; break; }
+    pos += len;
+  }
   row.style.position = "relative";
-  const r = mark.getBoundingClientRect(), base = row.getBoundingClientRect();
-  pop.style.top = `${r.bottom - base.top + 4}px`;
-  pop.style.right = `${Math.max(0, base.right - r.right)}px`;
+  const base = row.getBoundingClientRect();
+  let rect = ed.getBoundingClientRect();
+  if (startNode && endNode) { r.setStart(startNode, startOff); r.setEnd(endNode, endOff); rect = r.getBoundingClientRect(); }
+  pop.style.top = `${rect.bottom - base.top + 4}px`;
+  pop.style.right = `${Math.max(0, base.right - rect.right)}px`;
   row.append(pop);
   const close = (e) => {
-    if (e.type === "keydown" ? e.key === "Escape" || e.key.length === 1 || e.key === "Backspace" : !pop.contains(e.target) && e.target !== mark) {
-      pop.remove(); document.removeEventListener("mousedown", close, true); document.removeEventListener("keydown", close, true);
+    const typing = e.type === "keydown" && (e.key === "Escape" || e.key.length === 1 || e.key === "Backspace" || e.key === "Delete");
+    if (typing || (e.type === "mousedown" && !pop.contains(e.target) && !ed.contains(e.target))) {
+      pop.remove(); box && (box.hidden = true);
+      document.removeEventListener("mousedown", close, true); document.removeEventListener("keydown", close, true);
     }
   };
   setTimeout(() => { document.addEventListener("mousedown", close, true); document.addEventListener("keydown", close, true); }, 0);
@@ -2102,7 +2277,7 @@ navigator.storage?.persist?.().catch(() => {});
 async function resumeUnfinished() {
   for (const d of await getAll("docs")) {
     // A word check that was running when the window closed isn't resumed; its highlights are optional.
-    if (d.pages.some((p) => p.checking)) await modify("docs", d.id, (x) => { x.pages.forEach((p) => { p.checking = null; }); });
+    if (d.pages.some((p) => p.checking || p.optionsProgress)) await modify("docs", d.id, (x) => { x.pages.forEach((p) => { p.checking = null; p.optionsProgress = null; }); });
     const ids = d.pages.filter((p) => (p.status === "queued" || p.status === "working") && !active.has(p.id)).map((p) => p.id);
     if (!ids.length) continue;
     await modify("docs", d.id, (x) => { for (const p of x.pages) if (ids.includes(p.id)) Object.assign(p, { status: "queued", draft: null, words: null, checking: null }); });
