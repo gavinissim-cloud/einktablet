@@ -30,7 +30,9 @@ check("clicking a word shows its other reading", c1.includes("כשנאנס") && 
 const c2 = await choicesOf(page, 3, "בתשלומי׳");
 check("the writer's own spelling is one click away", c2.includes("במזנותיה"), JSON.stringify(c2));
 check("missing comma highlighted", m1.includes("לכולם,"), JSON.stringify(m1));
-check("at most 5 choices per word (plus ✓)", (await Promise.all(m3.map((w) => choicesOf(page, 3, w)))).every((c) => c.length <= 6));
+const all = [];
+for (const w of m3) all.push(await choicesOf(page, 3, w));
+check("at most 5 choices per word (plus ✓)", all.every((c) => c.length <= 6), JSON.stringify(all));
 check("no page errors", errors.length === 0, errors.join("\n"));
 console.log(`editable after ${editableAfter.toFixed(1)}s with a fake reader answering in 0.4s; requests: ${JSON.stringify({ lines: stats.lines, words: stats.words, page: stats.page })}`);
 await page.screenshot({ path: `${S}/e2e/t1.png`, fullPage: true });
