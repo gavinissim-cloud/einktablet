@@ -11,43 +11,74 @@ await page.setInputFiles("#fileInput", `${S}/e2e/page.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Rivka"); await page.click(".dialog button[type=submit]");
 await allReady(page, stats);
 const ed = (i) => page.locator(".row .line-edit").nth(i);
+// Put the caret in word n (0 = first) of line box `loc` and click it.
+const clickWord = async (loc, n) => {
+  await loc.evaluate((el, n) => {
+    const text = el.textContent; let i = -1, start = 0;
+    for (const m of text.matchAll(/\S+/g)) if (++i === n) { start = m.index + 1; break; }
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT); let pos = 0, node, off = 0;
+    for (let t = walker.nextNode(); t; t = walker.nextNode()) { if (start <= pos + t.textContent.length) { node = t; off = start - pos; break; } pos += t.textContent.length; }
+    const r = document.createRange(); r.setStart(node, off); r.collapse(true);
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  }, n);
+  await loc.dispatchEvent("click");
+  await page.waitForSelector(".popover");
+  await page.waitForTimeout(300);
+  return page.locator(".popover button").allTextContents();
+};
+const fixesOf = async () => (await dbDump(page)).writers.find((x) => x.name === "Rivka")?.memory?.fixes?.["הקגס"];
 check("read with the misreading", (await ed(4).innerText()).startsWith("הקגס"), await ed(4).innerText());
 // 1. pick the right word for the first הקגס from its menu
-await ed(4).evaluate((el) => { const r = document.createRange(); r.setStart(el.firstChild.nodeType === 3 ? el.firstChild : el.firstChild.firstChild, 1); r.collapse(true); const s = getSelection(); s.removeAllRanges(); s.addRange(r); });
-await ed(4).dispatchEvent("click");
-await page.waitForSelector(".popover");
-const opts = await page.locator(".popover button").allTextContents();
+const opts = await clickWord(ed(4), 0);
 check("the menu offers the right word", opts.includes("הקנס"), JSON.stringify(opts));
 await page.locator(".popover button", { hasText: /^הקנס$/ }).click();
 await page.waitForSelector(".toast", { timeout: 5000 }).catch(() => {});
 const toast = await page.locator(".toast").textContent().catch(() => "");
-check("the other «הקגס» in the document changed too, with a note", /Also changed «הקגס» to «הקנס» in 1 other place/.test(toast), toast);
+check("the other «הקגס» is only highlighted, with a note", /«הקגס» appears in 1 other place: highlighted, with «הקנס» as the first choice/.test(toast), toast);
 await page.waitForTimeout(800);
-check("both words corrected", (await ed(4).innerText()) === "הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.", await ed(4).innerText());
-let db = await dbDump(page);
-let w = db.writers.find((x) => x.name === "Rivka");
-check("remembered for this writer", w.memory?.fixes?.["הקגס"]?.to === "הקנס" && w.memory.fixes["הקגס"].count === 1, JSON.stringify(w.memory));
+check("…not changed by itself", (await ed(4).innerText()) === "הקנס אינו מובן: דצורת הקגס היא ד״ר ת״ת.", await ed(4).innerText());
+check("…but highlighted", (await marksOf(page, 4)).includes("הקגס"), JSON.stringify(await marksOf(page, 4)));
+let f = await fixesOf();
+check("remembered for this writer", f?.to === "הקנס" && f.count === 1, JSON.stringify(f));
+let w = (await dbDump(page)).writers.find((x) => x.name === "Rivka");
 check("the corrected word's picture kept for teaching", (w.wordExamples || []).length === 1 && w.wordExamples[0].crop, JSON.stringify((w.wordExamples || []).map((e) => e.text)));
-// 2. Undo puts the other one back
-await page.locator(".toast button", { hasText: "Undo" }).click();
+// 2. the other place: the correction is its first choice
+const opts2 = await clickWord(ed(4), 4);
+check("the other place offers the correction first", opts2[0] === "הקנס", JSON.stringify(opts2));
+await page.locator(".popover button.alt").first().click();
 await page.waitForTimeout(800);
-check("Undo restores the other place", (await ed(4).innerText()) === "הקנס אינו מובן: דצורת הקגס היא ד״ר ת״ת.", await ed(4).innerText());
-// 3. correct it again by typing
-await ed(4).click();
-await ed(4).fill("הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.");
-await page.locator("#docTitle").click(); // leave the line
-await page.waitForTimeout(1500);
-db = await dbDump(page);
-w = db.writers.find((x) => x.name === "Rivka");
-check("typing the correction is remembered too (twice now)", w.memory.fixes["הקגס"].count === 2, JSON.stringify(w.memory));
-// 4. a new page by the same writer: fixed automatically, and Gemini sees the corrected word
-const before = stats.raw.length;
+check("one click fixes it", (await ed(4).innerText()) === "הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.", await ed(4).innerText());
+f = await fixesOf();
+check("remembered twice now", f?.count === 2, JSON.stringify(f));
+// 3. a new page by the same writer, corrected twice so far: offered, not changed by itself
 await page.setInputFiles("#fileInput", `${S}/e2e/p1.png`);
 await page.waitForFunction(() => document.querySelectorAll(".page-head").length === 2);
 await allReady(page, stats, 2);
-const second = await page.locator("#pages > .card").nth(1).locator(".line-edit").nth(4).innerText();
-check("next page: the remembered correction applied by itself", second === "הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.", second);
-const marks = await page.locator("#pages > .card").nth(1).locator(".row").nth(4).locator("mark").allTextContents();
+const card2 = page.locator("#pages > .card").nth(1);
+const second = await card2.locator(".line-edit").nth(4).innerText();
+check("next page: not changed by itself after 2 corrections", second === "הקגס אינו מובן: דצורת הקגס היא ד״ר ת״ת.", second);
+const marks2 = await card2.locator(".row").nth(4).locator("mark").allTextContents();
+check("…highlighted", marks2.includes("הקגס"), JSON.stringify(marks2));
+const opts3 = await clickWord(card2.locator(".line-edit").nth(4), 0);
+check("…with the correction as the first choice", opts3[0] === "הקנס", JSON.stringify(opts3));
+await page.keyboard.press("Escape");
+// 4. correct it by typing (both words): now corrected 4 times
+const ed2 = card2.locator(".line-edit").nth(4);
+await ed2.click();
+await ed2.fill("הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.");
+await page.locator("#docTitle").click(); // leave the line
+await page.waitForTimeout(1500);
+f = await fixesOf();
+check("typing the correction is remembered too", f?.count === 4, JSON.stringify(f));
+// 5. a third page: now applied by itself, and Gemini sees the corrected word
+const before = stats.raw.length;
+await page.setInputFiles("#fileInput", `${S}/e2e/p2.png`);
+await page.waitForFunction(() => document.querySelectorAll(".page-head").length === 3);
+await allReady(page, stats, 3);
+const card3 = page.locator("#pages > .card").nth(2);
+const third = await card3.locator(".line-edit").nth(4).innerText();
+check("after 3+ corrections: applied by itself", third === "הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.", third);
+const marks = await card3.locator(".row").nth(4).locator("mark").allTextContents();
 check("…and highlighted, so it can be checked", marks.includes("הקנס"), JSON.stringify(marks));
 const lineReq = stats.raw.slice(before).find((r) => r.kind === "lines");
 check("Gemini is shown this writer's corrected words", lineReq && /How this writer writes words/.test(lineReq.raw) && /הקגס → הקנס/.test(lineReq.raw), lineReq ? "" : "no line request");
@@ -67,7 +98,7 @@ await page.waitForTimeout(500);
 await page.setInputFiles("#restoreInput", `${S}/e2e/memory-backup.json`);
 await page.click(".dialog button[type=submit]"); await page.waitForTimeout(800); await page.click(".dialog button[type=submit]");
 const restored = (await dbDump(page)).writers.find((x) => x.name === "Rivka");
-check("memory and word pictures survive backup and restore", restored?.memory?.fixes?.["הקגס"]?.count === 2 && restored.wordExamples?.length >= 1 && restored.wordExamples.every((e) => e.crop), JSON.stringify(restored?.memory));
+check("memory and word pictures survive backup and restore", restored?.memory?.fixes?.["הקגס"]?.count === 4 && restored.wordExamples?.length >= 1 && restored.wordExamples.every((e) => e.crop), JSON.stringify(restored?.memory));
 check("no page errors", errors.length === 0, errors.join("\n"));
 await browser.close();
 process.exit(done() ? 0 : 1);

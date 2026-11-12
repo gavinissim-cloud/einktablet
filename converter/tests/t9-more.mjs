@@ -34,6 +34,28 @@ db = await dbDump(page);
 check("split line not learned as an example", db.writers[0].examples.length === before, `${before} -> ${db.writers[0].examples.length}`);
 await page.click("#viewLines"); await page.waitForSelector(".row .line-edit");
 
+// a redraw that arrives while the person types waits, and still happens after moving to another
+// line of the same page and then leaving the page
+const eds = page.locator("#pages > .card").first().locator(".line-edit");
+await eds.nth(1).click();
+await page.evaluate(() => { const p = state.doc.pages[0]; p.lines[3].text = "שורה שהשתנתה ברקע"; renderPageSoon(p); });
+await eds.nth(2).click();
+await page.waitForTimeout(700);
+check("no redraw while typing in the page", (await eds.nth(3).innerText()) !== "שורה שהשתנתה ברקע");
+await page.locator("#docTitle").click();
+await page.waitForTimeout(700);
+check("redrawn once the person leaves the page", (await eds.nth(3).innerText()) === "שורה שהשתנתה ברקע", await eds.nth(3).innerText());
+
+// a word menu closes when the line changes in any way (pasting, a tablet keyboard), so a stale
+// choice can't overwrite it
+await eds.nth(0).evaluate((el) => { const r = document.createRange(); r.setStart(el.firstChild.nodeType === 3 ? el.firstChild : el.firstChild.firstChild, 1); r.collapse(true); const s = getSelection(); s.removeAllRanges(); s.addRange(r); });
+await eds.nth(0).dispatchEvent("click");
+await page.waitForSelector(".popover");
+await eds.nth(0).evaluate((el) => { el.append(" הדבקה"); el.dispatchEvent(new InputEvent("input", { bubbles: true })); });
+check("the menu closes when the line changes", (await page.locator(".popover").count()) === 0);
+await page.locator("#docTitle").click();
+await page.waitForTimeout(500);
+
 // browser Back and Forward
 await page.click("#backHome");
 await page.waitForSelector("#home:not([hidden])");

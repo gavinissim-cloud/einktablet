@@ -66,6 +66,20 @@ check("at most 5 choices", opts2.filter((o) => o !== "✓").length <= 5, JSON.st
 check("options requested in the background once", stats.options >= 1, JSON.stringify(stats));
 const db = await dbDump(page);
 check("options saved", Object.keys(db.docs[0].pages[0].lines[0].options || {}).length >= 5, JSON.stringify(db.docs[0].pages[0].lines[0].options));
+// The marked spot when the ink groups don't match the words one to one (right to left, page units).
+const spots = await page.evaluate(() => {
+  const B = (r, l) => ({ right: r, left: l });
+  const words = ["שלום", "לכולם", "היום", "נלמד", "על"];
+  // the 2nd and 3rd words written close together: one group
+  const merged = [B(900, 800), B(780, 560), B(540, 440), B(420, 380)];
+  // the 3rd word written with a wide gap inside it: two groups
+  const split = [B(900, 800), B(780, 670), B(650, 620), B(610, 560), B(540, 440), B(420, 380)];
+  const pick = (boxes, i) => { const b = matchWordToBoxes(boxes, words, i); return [Math.round(b.right), Math.round(b.left)]; };
+  return { m1: pick(merged, 1), m2: pick(merged, 2), m3: pick(merged, 3), m4: pick(merged, 4), s2: pick(split, 2), s3: pick(split, 3), s4: pick(split, 4) };
+});
+check("word spot: two words in one ink group are each marked in their own part", spots.m1[0] === 780 && spots.m1[1] > 640 && spots.m1[1] < 700 && spots.m2[1] === 560 && spots.m2[0] < 700 && spots.m2[0] > 640, JSON.stringify(spots));
+check("word spot: the words after the merged group are not shifted", spots.m3.join() === "540,440" && spots.m4.join() === "420,380", JSON.stringify(spots));
+check("word spot: a word in two ink groups is marked whole, and the next ones not shifted", spots.s2.join() === "650,560" && spots.s3.join() === "540,440" && spots.s4.join() === "420,380", JSON.stringify(spots));
 check("no page errors", errors.length === 0, errors.join("\n"));
 await clickWord(2);
 await page.locator(".row").first().screenshot({ path: `${S}/e2e/t10.png` });

@@ -451,7 +451,8 @@ function inkMap(src, width) {
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W;) {
       if (!ink[y * W + x]) { x++; continue; }
-      let e = x; while (e < W && (ink[y * W + e] || ink[y * W + e + 1] || ink[y * W + e + 2] || ink[y * W + e + 3])) e++;
+      const row = y * W, at = (k) => k < W && ink[row + k];
+      let e = x; while (e < W && (at(e) || at(e + 1) || at(e + 2) || at(e + 3))) e++;
       if (e - x > long) for (let k = x; k < e; k++) ink[y * W + k] = 0;
       x = e + 1;
     }
@@ -647,11 +648,15 @@ const EXACT_SCHEMA = {
 const MAX_REQUESTS = 10;
 let inFlight = 0; const waiting = [], waitingLow = [];
 // Reading the lines a person is waiting for goes first; background word checks wait their turn.
-let lowPriority = false;
+// A freed slot is handed straight to the next waiting request (counted for it already), so no
+// newcomer can slip in between and go over the limit.
 async function withSlot(fn, low = false) {
   if (inFlight >= MAX_REQUESTS || (low && waiting.length)) await new Promise((r) => (low ? waitingLow : waiting).push(r));
-  inFlight++;
-  try { return await fn(); } finally { inFlight--; (waiting.shift() || waitingLow.shift())?.(); }
+  else inFlight++;
+  try { return await fn(); } finally {
+    const next = waiting.shift() || waitingLow.shift();
+    if (next) next(); else inFlight--;
+  }
 }
 let thinkingRejected = new Set(); // models that refused a thinking setting once
 
@@ -957,6 +962,7 @@ function fixAbbreviations(l) {
     const hit = abbrevTable.get(core);
     if (!hit) return;
     const abbr = p.pre + hebrewMarks(hit.abbr) + p.post;
+    if (abbr === t || hebrewMarks(p.core) === hebrewMarks(hit.abbr)) return; // already read with its mark
     const readRank = lexicon.get(core);
     if (readRank === undefined || readRank > hit.rank * 50) {
       // What was read is not a word, or a rare one next to a very common abbreviation.
@@ -1032,7 +1038,7 @@ function suggestVisual(w, max = 5, prefer = null) {
     if (core[i] === v) consider(core.slice(0, i) + core.slice(i + 1), 0.5); // or added
   }
   const back = (c) => (/[\u05f3\u05f4]/.test(w) ? c.replace(/"/g, "\u05f4").replace(/'/g, "\u05f3") : c);
-  return [...found].sort((a, b) => a[1] - b[1]).slice(0, max).map(([c]) => p.pre + back(c) + p.post).filter(() => !marks || true);
+  return [...found].sort((a, b) => a[1] - b[1]).slice(0, max).map(([c]) => p.pre + back(c) + p.post);
 }
 
 function suggestWords(w, max = 2) {
@@ -1135,6 +1141,7 @@ async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thi
   const order = lines.map((_, i) => i);
   for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
   const out = new Array(lines.length).fill(null);
+  out.answered = new Set(); // lines whose request came back (an entry may still be missing: nothing written)
   const batches = [];
   for (let i = 0; i < order.length; i += group) batches.push(order.slice(i, i + group));
   let failures = 0;
@@ -1150,6 +1157,7 @@ async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thi
     }
     try {
       const res = await askJson(parts, EXACT_SCHEMA, thinking);
+      for (const idx of batch) out.answered.add(idx);
       for (const r of res.lines || []) {
         const idx = batch[Number(r.image) - 1];
         if (idx === undefined || typeof r.text !== "string") continue;
@@ -1250,7 +1258,8 @@ async function readPage(doc, page, onStep) {
     const missing = read ? read.map((r, i) => (r ? null : i)).filter((i) => i !== null) : [];
     if (missing.length) {
       const again = await readLinesExactly(bitmap, missing.map((i) => boxes[i]), known, { group: 1, thinking: lineThinking() }).catch(() => []);
-      missing.forEach((i, k) => { if (again[k]) read[i] = again[k]; });
+      // A line still without an entry although Gemini answered for it has nothing readable on it.
+      missing.forEach((i, k) => { if (again[k]) read[i] = again[k]; else if (again.answered?.has(k)) read[i] = { text: "", unclear: [] }; });
     }
     if (read && read.every(Boolean)) {
       // A line answered with nothing stays (empty, flagged) next to its picture, never silently dropped.
@@ -1280,11 +1289,29 @@ async function readPage(doc, page, onStep) {
  * two readings differ are highlighted, with the other reading one click away.
  * Lines the person already edited are left alone. Runs in the background.
  */
-async function checkWords(docId, pageId) {
+/** Change a page only if it is still the same reading (not read again meanwhile). */
+async function updateSameRead(docId, pageId, readId, patch) {
+  const saved = await modify("docs", docId, (d) => {
+    const p = d.pages.find((x) => x.id === pageId);
+    if (!p || p.readId !== readId) return false;
+    Object.assign(p, patch);
+  });
+  const live = saved && state.doc?.id === docId && state.doc.pages.find((p) => p.id === pageId);
+  if (live && live.readId === readId) { Object.assign(live, patch); refreshLabel(live); }
+}
+/** The word check; false when the page was read again meanwhile. "Checking…" always ends with it. */
+async function checkWords(docId, pageId, readId) {
+  try {
+    return await checkWordsOnce(docId, pageId, readId);
+  } finally {
+    await updateSameRead(docId, pageId, readId, { checking: null }).catch(() => {});
+  }
+}
+async function checkWordsOnce(docId, pageId, readId) {
   const doc = await getOne("docs", docId);
   const page = doc?.pages.find((p) => p.id === pageId);
-  if (!page || page.status !== "done" || !page.lines.length) return;
-  const readId = page.readId;
+  if (!page || page.readId !== readId) return false;
+  if (page.status !== "done" || !page.lines.length) return true;
   const bitmap = await loadBitmap(page.image);
   const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
   const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
@@ -1292,24 +1319,22 @@ async function checkWords(docId, pageId) {
   let byWord, finished = false, writes = Promise.resolve();
   try {
     byWord = await readWordsExactly(bitmap, lines, known, (done, total) => {
-      if (done < total) writes = writes.then(() => (finished ? null : updatePage(docId, pageId, { checking: { done, total } }, { quiet: true }))).catch(() => {});
+      if (done < total) writes = writes.then(() => (finished ? null : updateSameRead(docId, pageId, readId, { checking: { done, total } }))).catch(() => {});
     }, true);
   } catch (e) {
     console.warn("The word check couldn't run:", e);
     finished = true; await writes;
-    return updatePage(docId, pageId, { checking: null }, { quiet: true });
+    return true;
   }
   finished = true;
   await writes; // no progress may land after the result
-  const short = (t) => t.length <= 3;
-  // The word-by-word reading wins (a word made up from the sentence is replaced by what the letters
-  // say); wherever the readings differ the word is highlighted, with the line reading one click away.
-  // The word-by-word reading replaces a word only when it found a real word (in the word list)
-  // and the line reading didn't, or both are real words that differ (a word made up from the
+  // Wherever the two readings differ the word is highlighted, with the other reading one click away.
+  // The word-by-word reading replaces a word only when it found a real word (in the word list):
+  // when the line reading isn't one, or both are real words that differ (a word made up from the
   // sentence). When the word-by-word reading isn't a real word, the line reading stays: reading a
   // word alone loses the help of its neighbours, and its misreadings shouldn't overrule a good line.
   const real = (w) => !w.includes("□") && (!lexicon?.size || isKnownWord(w));
-  const pick = (litW, lineW) => (real(litW) || !real(lineW) ? litW : lineW);
+  const pick = (litW, lineW) => (real(litW) ? litW : lineW);
   const mergeFor = (line, e) => {
     const lit = e.text.split(/\s+/).filter(Boolean), rd = line.ai.split(/\s+/).filter(Boolean);
     const parts = alignWords(lit, rd);
@@ -1327,7 +1352,7 @@ async function checkWords(docId, pageId) {
         part.a.forEach((litW, k) => { const lineW = part.b[k], c = pick(litW, lineW); words.push(c); offer(c, c === litW ? lineW : litW); });
       } else if (part.a.length && part.b.length) {
         const litPhrase = part.a.join(" "), linePhrase = part.b.join(" ");
-        const useLit = part.a.every(real) || !part.b.every(real);
+        const useLit = part.a.every(real);
         const chosen = useLit ? part.a : part.b;
         words.push(...chosen);
         chosen.forEach((w) => flagged.add(w));
@@ -1368,13 +1393,14 @@ async function checkWords(docId, pageId) {
     p.lines.forEach((l) => apply(l, results.get(keyOf(l))));
     p.checking = null;
   });
-  if (!saved) return;
+  if (!saved) return false;
   const live = state.doc?.id === docId && state.doc.pages.find((p) => p.id === pageId);
   if (live && live.readId === readId) {
     live.lines.forEach((l) => apply(l, results.get(keyOf(l))));
     live.checking = null;
     renderPageSoon(live);
   }
+  return true;
 }
 
 /** Align two word lists: [{a: [...], b: [...]}], equal stretches have a and b the same. */
@@ -1435,9 +1461,9 @@ async function runJob({ docId, pageId }) {
     const lines = await readPage(doc, page, (step, draft) => updatePage(docId, pageId, { step, ...(draft ? { draft } : {}) }));
     await updatePage(docId, pageId, { status: "done", lines, draft: null, step: 0, checking: { done: 0, total: 0 }, readSeconds: Math.round((Date.now() - started) / 1000) });
     // The page is ready to edit; the word check adds its highlights in the background.
-    checkWords(docId, pageId)
-      .catch((e) => console.warn("Word check failed:", e))
-      .then(() => autoWordOptions() && fetchWordOptions(docId, pageId))
+    checkWords(docId, pageId, readId)
+      .catch((e) => { console.warn("Word check failed:", e); return true; })
+      .then((current) => current !== false && autoWordOptions() && fetchWordOptions(docId, pageId))
       .catch((e) => console.warn("Word options failed:", e));
   } catch (e) {
     console.error(e);
@@ -1541,7 +1567,10 @@ async function showDoc(id) {
   renderPages(); updateDocStatus();
 }
 
+let writerUrls = [];
+const writerUrl = (blob) => { const u = URL.createObjectURL(blob); writerUrls.push(u); return u; };
 async function showWriter(id) {
+  writerUrls.forEach((u) => URL.revokeObjectURL(u)); writerUrls = [];
   const w = await getOne("writers", id);
   if (!w) return showHome();
   state.doc = null; show("writerView");
@@ -1557,11 +1586,11 @@ async function showWriter(id) {
   const fixes = Object.entries(writerMemory(w).fixes).sort((a, b) => b[1].count - a[1].count || (b[1].at || "").localeCompare(a[1].at || ""));
   if (fixes.length) {
     const head = document.createElement("div"); head.className = "pad"; head.style.borderTop = "1px solid var(--line)";
-    head.innerHTML = `<b>Remembered corrections</b> <span class="muted">— applied by itself on ${esc(w.name)}'s next pages (highlighted so you can check it), except that a common word is only changed after the same correction 3 times (until then it is offered first).</span>`;
+    head.innerHTML = `<b>Remembered corrections</b> <span class="muted">— offered as the first choice wherever the misreading comes up again (highlighted); after the same correction ${AUTO_FIX_COUNT} times it is applied by itself on ${esc(w.name)}'s next pages (still highlighted, so you can check it).</span>`;
     list.append(head);
     for (const [from, f] of fixes) {
       const row = document.createElement("div"); row.className = "example";
-      const auto = isCommonWord(from) ? f.count >= 3 : true;
+      const auto = f.count >= AUTO_FIX_COUNT;
       row.innerHTML = `<div class="he"><span class="muted">${esc(from)}</span> → <b>${esc(f.to)}</b></div><div class="muted">${auto ? "applied by itself" : "offered first"} · corrected ${f.count}×</div>`;
       const b = document.createElement("button"); b.className = "secondary"; b.textContent = "Forget";
       b.onclick = async () => { await modify("writers", id, (x) => { if (x.memory?.fixes) delete x.memory.fixes[from]; }); showWriter(id); };
@@ -1575,7 +1604,7 @@ async function showWriter(id) {
     for (const e of w.wordExamples.slice(0, 60)) {
       if (!(e.crop instanceof Blob)) continue;
       const row = document.createElement("div"); row.className = "example";
-      const img = document.createElement("img"); img.src = URL.createObjectURL(e.crop);
+      const img = document.createElement("img"); img.src = writerUrl(e.crop);
       const txt = document.createElement("div"); txt.className = "he"; txt.innerHTML = `${esc(e.text)}${e.misread ? `<div class="muted" style="font-size:13px">was read as: ${esc(e.misread)}</div>` : ""}`;
       const b = document.createElement("button"); b.className = "secondary"; b.textContent = "Forget";
       b.onclick = async () => { await modify("writers", id, (x) => { x.wordExamples = (x.wordExamples || []).filter((y) => y.id !== e.id); }); showWriter(id); };
@@ -1588,8 +1617,9 @@ async function showWriter(id) {
     list.append(head);
   }
   for (const e of ex.slice(0, 200)) {
+    if (!(e.crop instanceof Blob)) continue;
     const row = document.createElement("div"); row.className = "example line-example";
-    const img = document.createElement("img"); img.src = URL.createObjectURL(e.crop);
+    const img = document.createElement("img"); img.src = writerUrl(e.crop);
     const txt = document.createElement("div"); txt.className = "he";
     txt.innerHTML = `${esc(e.text)}<div class="muted" style="font-size:13px">first read as: ${esc(e.ai)}</div>`;
     const b = document.createElement("button"); b.className = "secondary"; b.textContent = "Forget";
@@ -1671,17 +1701,22 @@ function refreshLabel(page) {
   if (st) fillLabel(st, page);
 }
 /** Redraw a page, but not while the person is typing in it (then right after they leave it). */
+const typingIn = (id) => {
+  const el = document.getElementById("page-" + id), a = document.activeElement;
+  return !!(el && a && el.contains(a) && a.matches("textarea, [contenteditable]"));
+};
+const pendingRedraw = new Set();
 function renderPageSoon(page) {
-  const el = document.getElementById("page-" + page.id);
-  if (el && el.contains(document.activeElement) && document.activeElement.matches("textarea, [contenteditable]")) {
-    if (!el._pending) {
-      el._pending = true;
-      el.addEventListener("focusout", () => setTimeout(() => {
-        if (el.contains(document.activeElement)) return renderPageSoon(page);
-        el._pending = false;
+  if (typingIn(page.id)) {
+    if (!pendingRedraw.has(page.id)) {
+      pendingRedraw.add(page.id);
+      const wait = () => {
+        if (typingIn(page.id)) return setTimeout(wait, 250);
+        pendingRedraw.delete(page.id);
         const live = state.doc?.pages.find((p) => p.id === page.id);
-        if (live) renderPage(live);
-      }, 0), { once: true });
+        if (live && document.getElementById("page-" + page.id)) renderPage(live);
+      };
+      setTimeout(wait, 250);
     }
     refreshLabel(page); // the status text still updates while they type
     return;
@@ -1702,7 +1737,7 @@ async function renderPage(page) {
   const view = document.createElement("button"); view.className = "secondary"; view.textContent = "View page";
   view.onclick = () => openLightbox(URL.createObjectURL(page.image));
   head.append(view);
-  if (page.status === "done" && !page.optionsProgress) {
+  if (page.status === "done" && !page.optionsProgress && !page.checking) {
     const more = document.createElement("button"); more.className = "secondary"; more.textContent = "More word options";
     more.title = "For pages that need a lot of editing: Gemini gives its 5 best readings of every word (takes a little while; you can keep editing)";
     more.onclick = async () => {
@@ -1792,7 +1827,14 @@ function lineRow(page, line, img) {
   if (ed.contentEditable !== "plaintext-only") ed.contentEditable = "true";
   ed.innerHTML = highlight(line.text, doubtful());
   let typed = false;
-  ed.oninput = () => { line.text = ed.innerText.replace(/\n/g, " "); typed = true; scheduleSave(page); };
+  ed.oninput = () => {
+    // A pasted line break or an emptied box can leave <br>/<div>: kept as plain text.
+    if (ed.querySelector("br, div")) {
+      ed.textContent = ed.innerText.replace(/\n+/g, " ").replace(/^ $/, "");
+      const r = document.createRange(); r.selectNodeContents(ed); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    }
+    line.text = ed.textContent.replace(/\n/g, " "); typed = true; scheduleSave(page);
+  };
   ed.onkeydown = (e) => {
     if (e.key !== "Enter") return;
     e.preventDefault(); // one box per handwritten line: Enter goes to the next line
@@ -1800,8 +1842,9 @@ function lineRow(page, line, img) {
     if (next) { next.focus(); const r = document.createRange(); r.selectNodeContents(next); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); }
   };
   const textBefore = line.text;
-  ed.onblur = () => {
-    if (!typed) return;
+  // What the person typed is learned once they are done with the line.
+  ed._commit = () => {
+    if (!typed) return false;
     typed = false;
     line.text = line.text.replace(/\s+/g, " ").trim();
     let idx = 0;
@@ -1811,7 +1854,14 @@ function lineRow(page, line, img) {
     }
     line.unclear = doubtful();
     line.alts = (line.alts || []).filter((a) => findTokens(line.text, a.word) >= 0);
-    row.replaceWith(lineRow(page, line, img)); // fresh highlights and choices
+    return true;
+  };
+  ed.onblur = () => {
+    // Switching to another window isn't leaving the line: the person comes back to it.
+    if (!document.hasFocus() || document.activeElement === ed) return;
+    if (!ed._commit()) return;
+    // Redrawn after the focus has moved on (fresh highlights and choices).
+    setTimeout(() => { if (row.isConnected) row.replaceWith(lineRow(page, line, img)); }, 0);
   };
   row.append(ed);
   if (line.empty && !line.text) {
@@ -1839,12 +1889,11 @@ function caretToken(ed) {
   const sel = getSelection();
   if (!sel.rangeCount || !ed.contains(sel.anchorNode)) return null;
   const r = document.createRange(); r.selectNodeContents(ed); r.setEnd(sel.anchorNode, sel.anchorOffset);
-  const offset = r.toString().length, text = ed.innerText;
-  let index = -1, pos = 0;
+  const offset = r.toString().length, text = ed.textContent;
+  let index = -1;
   for (const m of text.matchAll(/\S+/g)) {
     index++;
     if (offset <= m.index + m[0].length) { if (offset < m.index && index > 0) index--; return tokenAt(text, index); }
-    pos = m.index;
   }
   return index >= 0 ? tokenAt(text, index) : null;
 }
@@ -1881,16 +1930,65 @@ async function wordSpot(page, line, index, count, text) {
   const W = bitmap.width, H = bitmap.height, h = ((line.bottom - line.top) / 1000) * H;
   const x0 = Math.max(0, (line.left / 1000) * W - h * 0.05), x1 = Math.min(W, (line.right / 1000) * W + h * 0.05);
   const span = x1 - x0;
-  let box;
-  if (boxes.length === count) box = boxes[index];
-  else {
-    // By position in the text: the share of letters before the middle of this word, right to left.
-    const words = text.split(/\s+/).filter(Boolean), total = words.join("").length || 1;
-    const before = words.slice(0, index).join("").length + (words[index]?.length || 0) / 2;
-    const xr = boxes[0].right, xl = boxes.at(-1).left, at = xr - (before / total) * (xr - xl);
-    box = boxes.reduce((best, b) => (Math.abs((b.left + b.right) / 2 - at) < Math.abs((best.left + best.right) / 2 - at) ? b : best));
-  }
+  const box = matchWordToBoxes(boxes, text.split(/\s+/).filter(Boolean), index);
+  if (!box) return null;
   return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span, box };
+}
+
+/** How wide a written word is, roughly, in letters (marks and narrow letters count less). */
+function writtenWidth(w) {
+  let n = 0;
+  for (const ch of w) n += /["'׳״.,:;!?()\-־–]/.test(ch) ? 0.35 : /[יוןז]/.test(ch) ? 0.55 : 1;
+  return Math.max(0.5, n);
+}
+/**
+ * Which part of the line picture is word `index` of `words`. The picture's ink groups (boxes,
+ * right to left) don't always match the words one to one: two words written close together are
+ * one group, a word with a wide gap is two. Words and groups are matched in order so that their
+ * widths agree best (one group to several words, or several groups to one word).
+ */
+function matchWordToBoxes(boxes, words, index) {
+  const n = boxes.length, m = words.length;
+  if (!n || !m || index < 0 || index >= m) return null;
+  if (n === 1 && m === 1) return boxes[0];
+  const bw = boxes.map((b) => Math.max(1, b.right - b.left)), ww = words.map(writtenWidth);
+  const bTot = bw.reduce((a, b) => a + b, 0), wTot = ww.reduce((a, b) => a + b, 0);
+  const K = 4, INF = 1e18;
+  const cost = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(INF));
+  const from = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(null));
+  cost[0][0] = 0;
+  for (let i = 0; i <= n; i++) for (let j = 0; j <= m; j++) {
+    if (cost[i][j] === INF) continue;
+    // a boxes for b words, one of them 1
+    for (let a = 1; a <= K && i + a <= n; a++) for (let b = 1; b <= K && j + b <= m; b++) {
+      if (a > 1 && b > 1) continue;
+      let gb = 0, gw = 0;
+      for (let k = 0; k < a; k++) gb += bw[i + k];
+      for (let k = 0; k < b; k++) gw += ww[j + k];
+      const c = cost[i][j] + (gb / bTot - gw / wTot) ** 2 + (a > 1 || b > 1 ? 0.004 * (a + b - 2) : 0);
+      if (c < cost[i + a][j + b]) { cost[i + a][j + b] = c; from[i + a][j + b] = [i, j]; }
+    }
+  }
+  if (cost[n][m] === INF) {
+    // Can't be matched within limits: by position along the line.
+    const before = ww.slice(0, index).reduce((a, b) => a + b, 0) + ww[index] / 2;
+    const xr = boxes[0].right, xl = boxes.at(-1).left, at = xr - (before / wTot) * (xr - xl);
+    return boxes.reduce((best, b) => (Math.abs((b.left + b.right) / 2 - at) < Math.abs((best.left + best.right) / 2 - at) ? b : best));
+  }
+  for (let i = n, j = m; i > 0 || j > 0;) {
+    const [pi, pj] = from[i][j];
+    if (index >= pj && index < j) {
+      const group = boxes.slice(pi, i);
+      const left = Math.min(...group.map((b) => b.left)), right = Math.max(...group.map((b) => b.right));
+      if (j - pj === 1) return { ...group[0], left, right };
+      // One ink group holds several words: this word's share of it, right to left.
+      const gw = ww.slice(pj, j).reduce((a, b) => a + b, 0);
+      const s = ww.slice(pj, index).reduce((a, b) => a + b, 0) / gw, e = s + ww[index] / gw;
+      return { ...group[0], right: right - s * (right - left), left: right - e * (right - left) };
+    }
+    i = pi; j = pj;
+  }
+  return null;
 }
 
 // ---------- Remembering corrections ----------
@@ -1908,6 +2006,10 @@ function isCommonWord(w) {
 // Gemini is shown the writer's corrected words to learn their letters.
 const MAX_WORD_EXAMPLES = 300;
 function writerMemory(w) { return w?.memory || { fixes: {}, vocab: {} }; }
+/** The remembered correction of `word` (own keys only: a word like "constructor" is not a fix). */
+function fixOf(memory, word) { return memory?.fixes && Object.hasOwn(memory.fixes, word) ? memory.fixes[word] : undefined; }
+/** A correction is applied by itself on new pages only once the person made it this often. */
+const AUTO_FIX_COUNT = 3;
 /** The person corrected `from` to `to` (word number `index` of the line, after the change). */
 async function rememberCorrection(page, line, index, from, to) {
   if (!from || !to || from === to || /\s/.test(to)) return;
@@ -1923,85 +2025,55 @@ async function rememberCorrection(page, line, index, from, to) {
   if (doc.writerId) {
     const saved = await modify("writers", doc.writerId, (w) => {
       const m = (w.memory ||= { fixes: {}, vocab: {} });
-      const prev = m.fixes[from];
+      const prev = fixOf(m, from);
       m.fixes[from] = { to, count: prev && prev.to === to ? prev.count + 1 : 1, at: new Date().toISOString() };
-      m.vocab[to] = (m.vocab[to] || 0) + 1;
+      // Changing it back (B to A after A to B) undoes the earlier correction, so they don't cycle.
+      if (fixOf(m, to)?.to === from) delete m.fixes[to];
+      m.vocab[to] = (Object.hasOwn(m.vocab, to) ? m.vocab[to] : 0) + 1;
       if (crop) {
         w.wordExamples = [{ id: uid(), text: to, misread: from, crop, at: new Date().toISOString() }, ...(w.wordExamples || [])].slice(0, MAX_WORD_EXAMPLES);
       }
     }).catch((e) => console.warn("Couldn't remember the correction:", e));
     if (saved && state.doc === doc) state.writer = saved;
   }
-  propagateCorrection(page, line, from, to);
+  if (state.doc === doc) propagateCorrection(page, line, from, to);
 }
 /**
- * The same misreading elsewhere in this document: when it isn't a real word it is fixed
- * everywhere (highlighted, can be undone); when it is a real word (it may be right in other
- * places) it is only highlighted there, with the correction as the first choice.
+ * The same misreading elsewhere in this document is highlighted, with the correction as its
+ * first choice: one click applies it. Nothing is changed by itself (it may be right there).
  */
 function propagateCorrection(srcPage, srcLine, from, to) {
-  const realWord = isCommonWord(from);
-  if (realWord) {
-    let n = 0;
-    for (const p of state.doc?.pages || []) {
-      if (p.status !== "done") continue;
-      let touched = false;
-      p.lines.forEach((l) => {
-        if (!l.text.split(/\s+/).includes(from)) return;
-        n += l.text.split(/\s+/).filter((t) => t === from).length;
-        l.unclear = [...new Set([...l.unclear, from])];
-        if (!(l.alts || []).some((a) => a.word === from && a.alt === to)) l.alts = [...(l.alts || []), { word: from, alt: to, memory: true }];
-        touched = true;
-      });
-      if (touched) { scheduleSave(p); renderPageSoon(p); }
-    }
-    if (n) showToast(`«${from}» appears in ${n} other place${n === 1 ? "" : "s"}: highlighted, with «${to}» as a choice.`);
-    return;
-  }
-  const changed = [];
+  let n = 0;
   for (const p of state.doc?.pages || []) {
     if (p.status !== "done") continue;
     let touched = false;
     p.lines.forEach((l) => {
-      const tokens = l.text.split(/\s+/).filter(Boolean);
-      let hit = false;
-      tokens.forEach((t, i) => { if (t === from) { tokens[i] = to; hit = true; changed.push({ page: p, line: l, index: i }); } });
-      if (!hit) return;
-      l.text = tokens.join(" ");
-      l.unclear = [...new Set([...l.unclear.filter((u) => u !== from), to])];
-      l.alts = [...(l.alts || []).filter((a) => a.word !== from), { word: to, alt: from, memory: true }];
+      const hits = l.text.split(/\s+/).filter((t) => t === from).length;
+      if (!hits) return;
+      n += hits;
+      l.unclear = [...new Set([...(l.unclear || []), from])];
+      l.alts = [...(l.alts || []).filter((a) => !(a.word === from && a.alt === to)), { word: from, alt: to, memory: true }];
       touched = true;
     });
     if (touched) { scheduleSave(p); renderPageSoon(p); }
   }
-  if (!changed.length) return;
-  const n = changed.length;
-  showToast(`Also changed «${from}» to «${to}» in ${n} other place${n === 1 ? "" : "s"} in this document.`, "Undo", () => {
-    // Exactly the places changed here (not the one the person corrected).
-    for (const { page, line, index } of changed) {
-      if (line.text.split(/\s+/).filter(Boolean)[index] !== to) continue; // edited since
-      line.text = replaceTokenAt(line.text, index, from);
-      if (!line.text.split(/\s+/).includes(to)) line.unclear = line.unclear.filter((u) => u !== to);
-      line.alts = (line.alts || []).filter((a) => !(a.memory && a.word === to));
-      scheduleSave(page); renderPageSoon(page);
-    }
-  });
+  if (n) showToast(`«${from}» appears in ${n} other place${n === 1 ? "" : "s"}: highlighted, with «${to}» as the first choice.`);
 }
 /** Apply what was learned from this writer's corrections to a freshly read line. */
 function applyMemory(l, writer) {
-  const fixes = writerMemory(writer).fixes;
-  if (!Object.keys(fixes).length) return l;
+  const memory = writerMemory(writer);
+  if (!Object.keys(memory.fixes).length) return l;
   const tokens = l.text.split(/\s+/).filter(Boolean);
   const unclear = new Set(l.unclear), alts = [...(l.alts || [])];
   let changed = false;
   tokens.forEach((t, i) => {
     const p = wordParts(t) || { pre: "", core: t, post: "" };
-    const f = fixes[t] || fixes[p.core];
+    const f = fixOf(memory, t) || fixOf(memory, p.core);
     if (!f || f.to === t) return;
-    const to = fixes[t] ? f.to : p.pre + f.to + p.post;
-    if (isCommonWord(t) ? f.count >= 3 : true) {
-      // What was read isn't a word and was corrected this way before, or a real word corrected
-      // the same way 3 times: fixed, highlighted.
+    const to = fixOf(memory, t) ? f.to : p.pre + f.to + p.post;
+    if (to === t) return;
+    if (f.count >= AUTO_FIX_COUNT) {
+      // Corrected the same way several times: fixed by itself, highlighted.
       tokens[i] = to; changed = true; unclear.add(to);
       alts.push({ word: to, alt: t, memory: true });
     } else {
@@ -2039,9 +2111,18 @@ const OPTIONS_SCHEMA = {
  * clicked. Optional and in the background, so normal reading stays fast.
  */
 async function fetchWordOptions(docId, pageId) {
+  let cleared = false;
+  try {
+    cleared = await fetchWordOptionsOnce(docId, pageId);
+  } finally {
+    // Never left showing "getting word options…" (that also hides the button to try again).
+    if (!cleared) await updatePage(docId, pageId, { optionsProgress: null }, { quiet: true }).catch(() => {});
+  }
+}
+async function fetchWordOptionsOnce(docId, pageId) {
   const doc = await getOne("docs", docId);
   const page = doc?.pages.find((p) => p.id === pageId);
-  if (!page || page.status !== "done") return;
+  if (!page || page.status !== "done") return true;
   const bitmap = await loadBitmap(page.image);
   const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
   const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
@@ -2061,10 +2142,10 @@ async function fetchWordOptions(docId, pageId) {
   for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
   await Promise.all(batches.map(async (batch) => {
     const parts = [...known, { text: `Below are ${batch.length} images, each ONE handwritten Hebrew word cut out of a page, in random order. For each image, give the 5 readings that its pen strokes most look like, most likely first: go letter by letter and consider the letters each stroke could be (handwriting look-alikes such as ד/ר/ך, ה/ח/ת, ו/ז/י/ן, ב/כ/פ, ס/ם, ג/נ, ט/מ, ע/צ/א), and marks like ״ ׳. Judge only by what the handwriting looks like, never by what would make sense. Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them. Each reading different. Answer with one entry per numbered image, using the number written just before it ("Image 1:" …); example lines shown earlier get no entry.` }];
-    for (const [k, it] of batch.entries()) {
-      parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)) } });
-    }
     try {
+      for (const [k, it] of batch.entries()) {
+        parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)) } });
+      }
       const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, true);
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
@@ -2082,9 +2163,10 @@ async function fetchWordOptions(docId, pageId) {
     const first = segs.map((o) => o?.[0] || "");
     if (segs.length === tokens.length) tokens.forEach((t, k) => { if (segs[k]?.length) map[t] = segs[k]; });
     else {
-      let ti = 0;
+      let ai = 0;
       for (const part of alignWords(first, tokens)) {
-        if (part.a.length === part.b.length) part.b.forEach((t, k) => { const o = segs[first.indexOf(part.a[k])]; if (o?.length) map[t] = o; });
+        if (part.a.length === part.b.length) part.b.forEach((t, k) => { const o = segs[ai + k]; if (o?.length) map[t] = o; });
+        ai += part.a.length;
       }
     }
     optionsByLine.set(keyOf(l), map);
@@ -2100,12 +2182,25 @@ async function fetchWordOptions(docId, pageId) {
   });
   const live = state.doc?.id === docId && state.doc.pages.find((p) => p.id === pageId);
   if (live) { live.lines.forEach(apply); live.optionsProgress = null; renderPageSoon(live); }
+  return true;
 }
 
+/** The writer's own words and this document's words (kept for a moment: clicks come quickly). */
+let preferCache = null;
+function preferredWords(except) {
+  const now = Date.now();
+  if (!preferCache || preferCache.doc !== state.doc || preferCache.writer !== state.writer || now - preferCache.at > 3000) {
+    const set = new Set(Object.keys(writerMemory(state.writer).vocab));
+    for (const p of state.doc?.pages || []) for (const l of p.lines || []) for (const t of l.text.split(/\s+/)) { const c = wordParts(t)?.core; if (c) set.add(c); }
+    preferCache = { doc: state.doc, writer: state.writer, at: now, set };
+  }
+  const out = new Set(preferCache.set); out.delete(except);
+  return out;
+}
 /** Up to 5 other readings for one word: the check's reading, abbreviations, Gemini's options, real words one letter away. */
 function optionsFor(line, word) {
   const out = [];
-  const remembered = writerMemory(state.writer).fixes[word];
+  const remembered = fixOf(writerMemory(state.writer), word);
   const add = (w, why) => { if (w !== undefined && w !== word && !out.some((o) => o.text === w) && out.length < 5) out.push({ text: w, why }); };
   if (remembered) add(remembered.to, "how you corrected this before");
   const rank = (a) => (a.memory ? -1 : a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
@@ -2116,35 +2211,39 @@ function optionsFor(line, word) {
   const real = (w) => !lexicon?.size || isKnownWord(w);
   for (const w of [...gem.filter(real), ...gem.filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
   // The writer's own words and the words of this document are preferred.
-  const prefer = new Set(Object.keys(writerMemory(state.writer).vocab));
-  for (const p of state.doc?.pages || []) for (const l of p.lines || []) for (const t of l.text.split(/\s+/)) { const c = wordParts(t)?.core; if (c && c !== word) prefer.add(c); }
-  for (const w of suggestVisual(word, 5, prefer)) add(w, "a real word with look-alike letters");
+  for (const w of suggestVisual(word, 5, preferredWords(word))) add(w, "a real word with look-alike letters");
   return out;
 }
 
 /** The menu for one word, right under it: its choices, ✓, and where it is in the handwriting. */
+let closeWordMenu = () => {};
 async function openWordMenu(page, line, row, img, at) {
+  closeWordMenu();
   document.querySelector(".popover")?.remove();
   row.querySelectorAll(".word-box").forEach((b) => { b.hidden = true; });
   const ed = row.querySelector(".line-edit");
-  const text = ed.innerText.replace(/\n/g, " ");
+  const text = ed.textContent.replace(/\n/g, " ");
   const count = text.split(/\s+/).filter(Boolean).length;
   const word = at.word;
   // Show where the word is in the picture.
   const box = row.querySelector(".word-box");
+  const tok = box ? (box._tok = (box._tok || 0) + 1) : 0;
   if (box) wordSpot(page, line, at.index, count, text).then((spot) => {
-    if (!spot || !box.isConnected) return;
+    if (!spot || !box.isConnected || box._tok !== tok || !pop.isConnected) return;
     box.style.right = `${(1 - spot.right) * 100}%`; box.style.width = `${(spot.right - spot.left) * 100}%`; box.hidden = false;
   }).catch(() => {});
   const pop = document.createElement("div");
   pop.className = "popover"; pop.dir = "rtl";
   const flagged = line.unclear.includes(word);
   const settle = (replacement) => {
+    // What was typed in this line before is learned first, then the choice is applied.
+    ed._commit?.();
+    if (ed.textContent.replace(/\n/g, " ") !== text) { closeWordMenu(); return; } // changed since: not applied
     line.text = replacement === null ? text : replaceTokenAt(text, at.index, replacement);
     if (replacement) rememberCorrection(page, line, at.index, word, replacement).catch(() => {});
     line.alts = (line.alts || []).filter((x) => x.word !== word && findTokens(line.text, x.word) >= 0);
     line.unclear = line.unclear.filter((u) => u !== word && line.text.split(/\s+/).includes(u));
-    pop.remove();
+    closeWordMenu();
     scheduleSave(page);
     row.replaceWith(lineRow(page, line, img));
   };
@@ -2181,13 +2280,19 @@ async function openWordMenu(page, line, row, img, at) {
   pop.style.right = `${Math.max(0, base.right - rect.right)}px`;
   row.append(pop);
   const close = (e) => {
-    const typing = e.type === "keydown" && (e.key === "Escape" || e.key.length === 1 || e.key === "Backspace" || e.key === "Delete");
-    if (typing || (e.type === "mousedown" && !pop.contains(e.target) && !ed.contains(e.target))) {
-      pop.remove(); box && (box.hidden = true);
-      document.removeEventListener("mousedown", close, true); document.removeEventListener("keydown", close, true);
-    }
+    const typing = e.type === "input" || (e.type === "keydown" && (e.key === "Escape" || e.key.length === 1 || e.key === "Backspace" || e.key === "Delete"));
+    if (typing || (e.type === "mousedown" && !pop.contains(e.target) && !ed.contains(e.target))) closeWordMenu();
   };
-  setTimeout(() => { document.addEventListener("mousedown", close, true); document.addEventListener("keydown", close, true); }, 0);
+  let armed = null;
+  closeWordMenu = () => {
+    pop.remove(); if (box) box.hidden = true;
+    clearTimeout(armed);
+    document.removeEventListener("mousedown", close, true); document.removeEventListener("keydown", close, true);
+    ed.removeEventListener("input", close);
+    closeWordMenu = () => {};
+  };
+  ed.addEventListener("input", close); // any change to the line (typing, pasting, a tablet keyboard)
+  armed = setTimeout(() => { document.addEventListener("mousedown", close, true); document.addEventListener("keydown", close, true); }, 0);
 }
 
 function highlight(text, unclear) {
