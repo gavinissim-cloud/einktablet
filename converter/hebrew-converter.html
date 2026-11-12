@@ -165,6 +165,8 @@ function chosenModel() { try { return localStorage.getItem("gemini_model") || AU
 // "careful": the strongest Pro model with deep thinking (slower, for very hard pages).
 function readMode() { try { return localStorage.getItem("read_mode") === "careful" ? "careful" : "fast"; } catch { return "fast"; } }
 function setReadMode(m) { try { localStorage.setItem("read_mode", m); } catch {} }
+// Gemini's 5 readings of every word, prepared in the background after a page is read.
+function autoWordOptions() { try { return localStorage.getItem("auto_options") !== "off"; } catch { return true; } }
 try {
   if (localStorage.getItem("settings_version") !== "2") {
     localStorage.removeItem("gemini_model"); // earlier versions chose the slow model by default
@@ -962,6 +964,49 @@ function isKnownWord(w) {
     lexicon.has(part) || lexicon.has(part.replace(/["']$/, "")));
 }
 /** Real words one letter away (a letter added, dropped, swapped or changed), most common first. */
+// Letters that look alike in Hebrew handwriting (print and cursive): a misreading usually swaps one
+// for another of the same group, adds or drops a ו or י, or confuses a final letter.
+const LOOKALIKE = ["וזין", "דרך", "החתק", "בכפ", "גנ", "טמ", "סם", "עצא", "קף", "שע", "לך", "פף", "צץ", "נן", "ומ"];
+const looksLike = (() => {
+  const m = new Map();
+  for (const g of LOOKALIKE) for (const a of g) for (const b of g) if (a !== b) { if (!m.has(a)) m.set(a, new Set()); m.get(a).add(b); }
+  return m;
+})();
+const toFinal = { כ: "ך", מ: "ם", נ: "ן", פ: "ף", צ: "ץ" };
+/**
+ * Real words the handwriting could also be read as: one letter swapped for a look-alike, a ו or י
+ * added or dropped, or two look-alike swaps in a longer word. Ranked by how alike the letters look,
+ * then by how common the word is. Used for the choices of a word.
+ */
+function suggestVisual(w, max = 5) {
+  const p = wordParts(w);
+  if (!p || /[\u05be\-–/]/.test(p.core) || !lexicon?.size) return [];
+  const core = p.core.replace(/["']/g, ""), marks = p.core !== core;
+  const found = new Map(); // word -> score (lower is better)
+  const consider = (c, score) => {
+    if (!c || c === core) return;
+    const fixed = toFinal[c.at(-1)] ? c.slice(0, -1) + toFinal[c.at(-1)] : c;
+    for (const x of new Set([c, fixed])) if (lexicon.has(x)) {
+      const sc = score + Math.log10(2 + lexicon.get(x)) / 4; // a little preference for common words
+      if (!found.has(x) || found.get(x) > sc) found.set(x, sc);
+    }
+  };
+  const swaps = (word, score, depth) => {
+    for (let i = 0; i < word.length; i++) for (const b of looksLike.get(word[i]) || []) {
+      const c = word.slice(0, i) + b + word.slice(i + 1);
+      consider(c, score);
+      if (depth > 1 && word.length >= 4) swaps(c, score + 1, depth - 1);
+    }
+  };
+  swaps(core, 0, 2);
+  for (let i = 0; i <= core.length; i++) for (const v of "וי") {
+    consider(core.slice(0, i) + v + core.slice(i), 0.5); // a ו or י the reading missed
+    if (core[i] === v) consider(core.slice(0, i) + core.slice(i + 1), 0.5); // or added
+  }
+  const back = (c) => (/[\u05f3\u05f4]/.test(w) ? c.replace(/"/g, "\u05f4").replace(/'/g, "\u05f3") : c);
+  return [...found].sort((a, b) => a[1] - b[1]).slice(0, max).map(([c]) => p.pre + back(c) + p.post).filter(() => !marks || true);
+}
+
 function suggestWords(w, max = 2) {
   const p = wordParts(w);
   if (!p || /[\u05be\-–/]/.test(p.core)) return [];
@@ -1004,7 +1049,7 @@ function addLexiconFlags(l) {
   const unclear = new Set(l.unclear), alts = [...(l.alts || [])];
   for (const w of unknown) {
     unclear.add(w);
-    for (const alt of suggestWords(w)) if (!alts.some((a) => a.word === w && a.alt === alt)) alts.push({ word: w, alt, dict: true });
+    for (const alt of suggestVisual(w, 2)) if (!alts.some((a) => a.word === w && a.alt === alt)) alts.push({ word: w, alt, dict: true });
   }
   l.unclear = [...unclear]; l.alts = alts;
   return l;
@@ -1020,7 +1065,7 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
     const unclear = new Set(line.unclear), alts = [...(line.alts || [])];
     for (const w of unknown) {
       unclear.add(w);
-      const sug = suggestWords(w);
+      const sug = suggestVisual(w, 3);
       sug.forEach((alt) => alts.push({ word: w, alt, dict: true }));
       const core = (t) => wordParts(t)?.core;
       const seg = segsPerLine?.[i]?.find((sg) => sg.box && sg.text.split(/\s+/).some((t) => t === w || (core(t) && core(t) === core(w))));
@@ -1207,15 +1252,18 @@ async function checkWords(docId, pageId) {
   const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
   const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
   const lines = page.lines;
-  let byWord;
+  let byWord, finished = false, writes = Promise.resolve();
   try {
     byWord = await readWordsExactly(bitmap, lines, known, (done, total) => {
-      if (done < total) updatePage(docId, pageId, { checking: { done, total } }, { quiet: true });
+      if (done < total) writes = writes.then(() => (finished ? null : updatePage(docId, pageId, { checking: { done, total } }, { quiet: true }))).catch(() => {});
     }, true);
   } catch (e) {
     console.warn("The word check couldn't run:", e);
+    finished = true; await writes;
     return updatePage(docId, pageId, { checking: null }, { quiet: true });
   }
+  finished = true;
+  await writes; // no progress may land after the result
   const short = (t) => t.length <= 3;
   // The word-by-word reading wins (a word made up from the sentence is replaced by what the letters
   // say); wherever the readings differ the word is highlighted, with the line reading one click away.
@@ -1349,7 +1397,10 @@ async function runJob({ docId, pageId }) {
     const lines = await readPage(doc, page, (step, draft) => updatePage(docId, pageId, { step, ...(draft ? { draft } : {}) }));
     await updatePage(docId, pageId, { status: "done", lines, draft: null, step: 0, checking: { done: 0, total: 0 }, readSeconds: Math.round((Date.now() - started) / 1000) });
     // The page is ready to edit; the word check adds its highlights in the background.
-    checkWords(docId, pageId).catch((e) => console.warn("Word check failed:", e));
+    checkWords(docId, pageId)
+      .catch((e) => console.warn("Word check failed:", e))
+      .then(() => autoWordOptions() && fetchWordOptions(docId, pageId))
+      .catch((e) => console.warn("Word options failed:", e));
   } catch (e) {
     console.error(e);
     await updatePage(docId, pageId, { status: "error", draft: null, checking: null, error: e.message || String(e) });
@@ -1787,13 +1838,14 @@ async function fetchWordOptions(docId, pageId) {
     return words ? words.map(() => null) : null;
   });
   const total = items.length;
-  let done = 0;
-  const progress = () => updatePage(docId, pageId, { optionsProgress: { done, total } }, { quiet: true });
+  let done = 0, finished = false, writes = Promise.resolve();
+  // Progress is written one after another, and never after the end (it would leave "getting…" showing).
+  const progress = () => { writes = writes.then(() => (finished ? null : updatePage(docId, pageId, { optionsProgress: { done, total } }, { quiet: true }))).catch(() => {}); return writes; };
   await progress();
   const batches = [];
   for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
   await Promise.all(batches.map(async (batch) => {
-    const parts = [...known, { text: `Below are ${batch.length} images, each ONE handwritten Hebrew word cut out of a page (in random order). For each image, give up to 5 possible readings of exactly the letters drawn, the most likely first, each a different reading (different letters, or with/without a mark like ״ ׳). Keep the writer's spelling. Answer with one entry per numbered image, using the number written just before it ("Image 1:" …); example lines shown earlier get no entry.` }];
+    const parts = [...known, { text: `Below are ${batch.length} images, each ONE handwritten Hebrew word cut out of a page, in random order. For each image, give the 5 readings that its pen strokes most look like, most likely first: go letter by letter and consider the letters each stroke could be (handwriting look-alikes such as ד/ר/ך, ה/ח/ת, ו/ז/י/ן, ב/כ/פ, ס/ם, ג/נ, ט/מ, ע/צ/א), and marks like ״ ׳. Judge only by what the handwriting looks like, never by what would make sense. Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them. Each reading different. Answer with one entry per numbered image, using the number written just before it ("Image 1:" …); example lines shown earlier get no entry.` }];
     for (const [k, it] of batch.entries()) {
       parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)) } });
     }
@@ -1823,6 +1875,8 @@ async function fetchWordOptions(docId, pageId) {
     optionsByLine.set(keyOf(l), map);
   });
   const apply = (l) => { const m = optionsByLine.get(keyOf(l)); if (m) l.options = { ...(l.options || {}), ...m }; };
+  finished = true;
+  await writes;
   await modify("docs", docId, (d) => {
     const p = d.pages.find((x) => x.id === pageId);
     if (!p) return false;
@@ -1838,9 +1892,13 @@ function optionsFor(line, word) {
   const out = [];
   const add = (w, why) => { if (w !== undefined && w !== word && !out.some((o) => o.text === w) && out.length < 5) out.push({ text: w, why }); };
   const rank = (a) => (a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
-  for (const a of [...(line.alts || [])].sort((x, y) => rank(x) - rank(y))) if (a.word === word) add(a.alt, a.check ? "the word-by-word reading" : a.abbrev ? "abbreviation" : "a real word one letter away");
-  for (const w of line.options?.[word] || []) add(w, "Gemini's other reading");
-  if (lexicon?.size) for (const w of suggestWords(word, 5)) add(w, "a real word one letter away");
+  for (const a of [...(line.alts || [])].sort((x, y) => rank(x) - rank(y))) if (a.word === word && (a.check || a.abbrev)) add(a.alt, a.check ? "the word-by-word reading" : "abbreviation");
+  // Gemini's readings of the word's picture first (real words before the rest), then the
+  // check's reading and abbreviations, then real words with look-alike letters.
+  const gem = line.options?.[word] || [];
+  const real = (w) => !lexicon?.size || isKnownWord(w);
+  for (const w of [...gem.filter(real), ...gem.filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
+  for (const w of suggestVisual(word, 5)) add(w, "a real word with look-alike letters");
   return out;
 }
 
@@ -2119,6 +2177,7 @@ $("#settingsBtn").onclick = async () => {
     <p><b>Reading</b></p>
     <p><label><input type="radio" name="readMode" value="fast"> <b>Fast</b> (recommended): every line read at once with Gemini Flash; a page takes seconds.</label></p>
     <p><label><input type="radio" name="readMode" value="careful"> <b>Most careful</b>: the strongest Pro model, thinking deeply; slower and costs more, for very hard pages.</label></p>
+    <p><label><input type="checkbox" id="autoOptions"> Prepare word choices automatically: after a page is read, Gemini gives its 5 best readings of every word (in the background; costs a little more per page)</label></p>
     <details><summary class="muted">Choose a specific model (advanced)</summary>
     <p><select id="modelPick" style="width:100%"><option>Loading the models your key can use…</option></select></p></details>
     <p class="muted">Gemini key (saved only in this browser). Paste a new one to replace it, or leave empty to keep it.</p>
@@ -2128,6 +2187,7 @@ $("#settingsBtn").onclick = async () => {
   const pick = wrap.querySelector("#modelPick");
   const current = chosenModel();
   wrap.querySelector(`input[name=readMode][value=${readMode()}]`).checked = true;
+  wrap.querySelector("#autoOptions").checked = autoWordOptions();
   listModels().then((models) => {
     pick.innerHTML = "";
     pick.add(new Option("Automatic, by the choice above (recommended)", AUTO, false, current === AUTO));
@@ -2147,6 +2207,7 @@ $("#settingsBtn").onclick = async () => {
     const k = wrap.querySelector("#keyNew").value.trim();
     if (k) setKey(k);
     setReadMode(wrap.querySelector("input[name=readMode]:checked")?.value || "fast");
+    try { localStorage.setItem("auto_options", wrap.querySelector("#autoOptions").checked ? "on" : "off"); } catch {}
     if (pick.value && !pick.value.startsWith("Loading")) { setModel(pick.value); autoModel = null; }
     wrap.remove();
     pickBestModel().then(() => notify(`Saved. Pages will be read ${readMode() === "careful" ? "carefully" : "fast"}, with ${getModel()}.`));

@@ -1,14 +1,14 @@
-import { settled, start, makePage, tagCrops, installFake, checker, dbDump, TRUTH } from "./harness.mjs";
+import { allReady, settled, start, makePage, tagCrops, installFake, checker, dbDump, TRUTH } from "./harness.mjs";
 const [S, FILE] = process.argv.slice(2);
 const { browser, ctx, page, errors } = await start(FILE);
 const { check, done } = checker();
 const truth = await makePage(page, `${S}/e2e/page.png`);
 await tagCrops(page);
-await installFake(page, truth);
+const stats = await installFake(page, truth);
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", `${S}/e2e/page.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "T"); await page.click(".dialog button[type=submit]");
-await settled(page);
+await allReady(page, stats);
 
 // a save that fails once: the edit is saved by the next save
 await page.evaluate(() => { const orig = window.modify; let once = true; window.modify = (store, id, fn) => (store === "docs" && once && !(once = false) ? Promise.reject(new Error("disk full (test)")) : orig(store, id, fn)); });

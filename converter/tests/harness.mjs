@@ -106,12 +106,13 @@ export async function installFake(page, truth, opts = {}) {
     const body = route.request().postDataJSON();
     const parts = body.contents[0].parts;
     const raw = JSON.stringify(parts.filter((p) => p.text));
-    const kind = raw.includes("possible readings") ? "options" : raw.includes("ONE handwritten Hebrew word") ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
+    const kind = raw.includes("readings that its pen strokes most look like") ? "options" : raw.includes("ONE handwritten Hebrew word") ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
     const n = ++stats[kind];
     if (opts.delay) await new Promise((r) => setTimeout(r, opts.delay));
     const f = opts.fail?.(kind, n, url);
     if (f) return route.fulfill(err(f.status, f.message));
-    const boxes = await page.evaluate(() => window.__boxes).catch(() => []);
+    const boxes = await page.evaluate(() => window.__boxes).catch(() => null);
+    if (!boxes) return route.abort().catch(() => {});
     const numbered = [];
     parts.forEach((p, i) => { const m = p.text?.match(/^Image (\d+)/); if (m && parts[i + 1]?.inlineData) numbered.push({ n: +m[1], data: parts[i + 1].inlineData.data }); });
     const boxOf = async (data) => { const id = await readTag(data); if (id < 0 || !boxes[id]) throw new Error("unreadable test tag"); return boxes[id]; };
@@ -182,7 +183,7 @@ export const corruptLines = (text) => {
 /** Wait until every page is read and its word check has finished. */
 export const settled = (page, n = 1, timeout = 180000) => page.waitForFunction((n) => {
   const s = [...document.querySelectorAll(".page-head .state")];
-  return s.length >= n && s.filter((x) => /\d+ lines/.test(x.textContent) && !/checking/.test(x.textContent)).length >= n;
+  return s.length >= n && s.filter((x) => /\d+ lines/.test(x.textContent) && !/checking|getting word options/.test(x.textContent)).length >= n;
 }, n, { timeout });
 
 /** The words a line highlights, and the choices its menu offers for one word. */
@@ -193,4 +194,12 @@ export async function choicesOf(page, i, word) {
   const c = await page.locator(".popover button").allTextContents();
   await page.keyboard.press("Escape");
   return c;
+}
+
+/** Wait until the page is read, checked, and its word choices are ready (they come last, automatically). */
+export async function allReady(page, stats, n = 1) {
+  await settled(page, n);
+  const t0 = Date.now();
+  while (stats.options < n && Date.now() - t0 < 60000) await page.waitForTimeout(200);
+  await settled(page, n);
 }
