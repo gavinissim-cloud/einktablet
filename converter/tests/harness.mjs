@@ -179,3 +179,13 @@ export const settled = (page, n = 1, timeout = 180000) => page.waitForFunction((
   const s = [...document.querySelectorAll(".page-head .state")];
   return s.length >= n && s.filter((x) => /\d+ lines/.test(x.textContent) && !/checking/.test(x.textContent)).length >= n;
 }, n, { timeout });
+
+/** The words a line highlights, and the choices its menu offers for one word. */
+export const marksOf = (page, i) => page.locator(".row").nth(i).locator(".line-edit mark").allTextContents();
+export async function choicesOf(page, i, word) {
+  await page.locator(".row").nth(i).locator(".line-edit mark", { hasText: word }).first().click();
+  await page.waitForSelector(".popover");
+  const c = await page.locator(".popover button").allTextContents();
+  await page.keyboard.press("Escape");
+  return c;
+}

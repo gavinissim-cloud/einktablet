@@ -1,4 +1,4 @@
-import { start, makePage, tagCrops, installFake, corruptLines, settled, checker, dbDump, TRUTH } from "./harness.mjs";
+import { marksOf, choicesOf, start, makePage, tagCrops, installFake, corruptLines, settled, checker, dbDump, TRUTH } from "./harness.mjs";
 const [S, FILE] = process.argv.slice(2);
 const { browser, ctx, page, errors } = await start(FILE);
 const { check, done } = checker();
@@ -13,13 +13,16 @@ const texts = () => page.locator(".row .line-edit").evaluateAll((e) => e.map((x)
 const save = () => page.waitForTimeout(1500);
 
 // 1. One-click choice replaces exactly that whole word
-await page.locator(".row").nth(3).locator(".choice-group", { hasText: "באשתו" }).locator("button.alt").first().click();
+let line4 = (await texts())[3];
+await page.locator(".row").nth(3).locator(".line-edit mark", { hasText: "באשתו" }).click();
+await page.locator(".popover button", { hasText: "כשנאנס" }).click();
 let t = await texts();
-check("choice replaced only that word", t[3] === TRUTH[3].replace("באשתו", "כשנאנס"), t[3]);
-// 2. Remove choice
-await page.locator(".row").nth(4).locator(".choice-group", { hasText: "נוסף" }).locator("button.alt", { hasText: "✕" }).click();
-t = await texts();
-check("remove choice removed the extra word", t[4] === TRUTH[4], t[4]);
+check("choice replaced only that word", t[3] === line4.replace("באשתו", "כשנאנס"), t[3]);
+// 2. ✓ keeps a word and removes its highlight
+await page.locator(".row").nth(3).locator(".line-edit mark", { hasText: "היגיע" }).click();
+await page.locator(".popover button.keep").click();
+check("✓ keeps the word and clears its highlight", !(await marksOf(page, 3)).includes("היגיע") && (await texts())[3].includes("היגיע"));
+check("a real word only the line reading had is kept", (await texts())[4].endsWith("נוסף"), (await texts())[4]);
 // 3. Typing a correction
 await page.locator(".row .line-edit").nth(1).fill("שלום לכולם, היום נלמד על ההיסטוריה של העיר!");
 await save();
@@ -27,7 +30,7 @@ let db = await dbDump(page);
 let lines = db.docs[0].pages[0].lines;
 check("edits saved", lines[1].text.endsWith("העיר!") && lines[3].text.startsWith("כשנאנס") , JSON.stringify(lines.map((l) => l.text)));
 let ex = db.writers[0].examples;
-check("3 corrected lines learned", ex.length === 3, ex.map((e) => e.text).join(" | "));
+check("corrected lines learned", ex.length === 2, ex.map((e) => e.text).join(" | "));
 check("examples have pictures", ex.every((e) => e.crop));
 const box3 = JSON.stringify([lines[3].top, lines[3].bottom, lines[3].left, lines[3].right]);
 
@@ -46,7 +49,7 @@ lines = db.docs[0].pages[0].lines;
 check("doc view: 5 lines left", lines.length === 5, lines.length);
 check("doc view: the line after the deleted one kept its own box", JSON.stringify([lines[2].top, lines[2].bottom, lines[2].left, lines[2].right]) === box3, JSON.stringify(lines[2]));
 ex = db.writers[0].examples;
-check("doc view: learned examples unchanged and matched to their lines", ex.length === 3 && ex.some((e) => e.text.startsWith("כשנאנס")), ex.map((e) => e.text).join(" | "));
+check("doc view: learned examples unchanged and matched to their lines", ex.length === 2 && ex.some((e) => e.text.startsWith("כשנאנס")), ex.map((e) => e.text).join(" | "));
 await page.click("#viewLines");
 await page.waitForSelector(".row .line-edit");
 t = await texts();

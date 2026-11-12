@@ -48,6 +48,11 @@ h2 { font-size: 17px; margin: 0 0 10px; }
 .line-edit { margin-top: 6px; font: 21px/1.7 "Segoe UI", Arial, sans-serif; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; background: var(--card); color: var(--ink); min-height: 1.7em; white-space: pre-wrap; unicode-bidi: plaintext; text-align: right; outline: none; }
 .line-edit:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
 .line-edit mark { padding: 0 2px; }
+.hint { margin-top: 4px; font-size: 12px; color: var(--muted); text-align: right; }
+.line-edit mark { cursor: pointer; }
+.popover { position: absolute; z-index: 5; display: flex; gap: 6px; padding: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
+.popover button { padding: 3px 12px; font-size: 19px; background: var(--card); color: var(--ink); border-color: var(--line); }
+.popover button.keep { color: #1a7f37; font-weight: 700; }
 .choices { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 15px; color: var(--warn-ink); }
 .choice-group { display: inline-flex; gap: 4px; align-items: center; }
 .choice-group mark { font-size: 17px; padding: 0 4px; }
@@ -169,7 +174,8 @@ function getModel() {
   if (m !== AUTO) return m;
   return readMode() === "careful" ? autoModel || DEFAULT_MODEL : DEFAULT_MODEL;
 }
-const lineThinking = () => (readMode() === "careful" ? "HIGH" : "LOW");
+// Lines are read all at once, so careful thinking costs seconds, not minutes.
+const lineThinking = () => "HIGH";
 /** Pick the strongest Pro model the key can use (newest version; a "latest" alias first). */
 async function pickBestModel() {
   if (chosenModel() !== AUTO || readMode() !== "careful" || autoModel) return;
@@ -681,7 +687,7 @@ const WORD_PARALLEL = 6; // word requests at the same time
 const WORD_EXAMPLES = 8; // the writer's corrected lines shown with each word request
 // Reading one isolated word needs little thinking; deep thinking is mostly
 // reasoning about meaning, which is what this step is meant to avoid.
-const WORD_THINKING = "LOW";
+const WORD_THINKING = "MEDIUM";
 
 /**
  * Split one handwritten line into words by the blank space between them.
@@ -954,7 +960,7 @@ function isKnownWord(w) {
     lexicon.has(part) || lexicon.has(part.replace(/["']$/, "")));
 }
 /** Real words one letter away (a letter added, dropped, swapped or changed), most common first. */
-function suggestWords(w, max = 5) {
+function suggestWords(w, max = 2) {
   const p = wordParts(w);
   if (!p || /[\u05be\-–/]/.test(p.core)) return [];
   const hebrewMarks = /[\u05f3\u05f4]/.test(w);
@@ -1211,26 +1217,45 @@ async function checkWords(docId, pageId) {
   const short = (t) => t.length <= 3;
   // The word-by-word reading wins (a word made up from the sentence is replaced by what the letters
   // say); wherever the readings differ the word is highlighted, with the line reading one click away.
+  // The word-by-word reading replaces a word only when it found a real word (in the word list)
+  // and the line reading didn't, or both are real words that differ (a word made up from the
+  // sentence). When the word-by-word reading isn't a real word, the line reading stays: reading a
+  // word alone loses the help of its neighbours, and its misreadings shouldn't overrule a good line.
+  const real = (w) => !w.includes("□") && (!lexicon?.size || isKnownWord(w));
+  const pick = (litW, lineW) => (real(litW) || !real(lineW) ? litW : lineW);
   const mergeFor = (line, e) => {
     const lit = e.text.split(/\s+/).filter(Boolean), rd = line.ai.split(/\s+/).filter(Boolean);
     const parts = alignWords(lit, rd);
-    // Readings that hardly agree mean the line was cut up wrongly: keep the line reading, flagged.
-    if (parts.filter((x) => x.same).length < rd.length * 0.4) return { text: line.ai, flagged: new Set(rd), alts: [] };
-    const words = [], flagged = new Set(e.unsure), alts = [];
+    // Readings that hardly agree mean the line was cut up wrongly: keep the line reading.
+    if (parts.filter((x) => x.same).length < rd.length * 0.4) return null;
+    const words = [], flagged = new Set(), alts = [];
+    const offer = (chosen, other) => {
+      flagged.add(chosen);
+      if (other !== chosen && other.split(" ").length <= 2) alts.push({ word: chosen, alt: other, check: true });
+    };
     for (const part of parts) {
       if (part.same) { words.push(...part.a); continue; }
-      if (part.a.length) {
-        words.push(...part.a);
-        part.a.forEach((w) => flagged.add(w));
-        const fits = (short(part.a) && short(part.b)) || (part.b.length > part.a.length && part.a.length <= 8 && part.b.length <= 10);
-        if (part.b.length && fits) alts.push({ word: part.a.join(" "), alt: part.b.join(" "), check: true });
-      } else {
-        // Only the line reading has these words (the word cutting may have missed them): kept, flagged.
+      if (part.a.length === part.b.length) {
+        // Word for word: choose each one.
+        part.a.forEach((litW, k) => { const lineW = part.b[k], c = pick(litW, lineW); words.push(c); offer(c, c === litW ? lineW : litW); });
+      } else if (part.a.length && part.b.length) {
+        const litPhrase = part.a.join(" "), linePhrase = part.b.join(" ");
+        const useLit = part.a.every(real) || !part.b.every(real);
+        const chosen = useLit ? part.a : part.b;
+        words.push(...chosen);
+        chosen.forEach((w) => flagged.add(w));
+        const other = useLit ? linePhrase : litPhrase;
+        if (chosen.length <= 2 && other.split(" ").length <= 2) alts.push({ word: chosen.join(" "), alt: other, check: true });
+      } else if (part.b.length) {
+        // Only the line reading has these words (the word cutting may have missed them): kept.
         words.push(...part.b);
-        part.b.forEach((w) => flagged.add(w));
-        if (short(part.b)) alts.push({ word: part.b.join(" "), alt: "", check: true });
+        if (!part.b.every(real)) part.b.forEach((w) => flagged.add(w));
+      } else {
+        // Only the word-by-word reading has these: kept if they're real words, flagged.
+        for (const w of part.a) if (real(w)) { words.push(w); flagged.add(w); alts.push({ word: w, alt: "", check: true }); }
       }
     }
+    for (const w of e.unsure) if (words.includes(w) && !real(w)) flagged.add(w);
     for (const w of words) if (w.includes("□")) flagged.add(w);
     return { text: words.join(" "), flagged, alts };
   };
@@ -1649,45 +1674,65 @@ function lineRow(page, line, img) {
   }
   const words = doubtful();
   if (words.length) {
-    const box = document.createElement("div"); box.className = "choices";
-    // Group the choices by the word (or words) they replace.
-    const groups = new Map();
-    for (const a of line.alts || []) {
-      if (findTokens(line.text, a.word) < 0) continue;
-      if (!groups.has(a.word)) groups.set(a.word, []);
-      groups.get(a.word).push(a);
-    }
-    for (const w of words) if (![...groups.keys()].some((k) => k.split(" ").includes(w))) groups.set(w, []);
-    const settle = (phrase, replacement) => {
-      if (replacement !== null) line.text = replaceTokens(line.text, phrase, replacement);
-      const gone = phrase.split(" ");
-      line.alts = (line.alts || []).filter((x) => x.word !== phrase && findTokens(line.text, x.word) >= 0);
-      line.unclear = line.unclear.filter((u) => !gone.includes(u) && line.text.split(/\s+/).includes(u));
-      scheduleSave(page);
-      row.replaceWith(lineRow(page, line, img));
-    };
-    for (const [phrase, alts] of groups) {
-      const g = document.createElement("span"); g.className = "choice-group";
-      const m = document.createElement("mark"); m.textContent = phrase; g.append(m);
-      for (const a of alts) {
-        const b = document.createElement("button");
-        b.className = "alt";
-        b.textContent = a.alt ? a.alt + (a.picked ? " ★" : "") : "✕";
-        b.title = a.abbrev ? "Use this abbreviation (from Sefaria's word list)" : a.dict
-          ? (a.picked ? "A real word from Sefaria's word list; Gemini says it matches the handwriting" : "A real word from Sefaria's word list, one letter different")
-          : a.alt ? `Use «${a.alt}» instead of «${phrase}»` : `Remove «${phrase}»`;
-        b.onclick = () => settle(phrase, a.alt);
-        g.append(b);
-      }
-      const keep = document.createElement("button");
-      keep.className = "keep"; keep.textContent = "✓"; keep.title = `«${phrase}» is right`;
-      keep.onclick = () => settle(phrase, null);
-      g.append(keep);
-      box.append(g);
-    }
-    row.append(box);
+    const hint = document.createElement("div"); hint.className = "hint"; hint.dir = "ltr";
+    hint.textContent = "Click a yellow word to see its other readings, or just type over it.";
+    row.append(hint);
   }
+  // Clicking a yellow word opens its choices right under it.
+  ed.addEventListener("click", (e) => {
+    const m = e.target.closest?.("mark");
+    if (m) openChoices(page, line, row, img, m);
+  });
   return row;
+}
+
+/** The other readings of one doubtful word (at most 3), in a small menu under the word. */
+function choicesFor(line, word) {
+  const rank = (a) => (a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
+  const seen = new Set();
+  return (line.alts || [])
+    .filter((a) => a.word.split(" ").includes(word) && findTokens(line.text, a.word) >= 0)
+    .sort((x, y) => rank(x) - rank(y))
+    .filter((a) => { const k = a.word + "|" + a.alt; if (seen.has(k)) return false; seen.add(k); return true; })
+    .slice(0, 3);
+}
+function openChoices(page, line, row, img, mark) {
+  document.querySelector(".popover")?.remove();
+  const word = mark.textContent;
+  const pop = document.createElement("div");
+  pop.className = "popover"; pop.dir = "rtl";
+  const settle = (phrase, replacement) => {
+    if (replacement !== null) line.text = replaceTokens(line.text, phrase, replacement);
+    const gone = phrase.split(" ");
+    line.alts = (line.alts || []).filter((x) => x.word !== phrase && findTokens(line.text, x.word) >= 0);
+    line.unclear = line.unclear.filter((u) => !gone.includes(u) && line.text.split(/\s+/).includes(u));
+    pop.remove();
+    scheduleSave(page);
+    row.replaceWith(lineRow(page, line, img));
+  };
+  for (const a of choicesFor(line, word)) {
+    const b = document.createElement("button");
+    b.className = "alt";
+    b.textContent = a.alt ? a.alt + (a.picked ? " ★" : "") : "✕";
+    b.title = a.alt ? `Use «${a.alt}»` : `Remove «${a.word}»`;
+    b.onclick = (e) => { e.stopPropagation(); settle(a.word, a.alt); };
+    pop.append(b);
+  }
+  const keep = document.createElement("button");
+  keep.className = "keep"; keep.textContent = "✓"; keep.title = `«${word}» is right`;
+  keep.onclick = (e) => { e.stopPropagation(); settle(word, null); };
+  pop.append(keep);
+  row.style.position = "relative";
+  const r = mark.getBoundingClientRect(), base = row.getBoundingClientRect();
+  pop.style.top = `${r.bottom - base.top + 4}px`;
+  pop.style.right = `${Math.max(0, base.right - r.right)}px`;
+  row.append(pop);
+  const close = (e) => {
+    if (e.type === "keydown" ? e.key === "Escape" || e.key.length === 1 || e.key === "Backspace" : !pop.contains(e.target) && e.target !== mark) {
+      pop.remove(); document.removeEventListener("mousedown", close, true); document.removeEventListener("keydown", close, true);
+    }
+  };
+  setTimeout(() => { document.addEventListener("mousedown", close, true); document.addEventListener("keydown", close, true); }, 0);
 }
 
 function highlight(text, unclear) {
