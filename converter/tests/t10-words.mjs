@@ -30,7 +30,9 @@ const clickWord = async (n) => {
   await ed.evaluate((el, n) => {
     const text = el.innerText; let i = -1, start = 0;
     for (const m of text.matchAll(/\S+/g)) if (++i === n) { start = m.index + 1; break; }
-    const node = el.firstChild; const r = document.createRange(); r.setStart(node, start); r.collapse(true);
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT); let pos = 0, node, off = 0;
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) { if (start <= pos + n.textContent.length) { node = n; off = start - pos; break; } pos += n.textContent.length; }
+    const r = document.createRange(); r.setStart(node, off); r.collapse(true);
     const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
   }, n);
   await ed.dispatchEvent("click");
@@ -51,6 +53,8 @@ await page.locator(".popover button.alt").first().click();
 const after = await ed.innerText();
 const chosen = opts[0];
 check("the choice replaced exactly the clicked word (not the first «זה»)", after === `זה הספר של ${chosen} האיש הטוב`, after);
+await page.waitForTimeout(1000);
+check("a real word elsewhere is only highlighted, not changed", (await page.locator(".row").first().locator("mark").allTextContents()).includes("זה"));
 // More word options
 await page.locator(".page-head button", { hasText: "More word options" }).click();
 await page.waitForFunction(() => !/getting word options/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 60000 });

@@ -1,0 +1,73 @@
+import { start, makePage, tagCrops, installFake, allReady, settled, checker, dbDump, marksOf } from "./harness.mjs";
+const [S, FILE] = process.argv.slice(2);
+const { browser, page, errors } = await start(FILE);
+const { check, done } = checker();
+const truth = await makePage(page, `${S}/e2e/page.png`);
+await tagCrops(page);
+const wrong = (t) => t.replace(/הקנס/g, "הקגס");
+const stats = await installFake(page, truth, { lineText: wrong, wordText: wrong });
+await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
+await page.setInputFiles("#fileInput", `${S}/e2e/page.png`);
+await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Rivka"); await page.click(".dialog button[type=submit]");
+await allReady(page, stats);
+const ed = (i) => page.locator(".row .line-edit").nth(i);
+check("read with the misreading", (await ed(4).innerText()).startsWith("הקגס"), await ed(4).innerText());
+// 1. pick the right word for the first הקגס from its menu
+await ed(4).evaluate((el) => { const r = document.createRange(); r.setStart(el.firstChild.nodeType === 3 ? el.firstChild : el.firstChild.firstChild, 1); r.collapse(true); const s = getSelection(); s.removeAllRanges(); s.addRange(r); });
+await ed(4).dispatchEvent("click");
+await page.waitForSelector(".popover");
+const opts = await page.locator(".popover button").allTextContents();
+check("the menu offers the right word", opts.includes("הקנס"), JSON.stringify(opts));
+await page.locator(".popover button", { hasText: /^הקנס$/ }).click();
+await page.waitForSelector(".toast", { timeout: 5000 }).catch(() => {});
+const toast = await page.locator(".toast").textContent().catch(() => "");
+check("the other «הקגס» in the document changed too, with a note", /Also changed «הקגס» to «הקנס» in 1 other place/.test(toast), toast);
+await page.waitForTimeout(800);
+check("both words corrected", (await ed(4).innerText()) === "הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.", await ed(4).innerText());
+let db = await dbDump(page);
+let w = db.writers.find((x) => x.name === "Rivka");
+check("remembered for this writer", w.memory?.fixes?.["הקגס"]?.to === "הקנס" && w.memory.fixes["הקגס"].count === 1, JSON.stringify(w.memory));
+check("the corrected word's picture kept for teaching", (w.wordExamples || []).length === 1 && w.wordExamples[0].crop, JSON.stringify((w.wordExamples || []).map((e) => e.text)));
+// 2. Undo puts the other one back
+await page.locator(".toast button", { hasText: "Undo" }).click();
+await page.waitForTimeout(800);
+check("Undo restores the other place", (await ed(4).innerText()) === "הקנס אינו מובן: דצורת הקגס היא ד״ר ת״ת.", await ed(4).innerText());
+// 3. correct it again by typing
+await ed(4).click();
+await ed(4).fill("הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.");
+await page.locator("#docTitle").click(); // leave the line
+await page.waitForTimeout(1500);
+db = await dbDump(page);
+w = db.writers.find((x) => x.name === "Rivka");
+check("typing the correction is remembered too (twice now)", w.memory.fixes["הקגס"].count === 2, JSON.stringify(w.memory));
+// 4. a new page by the same writer: fixed automatically, and Gemini sees the corrected word
+const before = stats.raw.length;
+await page.setInputFiles("#fileInput", `${S}/e2e/p1.png`);
+await page.waitForFunction(() => document.querySelectorAll(".page-head").length === 2);
+await allReady(page, stats, 2);
+const second = await page.locator("#pages > .card").nth(1).locator(".line-edit").nth(4).innerText();
+check("next page: the remembered correction applied by itself", second === "הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.", second);
+const marks = await page.locator("#pages > .card").nth(1).locator(".row").nth(4).locator("mark").allTextContents();
+check("…and highlighted, so it can be checked", marks.includes("הקנס"), JSON.stringify(marks));
+const lineReq = stats.raw.slice(before).find((r) => r.kind === "lines");
+check("Gemini is shown this writer's corrected words", lineReq && /How this writer writes words/.test(lineReq.raw) && /הקגס → הקנס/.test(lineReq.raw), lineReq ? "" : "no line request");
+// the person's page shows what is remembered, and it survives a backup and restore
+await page.click("#backHome");
+await page.locator("#writerList a", { hasText: "Rivka" }).click();
+await page.waitForSelector("#writerView:not([hidden])");
+const view = await page.textContent("#writerView");
+check("the person's page lists the remembered correction", /הקגס → הקנס/.test(view) && /applied by itself/.test(view), view.slice(0, 300));
+await page.click("#writerBack");
+const [dl] = await Promise.all([page.waitForEvent("download"), page.click("#backupBtn")]);
+await dl.saveAs(`${S}/e2e/memory-backup.json`);
+await page.locator("#writerList a", { hasText: "Rivka" }).click();
+await page.waitForSelector("#writerView:not([hidden])");
+await page.click("#writerDelete"); await page.click(".dialog button[type=submit]");
+await page.waitForTimeout(500);
+await page.setInputFiles("#restoreInput", `${S}/e2e/memory-backup.json`);
+await page.click(".dialog button[type=submit]"); await page.waitForTimeout(800); await page.click(".dialog button[type=submit]");
+const restored = (await dbDump(page)).writers.find((x) => x.name === "Rivka");
+check("memory and word pictures survive backup and restore", restored?.memory?.fixes?.["הקגס"]?.count === 2 && restored.wordExamples?.length >= 1 && restored.wordExamples.every((e) => e.crop), JSON.stringify(restored?.memory));
+check("no page errors", errors.length === 0, errors.join("\n"));
+await browser.close();
+process.exit(done() ? 0 : 1);

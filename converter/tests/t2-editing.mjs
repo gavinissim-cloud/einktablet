@@ -59,8 +59,8 @@ check("lines view after doc edit", t.length === 5 && t[2].startsWith("כשנאנ
 await page.click("#backHome");
 await page.locator("#writerList a").first().click();
 await page.waitForSelector("#writerView:not([hidden])");
-const before = await page.locator(".example").count();
-await page.locator(".example button", { hasText: "Forget" }).first().click();
+const before = await page.locator(".line-example").count();
+await page.locator(".line-example button", { hasText: "Forget" }).first().click();
 await page.waitForTimeout(500);
 await page.click("#writerBack");
 await page.locator("#docList a").first().click();

@@ -108,6 +108,7 @@ export async function installFake(page, truth, opts = {}) {
     const raw = JSON.stringify(parts.filter((p) => p.text));
     const kind = raw.includes("readings that its pen strokes most look like") ? "options" : raw.includes("ONE handwritten Hebrew word") ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
     const n = ++stats[kind];
+    (stats.raw ||= []).push({ kind, raw });
     if (opts.delay) await new Promise((r) => setTimeout(r, opts.delay));
     const f = opts.fail?.(kind, n, url);
     if (f) return route.fulfill(err(f.status, f.message));
@@ -122,6 +123,7 @@ export async function installFake(page, truth, opts = {}) {
       for (const { n: k, data } of numbered) {
         let text = wordsIn(truth, await boxOf(data)).join(" ");
         if (opts.emptyWord && text === opts.emptyWord) text = "";
+        if (opts.wordText) text = opts.wordText(text);
         words.push({ image: k, text, sure: true });
       }
       return route.fulfill(sse({ words }));

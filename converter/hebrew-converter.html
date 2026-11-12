@@ -52,6 +52,8 @@ h2 { font-size: 17px; margin: 0 0 10px; }
 .line-edit mark { padding: 0 2px; }
 .hint { margin-top: 4px; font-size: 12px; color: var(--muted); text-align: right; }
 .line-edit mark { cursor: pointer; }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 20; display: flex; gap: 12px; align-items: center; padding: 10px 16px; background: var(--ink); color: var(--card); border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.25); font-size: 14px; max-width: calc(100% - 32px); }
+.toast button { background: transparent; color: var(--card); border-color: var(--card); padding: 3px 10px; }
 .popover { position: absolute; z-index: 5; display: flex; gap: 6px; padding: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
 .popover button { padding: 3px 12px; font-size: 19px; background: var(--card); color: var(--ink); border-color: var(--line); }
 .popover button.keep { color: #1a7f37; font-weight: 700; }
@@ -978,7 +980,7 @@ const toFinal = { כ: "ך", מ: "ם", נ: "ן", פ: "ף", צ: "ץ" };
  * added or dropped, or two look-alike swaps in a longer word. Ranked by how alike the letters look,
  * then by how common the word is. Used for the choices of a word.
  */
-function suggestVisual(w, max = 5) {
+function suggestVisual(w, max = 5, prefer = null) {
   const p = wordParts(w);
   if (!p || /[\u05be\-–/]/.test(p.core) || !lexicon?.size) return [];
   const core = p.core.replace(/["']/g, ""), marks = p.core !== core;
@@ -986,8 +988,9 @@ function suggestVisual(w, max = 5) {
   const consider = (c, score) => {
     if (!c || c === core) return;
     const fixed = toFinal[c.at(-1)] ? c.slice(0, -1) + toFinal[c.at(-1)] : c;
-    for (const x of new Set([c, fixed])) if (lexicon.has(x)) {
-      const sc = score + Math.log10(2 + lexicon.get(x)) / 4; // a little preference for common words
+    for (const x of new Set([c, fixed])) if (lexicon.has(x) || prefer?.has(x)) {
+      // Words this writer uses, or that are in this document, come first; then common words.
+      const sc = score + (prefer?.has(x) ? -2 : 0) + Math.log10(2 + (lexicon.get(x) ?? 0)) / 4;
       if (!found.has(x) || found.get(x) > sc) found.set(x, sc);
     }
   };
@@ -1169,7 +1172,16 @@ async function learnedParts(writer, pageId, max = EXAMPLES) {
       parts.push({ inlineData: { mimeType: "image/jpeg", data: await blobBase64(e.crop) } });
     }
   }
+  const words = (writer.wordExamples || []).filter((e) => e.crop instanceof Blob).slice(0, 20);
+  if (words.length) {
+    parts.push({ text: `How this writer writes words (pictures of single words, each with its correct reading). Learn the shapes of their letters:` });
+    for (const [i, e] of words.entries()) {
+      parts.push({ text: `Example word ${i + 1} (not a numbered image), correct reading: «${e.text}»${e.misread ? ` (once misread as «${e.misread}»)` : ""}:` });
+      parts.push({ inlineData: { mimeType: "image/jpeg", data: await blobBase64(e.crop) } });
+    }
+  }
   const counts = new Map();
+  for (const [from, f] of Object.entries(writerMemory(writer).fixes)) counts.set(`${from}\u0000${f.to}`, f.count);
   for (const e of writer.examples || []) for (const f of wordFixes(e.ai, e.text)) {
     const k = `${f.from}\u0000${f.to}`; counts.set(k, (counts.get(k) || 0) + 1);
   }
@@ -1228,7 +1240,7 @@ async function readPage(doc, page, onStep) {
     lines = cleanLines((await askJson([...known, pagePart, { text: "Transcribe all the handwriting on this page." }], LINE_SCHEMA, lineThinking())).lines || []);
   }
   try {
-    lines = lines.map((l) => fixAbbreviations({ ...l, alts: l.alts || [] }));
+    lines = lines.map((l) => applyMemory(fixAbbreviations({ ...l, alts: l.alts || [] }), writer));
     lines = await checkAgainstLexicon(bitmap, lines, null);
   } catch (e) {
     console.error("Word-list check failed:", e);
@@ -1320,6 +1332,7 @@ async function checkWords(docId, pageId) {
     l.alts = [...(l.alts || []).filter((a) => !a.check && findTokens(r.text, a.word) >= 0), ...r.alts];
     l.text = r.text;
     fixAbbreviations(l);
+    applyMemory(l, writer);
     l.ai = l.text;
     addLexiconFlags(l);
     return true;
@@ -1491,6 +1504,7 @@ async function showDoc(id) {
   const doc = await getOne("docs", id);
   if (!doc) return showHome();
   state.doc = doc; state.crops = new Map(); pageBitmaps.clear();
+  state.writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
   show("docView");
   $("#docTitle").value = doc.title || "";
   const writers = await getAll("writers");
@@ -1509,12 +1523,47 @@ async function showWriter(id) {
   $("#writerView").dataset.id = id;
   $("#writerName").textContent = w.name;
   const ex = w.examples || [];
-  $("#writerSummary").textContent = ex.length
-    ? `${ex.length} corrected lines learned. Gemini sees the most recent ${Math.min(ex.length, EXAMPLES)} of them, and the words misread before, whenever it reads ${w.name}'s pages.`
+  const nFix = Object.keys(writerMemory(w).fixes).length;
+  $("#writerSummary").textContent = (ex.length || nFix)
+    ? `${ex.length} corrected lines and ${nFix} remembered corrections. Gemini sees the most recent corrected lines and words, and the words misread before, whenever it reads ${w.name}'s pages.`
     : `Nothing learned yet. Correct mistakes on ${w.name}'s pages and the corrected lines appear here.`;
   const list = $("#exampleList"); list.innerHTML = "";
+  // Corrections remembered for this person: applied to their next pages.
+  const fixes = Object.entries(writerMemory(w).fixes).sort((a, b) => b[1].count - a[1].count || (b[1].at || "").localeCompare(a[1].at || ""));
+  if (fixes.length) {
+    const head = document.createElement("div"); head.className = "pad"; head.style.borderTop = "1px solid var(--line)";
+    head.innerHTML = `<b>Remembered corrections</b> <span class="muted">— applied by itself on ${esc(w.name)}'s next pages (highlighted so you can check it), except that a common word is only changed after the same correction 3 times (until then it is offered first).</span>`;
+    list.append(head);
+    for (const [from, f] of fixes) {
+      const row = document.createElement("div"); row.className = "example";
+      const auto = isCommonWord(from) ? f.count >= 3 : true;
+      row.innerHTML = `<div class="he"><span class="muted">${esc(from)}</span> → <b>${esc(f.to)}</b></div><div class="muted">${auto ? "applied by itself" : "offered first"} · corrected ${f.count}×</div>`;
+      const b = document.createElement("button"); b.className = "secondary"; b.textContent = "Forget";
+      b.onclick = async () => { await modify("writers", id, (x) => { if (x.memory?.fixes) delete x.memory.fixes[from]; }); showWriter(id); };
+      row.append(b); list.append(row);
+    }
+  }
+  if ((w.wordExamples || []).length) {
+    const head = document.createElement("div"); head.className = "pad"; head.style.borderTop = "1px solid var(--line)";
+    head.innerHTML = `<b>Corrected words</b> <span class="muted">— shown to Gemini so it learns how ${esc(w.name)} writes.</span>`;
+    list.append(head);
+    for (const e of w.wordExamples.slice(0, 60)) {
+      if (!(e.crop instanceof Blob)) continue;
+      const row = document.createElement("div"); row.className = "example";
+      const img = document.createElement("img"); img.src = URL.createObjectURL(e.crop);
+      const txt = document.createElement("div"); txt.className = "he"; txt.innerHTML = `${esc(e.text)}${e.misread ? `<div class="muted" style="font-size:13px">was read as: ${esc(e.misread)}</div>` : ""}`;
+      const b = document.createElement("button"); b.className = "secondary"; b.textContent = "Forget";
+      b.onclick = async () => { await modify("writers", id, (x) => { x.wordExamples = (x.wordExamples || []).filter((y) => y.id !== e.id); }); showWriter(id); };
+      row.append(img, txt, b); list.append(row);
+    }
+  }
+  if (ex.length) {
+    const head = document.createElement("div"); head.className = "pad"; head.style.borderTop = "1px solid var(--line)";
+    head.innerHTML = "<b>Corrected lines</b>";
+    list.append(head);
+  }
   for (const e of ex.slice(0, 200)) {
-    const row = document.createElement("div"); row.className = "example";
+    const row = document.createElement("div"); row.className = "example line-example";
     const img = document.createElement("img"); img.src = URL.createObjectURL(e.crop);
     const txt = document.createElement("div"); txt.className = "he";
     txt.innerHTML = `${esc(e.text)}<div class="muted" style="font-size:13px">first read as: ${esc(e.ai)}</div>`;
@@ -1725,10 +1774,16 @@ function lineRow(page, line, img) {
     const next = row.nextElementSibling?.querySelector(".line-edit");
     if (next) { next.focus(); const r = document.createRange(); r.selectNodeContents(next); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); }
   };
+  const textBefore = line.text;
   ed.onblur = () => {
     if (!typed) return;
     typed = false;
     line.text = line.text.replace(/\s+/g, " ").trim();
+    let idx = 0;
+    for (const part of alignWords(textBefore.split(/\s+/).filter(Boolean), line.text.split(/\s+/).filter(Boolean))) {
+      if (!part.same && part.a.length === part.b.length) part.a.forEach((from, k) => rememberCorrection(page, line, idx + k, from, part.b[k]).catch(() => {}));
+      idx += part.b.length;
+    }
     line.unclear = doubtful();
     line.alts = (line.alts || []).filter((a) => findTokens(line.text, a.word) >= 0);
     row.replaceWith(lineRow(page, line, img)); // fresh highlights and choices
@@ -1810,7 +1865,142 @@ async function wordSpot(page, line, index, count, text) {
     const xr = boxes[0].right, xl = boxes.at(-1).left, at = xr - (before / total) * (xr - xl);
     box = boxes.reduce((best, b) => (Math.abs((b.left + b.right) / 2 - at) < Math.abs((best.left + best.right) / 2 - at) ? b : best));
   }
-  return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span };
+  return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span, box };
+}
+
+// ---------- Remembering corrections ----------
+/** A common real word (among the 100,000 most used): such a word may be right where it stands. */
+function isCommonWord(w) {
+  if (!lexicon?.size) return false;
+  const p = wordParts(w);
+  if (!p) return false;
+  const r = lexicon.get(p.core) ?? lexicon.get(p.core.replace(/["']$/, ""));
+  return r !== undefined && r < 100000;
+}
+// Every word a person corrects is remembered for that writer (writer.memory): which misreading
+// becomes which word, the writer's own words, and a picture of the corrected word. The same
+// misreading is fixed elsewhere in the document at once, future pages get it automatically, and
+// Gemini is shown the writer's corrected words to learn their letters.
+const MAX_WORD_EXAMPLES = 300;
+function writerMemory(w) { return w?.memory || { fixes: {}, vocab: {} }; }
+/** The person corrected `from` to `to` (word number `index` of the line, after the change). */
+async function rememberCorrection(page, line, index, from, to) {
+  if (!from || !to || from === to || /\s/.test(to)) return;
+  const doc = state.doc;
+  if (!doc) return;
+  // A picture of the corrected word, to show Gemini how this person writes it.
+  let crop = null;
+  try {
+    const count = line.text.split(/\s+/).filter(Boolean).length;
+    const spot = await wordSpot(page, line, index, count, line.text);
+    if (spot?.box) crop = await canvasBlob(cropLine(await pageBitmap(page), { top: line.top, bottom: line.bottom, left: spot.box.left, right: spot.box.right }, 120), 0.88);
+  } catch {}
+  if (doc.writerId) {
+    const saved = await modify("writers", doc.writerId, (w) => {
+      const m = (w.memory ||= { fixes: {}, vocab: {} });
+      const prev = m.fixes[from];
+      m.fixes[from] = { to, count: prev && prev.to === to ? prev.count + 1 : 1, at: new Date().toISOString() };
+      m.vocab[to] = (m.vocab[to] || 0) + 1;
+      if (crop) {
+        w.wordExamples = [{ id: uid(), text: to, misread: from, crop, at: new Date().toISOString() }, ...(w.wordExamples || [])].slice(0, MAX_WORD_EXAMPLES);
+      }
+    }).catch((e) => console.warn("Couldn't remember the correction:", e));
+    if (saved && state.doc === doc) state.writer = saved;
+  }
+  propagateCorrection(page, line, from, to);
+}
+/**
+ * The same misreading elsewhere in this document: when it isn't a real word it is fixed
+ * everywhere (highlighted, can be undone); when it is a real word (it may be right in other
+ * places) it is only highlighted there, with the correction as the first choice.
+ */
+function propagateCorrection(srcPage, srcLine, from, to) {
+  const realWord = isCommonWord(from);
+  if (realWord) {
+    let n = 0;
+    for (const p of state.doc?.pages || []) {
+      if (p.status !== "done") continue;
+      let touched = false;
+      p.lines.forEach((l) => {
+        if (!l.text.split(/\s+/).includes(from)) return;
+        n += l.text.split(/\s+/).filter((t) => t === from).length;
+        l.unclear = [...new Set([...l.unclear, from])];
+        if (!(l.alts || []).some((a) => a.word === from && a.alt === to)) l.alts = [...(l.alts || []), { word: from, alt: to, memory: true }];
+        touched = true;
+      });
+      if (touched) { scheduleSave(p); renderPageSoon(p); }
+    }
+    if (n) showToast(`«${from}» appears in ${n} other place${n === 1 ? "" : "s"}: highlighted, with «${to}» as a choice.`);
+    return;
+  }
+  const changed = [];
+  for (const p of state.doc?.pages || []) {
+    if (p.status !== "done") continue;
+    let touched = false;
+    p.lines.forEach((l) => {
+      const tokens = l.text.split(/\s+/).filter(Boolean);
+      let hit = false;
+      tokens.forEach((t, i) => { if (t === from) { tokens[i] = to; hit = true; changed.push({ page: p, line: l, index: i }); } });
+      if (!hit) return;
+      l.text = tokens.join(" ");
+      l.unclear = [...new Set([...l.unclear.filter((u) => u !== from), to])];
+      l.alts = [...(l.alts || []).filter((a) => a.word !== from), { word: to, alt: from, memory: true }];
+      touched = true;
+    });
+    if (touched) { scheduleSave(p); renderPageSoon(p); }
+  }
+  if (!changed.length) return;
+  const n = changed.length;
+  showToast(`Also changed «${from}» to «${to}» in ${n} other place${n === 1 ? "" : "s"} in this document.`, "Undo", () => {
+    // Exactly the places changed here (not the one the person corrected).
+    for (const { page, line, index } of changed) {
+      if (line.text.split(/\s+/).filter(Boolean)[index] !== to) continue; // edited since
+      line.text = replaceTokenAt(line.text, index, from);
+      if (!line.text.split(/\s+/).includes(to)) line.unclear = line.unclear.filter((u) => u !== to);
+      line.alts = (line.alts || []).filter((a) => !(a.memory && a.word === to));
+      scheduleSave(page); renderPageSoon(page);
+    }
+  });
+}
+/** Apply what was learned from this writer's corrections to a freshly read line. */
+function applyMemory(l, writer) {
+  const fixes = writerMemory(writer).fixes;
+  if (!Object.keys(fixes).length) return l;
+  const tokens = l.text.split(/\s+/).filter(Boolean);
+  const unclear = new Set(l.unclear), alts = [...(l.alts || [])];
+  let changed = false;
+  tokens.forEach((t, i) => {
+    const p = wordParts(t) || { pre: "", core: t, post: "" };
+    const f = fixes[t] || fixes[p.core];
+    if (!f || f.to === t) return;
+    const to = fixes[t] ? f.to : p.pre + f.to + p.post;
+    if (isCommonWord(t) ? f.count >= 3 : true) {
+      // What was read isn't a word and was corrected this way before, or a real word corrected
+      // the same way 3 times: fixed, highlighted.
+      tokens[i] = to; changed = true; unclear.add(to);
+      alts.push({ word: to, alt: t, memory: true });
+    } else {
+      unclear.add(t);
+      alts.push({ word: t, alt: to, memory: true });
+    }
+  });
+  if (changed) l.text = tokens.join(" ");
+  l.unclear = [...unclear].filter((u) => l.text.split(/\s+/).includes(u));
+  l.alts = alts;
+  return l;
+}
+/** A small note at the bottom of the window, with an optional button. */
+function showToast(message, action, onAction) {
+  document.querySelector(".toast")?.remove();
+  const t = document.createElement("div"); t.className = "toast";
+  const span = document.createElement("span"); span.textContent = message; t.append(span);
+  if (action) {
+    const b = document.createElement("button"); b.textContent = action;
+    b.onclick = () => { t.remove(); onAction(); };
+    t.append(b);
+  }
+  document.body.append(t);
+  setTimeout(() => t.remove(), 9000);
 }
 
 const OPTIONS_SCHEMA = {
@@ -1890,15 +2080,20 @@ async function fetchWordOptions(docId, pageId) {
 /** Up to 5 other readings for one word: the check's reading, abbreviations, Gemini's options, real words one letter away. */
 function optionsFor(line, word) {
   const out = [];
+  const remembered = writerMemory(state.writer).fixes[word];
   const add = (w, why) => { if (w !== undefined && w !== word && !out.some((o) => o.text === w) && out.length < 5) out.push({ text: w, why }); };
-  const rank = (a) => (a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
-  for (const a of [...(line.alts || [])].sort((x, y) => rank(x) - rank(y))) if (a.word === word && (a.check || a.abbrev)) add(a.alt, a.check ? "the word-by-word reading" : "abbreviation");
+  if (remembered) add(remembered.to, "how you corrected this before");
+  const rank = (a) => (a.memory ? -1 : a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
+  for (const a of [...(line.alts || [])].sort((x, y) => rank(x) - rank(y))) if (a.word === word && (a.check || a.abbrev || a.memory)) add(a.alt, a.memory ? "how you corrected this before" : a.check ? "the word-by-word reading" : "abbreviation");
   // Gemini's readings of the word's picture first (real words before the rest), then the
   // check's reading and abbreviations, then real words with look-alike letters.
   const gem = line.options?.[word] || [];
   const real = (w) => !lexicon?.size || isKnownWord(w);
   for (const w of [...gem.filter(real), ...gem.filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
-  for (const w of suggestVisual(word, 5)) add(w, "a real word with look-alike letters");
+  // The writer's own words and the words of this document are preferred.
+  const prefer = new Set(Object.keys(writerMemory(state.writer).vocab));
+  for (const p of state.doc?.pages || []) for (const l of p.lines || []) for (const t of l.text.split(/\s+/)) { const c = wordParts(t)?.core; if (c && c !== word) prefer.add(c); }
+  for (const w of suggestVisual(word, 5, prefer)) add(w, "a real word with look-alike letters");
   return out;
 }
 
@@ -1921,6 +2116,7 @@ async function openWordMenu(page, line, row, img, at) {
   const flagged = line.unclear.includes(word);
   const settle = (replacement) => {
     line.text = replacement === null ? text : replaceTokenAt(text, at.index, replacement);
+    if (replacement) rememberCorrection(page, line, at.index, word, replacement).catch(() => {});
     line.alts = (line.alts || []).filter((x) => x.word !== word && findTokens(line.text, x.word) >= 0);
     line.unclear = line.unclear.filter((u) => u !== word && line.text.split(/\s+/).includes(u));
     pop.remove();
@@ -2282,7 +2478,7 @@ $("#backupBtn").onclick = async () => {
     await flushSave();
     const docs = await getAll("docs"), writers = await getAll("writers");
     for (const d of docs) for (const p of d.pages) p.image = await toDataUrl(p.image);
-    for (const w of writers) for (const e of w.examples || []) e.crop = await toDataUrl(e.crop);
+    for (const w of writers) for (const e of [...(w.examples || []), ...(w.wordExamples || [])]) e.crop = await toDataUrl(e.crop);
     const data = { app: "hebrew-converter", version: 1, savedAt: new Date().toISOString(), docs, writers };
     // Written piece by piece, so a large backup doesn't need one huge text in memory.
     const parts = ['{"app":"hebrew-converter","version":1,"savedAt":', JSON.stringify(data.savedAt), ',"docs":['];
@@ -2316,7 +2512,12 @@ $("#restoreInput").onchange = async () => {
       for (const p of d.pages) p.image = await fromDataUrl(p.image);
       await putOne("docs", d); restored++;
     }
-    for (const w of data.writers) { for (const e of w.examples || []) e.crop = await fromDataUrl(e.crop); await putOne("writers", w); }
+    for (const w of data.writers) {
+      for (const e of [...(w.examples || []), ...(w.wordExamples || [])]) e.crop = typeof e.crop === "string" ? await fromDataUrl(e.crop) : null;
+      w.wordExamples = (w.wordExamples || []).filter((e) => e.crop);
+      w.examples = (w.examples || []).filter((e) => e.crop);
+      await putOne("writers", w);
+    }
   } catch (e) {
     console.error(e);
     return notify(`The restore stopped after ${restored} documents: ${e.message}`);
