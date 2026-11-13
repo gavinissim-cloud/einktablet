@@ -885,13 +885,13 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
     const h = line.bottom - line.top;
     const loose = { ...line, top: Math.max(0, line.top - h * 0.15), bottom: Math.min(1000, line.bottom + h * 0.15) };
     // Latin words and numbers read left to right; cutting them into right-to-left pictures would reverse them.
-    // (Hebrew + English: an all-English line is cut into pictures left to right; a line with both is read whole.)
-    const english = MIXED && hasLatin(line.text) && !hasHebrew(line.text);
-    if (!english && (/[A-Za-z]/.test(line.text) || (line.text.match(/\d+/g) || []).length > 1)) return null;
+    // (Hebrew + English: a line with English is checked picture by picture in the pictures' own order
+    // on the page, right to left, and matched to its words by where they stand: see mergeByPlace.)
+    const byPlace = MIXED && hasLatin(line.text);
+    if (!byPlace && (/[A-Za-z]/.test(line.text) || (line.text.match(/\d+/g) || []).length > 1)) return null;
     let words = null;
     try { words = segmentWords(bitmap, loose); } catch (e) { console.warn("Couldn't split a line into words:", e); }
     if (!words) return null;
-    if (english) words.reverse();
     words.forEach((box, pos) => items.push({ line: i, pos, box }));
     return words.length;
   });
@@ -938,7 +938,9 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
     const boxes = items.filter((it) => it.line === i).sort((a, b) => a.pos - b.pos).map((it) => it.box);
     // A picture may hold two words; each of its words counts as unsure.
     const unsure = texts[i].flatMap((t, k) => (sure[i][k] ? [] : t.split(" ")));
-    return { text: joinWords(texts[i]), unsure, segs: texts[i].map((t, k) => ({ text: t || "", box: boxes[k] })) };
+    const segs = texts[i].map((t, k) => ({ text: t || "", box: boxes[k] }));
+    if (MIXED && hasLatin(lines[i].text)) return { pics: texts[i], text: texts[i].join(" "), unsure, segs }; // right to left, as on the page
+    return { text: joinWords(texts[i]), unsure, segs };
   });
 }
 
@@ -1592,7 +1594,10 @@ async function checkWordsOnce(docId, pageId, readId) {
   // Results are matched to lines by box and first reading, not by number (lines may have been added or removed).
   const keyOf = (l) => `${l.top},${l.bottom},${l.left},${l.right}|${l.ai}`;
   const results = new Map();
-  lines.forEach((line, i) => { if (byWord[i]?.text) results.set(keyOf(line), mergeFor(line, byWord[i])); });
+  lines.forEach((line, i) => {
+    if (!byWord[i]?.text) return;
+    results.set(keyOf(line), byWord[i].pics ? mergeByPlace(line, byWord[i], lineDirOn(lines, line), real) : mergeFor(line, byWord[i]));
+  });
   const apply = (l, r) => {
     if (!r || l.text !== l.ai) return false; // edited by the person: leave it
     const has = new Set(r.text.split(/\s+/));
@@ -1619,6 +1624,60 @@ async function checkWordsOnce(docId, pageId, readId) {
     renderPageSoon(live);
   }
   return true;
+}
+
+/**
+ * Hebrew + English: the word-by-word check of a line with English words. The word pictures stand
+ * right to left on the page; the line's words are put in that same order (visualOrder) and the
+ * two are matched word for word. As in Hebrew: where they differ, the picture's own reading
+ * replaces the line's word when it is a real word (Hebrew list or English list), since the
+ * line's word may have been made up from the sentence; otherwise the line's word stays. Either
+ * way the word is highlighted with the other reading one click away. Where the counts differ
+ * (a picture holding two words, a word cut in two), the line's words stay, so no word is ever
+ * moved out of its place. Returns the line in reading order.
+ */
+function mergeByPlace(line, e, dir, real) {
+  const rd = line.ai.split(/\s+/).filter(Boolean);
+  if (!rd.length) return null;
+  const order = visualOrder(rd, dir); // order[v] = index of the word standing at place v (right to left)
+  const rdV = order.map((i) => rd[i]);
+  // Each picture's words, right to left (an English picture of two words reads left to right).
+  const litV = e.pics.flatMap((t) => { const w = String(t || "").split(/\s+/).filter(Boolean); return hasLatin(t) && !hasHebrew(t) ? w.reverse() : w; })
+    .filter((t) => /[\u05d0-\u05eaA-Za-z0-9□]/.test(t)); // a picture of a mark alone: its mark is in the line's word
+  const key = (t) => t.replace(/[^\u05d0-\u05eaA-Za-z0-9□]/g, "");
+  const parts = alignWords(litV.map(key), rdV.map(key));
+  // Readings that hardly agree mean the line was cut up wrongly: keep the line reading.
+  if (parts.filter((x) => x.same).length < rdV.length * 0.4) return null;
+  const outV = [], flagged = new Set(), alts = [];
+  let ia = 0, ib = 0;
+  for (const part of parts) {
+    const a = litV.slice(ia, ia + part.a.length), b = rdV.slice(ib, ib + part.b.length);
+    ia += part.a.length; ib += part.b.length;
+    if (part.same) { outV.push(...b); continue; }
+    if (a.length === b.length) {
+      a.forEach((litW, k) => {
+        const lineW = b[k];
+        // The picture's reading keeps the line word's marks (a comma, a quote) around its letters.
+        const lp = lineW.match(/^([^\u05d0-\u05eaA-Za-z0-9□]*)(.*?)([^\u05d0-\u05eaA-Za-z0-9□]*)$/);
+        const litCore = key(litW) ? litW.replace(/^[^\u05d0-\u05eaA-Za-z0-9□]+|[^\u05d0-\u05eaA-Za-z0-9□]+$/g, "") : litW;
+        const lit = lp[1] + litCore + lp[3];
+        // Only a reading in the same alphabet, of a word with letters, can take a word's place.
+        const script = (t) => (hasHebrew(t) ? "he" : hasLatin(t) ? "en" : "");
+        if (!script(lineW) || script(lit) !== script(lineW)) { outV.push(lineW); if (!real(lineW)) flagged.add(lineW); return; }
+        const chosen = real(lit) ? lit : lineW, other = chosen === lit ? lineW : lit;
+        outV.push(chosen); flagged.add(chosen);
+        if (other !== chosen) alts.push({ word: chosen, alt: other, check: true });
+      });
+    } else {
+      outV.push(...b); // can't be matched word for word: the line's words stay
+      for (const w of b) if (!real(w)) flagged.add(w);
+    }
+  }
+  const words = new Array(rd.length);
+  order.forEach((i, v) => { words[i] = outV[v]; });
+  for (const w of e.unsure) for (const t of words) if (key(t) === key(w) && !real(t)) flagged.add(t);
+  for (const w of words) if (w.includes("□")) flagged.add(w);
+  return { text: words.join(" "), flagged, alts };
 }
 
 /** Align two word lists: [{a: [...], b: [...]}], equal stretches have a and b the same. */
@@ -2505,7 +2564,12 @@ function optionsFor(line, word) {
   // check's reading and abbreviations, then real words with look-alike letters.
   const gem = line.options?.[word] || [];
   const real = (w) => !lexicon?.size || isKnownWord(w);
-  for (const w of [...gem.filter(real), ...gem.filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
+  if (MIXED) {
+    // Only readings in the word's own alphabet, and only real words (or Gemini's own first reading).
+    const script = (t) => (hasHebrew(t) ? "he" : hasLatin(t) ? "en" : "");
+    const mine = gem.filter((w) => !script(word) || script(w) === script(word));
+    for (const w of [...mine.filter(real), ...mine.slice(0, 1).filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
+  } else for (const w of [...gem.filter(real), ...gem.filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
   // The writer's own words and the words of this document are preferred.
   for (const w of suggestVisual(word, 5, preferredWords(word))) add(w, "a real word with look-alike letters");
   return out;

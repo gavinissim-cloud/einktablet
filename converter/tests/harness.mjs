@@ -131,7 +131,7 @@ export async function installFake(page, truth, opts = {}) {
     }
     if (kind === "options") {
       const words = [];
-      for (const { n: k, data } of numbered) { const w = wordsIn(truth, await boxOf(data)).join(" "); words.push({ image: k, options: [w, w + "ה", "ו" + w] }); }
+      for (const { n: k, data } of numbered) { const w = wordsIn(truth, await boxOf(data)).join(" "); words.push({ image: k, options: opts.optionsFor?.(w) || [w, w + "ה", "ו" + w] }); }
       return route.fulfill(sse({ words }));
     }
     if (kind === "pick") return route.fulfill(sse({ answers: numbered.map(({ n: k }) => ({ image: k, choice: "none" })) }));

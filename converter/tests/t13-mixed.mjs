@@ -2,7 +2,7 @@
 // English lines, and lines with both. The test page is laid out by the browser's own text
 // layout (the Unicode bidirectional algorithm), so where each word stands on the page does not
 // come from the converter's code.
-import { start, tagCrops, installFake, allReady, checker, dbDump } from "./harness.mjs";
+import { start, tagCrops, installFake, allReady, checker, dbDump, marksOf } from "./harness.mjs";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 const [S, FILE] = process.argv.slice(2);
@@ -68,7 +68,12 @@ check("test page: the English line starts on the left", pos(1, "Hello").left < 1
 await tagCrops(page);
 // A misread English word ("learn" read as "leam") must be flagged with the right word as a choice.
 const misread = (t) => t.replace("learn", "leam");
-const stats = await installFake(page, truth, { lineText: misread, wordText: misread });
+// …and the line reading makes up words from the sentence in lines with both languages (as Gemini
+// does), while each word's own picture says what is written: the word check must put those back.
+const madeUp = (t) => t.replace("עליכם", "עליהם").replace("קשה", "קשא").replace("families", "familys");
+// Gemini's own readings of each word picture: real words, different for each word.
+const OPTIONS = { York: ["York", "Work", "Yolk"], New: ["New", "Now", "Hew"], "על": ["על", "עד"], "ועל": ["ועל", "ועד"] };
+const stats = await installFake(page, truth, { lineText: (t) => madeUp(misread(t)), wordText: misread, optionsFor: (w) => OPTIONS[w] || [w, w + "ה", "ו" + w] });
 check("the Hebrew + English converter has its own title", (await page.textContent("h1")).includes("Hebrew + English"));
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", `${S}/e2e/mixed.png`);
@@ -78,6 +83,9 @@ const eds = page.locator(".row .line-edit");
 const texts = await eds.allInnerTexts();
 const expect = MIXED_TRUTH.map(misread);
 check("every line read, in reading order", texts.length === expect.length && texts.every((t, i) => t === expect[i]), JSON.stringify(texts));
+check("words made up from the sentence in lines with both languages are replaced by what each word's picture says", texts[3].includes("עליכם") && texts[5].includes("קשה") && texts[4].includes("families"), JSON.stringify(texts));
+const fixedMarks = [...(await marksOf(page, 3)), ...(await marksOf(page, 4)), ...(await marksOf(page, 5))];
+check("…highlighted, so they can be checked", ["עליכם", "families", "קשה"].every((w) => fixedMarks.includes(w)), JSON.stringify(fixedMarks));
 const lineReq = await page.evaluate(() => INSTRUCTIONS + MIXED_RULES);
 check("Gemini is told the pages mix Hebrew and English: each word in its own script, in reading order", /never transliterate/.test(lineReq) && /reading order \(Hebrew right to left, English left to right\)/.test(lineReq));
 check("English words were checked word by word too (the all-English line)", stats.words > 0 && stats.raw.some((r) => r.kind === "words" && /ONE handwritten word, Hebrew or English/.test(r.raw)));
@@ -142,7 +150,8 @@ await page.locator(".row").nth(2).locator(".line-edit").evaluate((el) => {
 });
 await page.waitForSelector(".popover");
 const yorkOpts = await page.locator(".popover button").allTextContents();
-check("Gemini's readings of «York» are offered for «York» (not a neighbour's)", yorkOpts.includes("Yorkה"), JSON.stringify(yorkOpts));
+check("Gemini's readings of «York» are offered for «York» (not a neighbour's)", yorkOpts.includes("Work") && yorkOpts.includes("Yolk") && !yorkOpts.includes("Now"), JSON.stringify(yorkOpts));
+check("…and readings in the other alphabet or made up are left out", !yorkOpts.some((o) => /[\u05d0-\u05ea]/.test(o)), JSON.stringify(yorkOpts));
 await page.keyboard.press("Escape");
 await page.locator(".row").nth(1).locator("mark", { hasText: "leam" }).click();
 await page.waitForSelector(".popover");
@@ -258,14 +267,14 @@ await browser.close();
 // (a fresh browser: a new person's first page)
 ({ browser, ctx, page, errors } = await start(FILE));
 await tagCrops(page);
-const stats2 = await installFake(page, truth2);
+const stats2 = await installFake(page, truth2, { lineText: (t) => t.replace("חידוש", "חידושים") });
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", `${S}/e2e/mixed2.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Page2"); await page.click(".dialog button[type=submit]");
 await allReady(page, stats2);
 await page.waitForFunction(() => /\d+ lines/.test(document.querySelector(".page-head .state")?.textContent || "") && !/checking|getting/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 60000 });
 const eds2 = page.locator(".row .line-edit");
-check("page 2 read", JSON.stringify(await eds2.allInnerTexts()) === JSON.stringify(PAGE2), JSON.stringify(await eds2.allInnerTexts()));
+check("page 2 read (the made-up «חידושים» put back to «חידוש», as its picture says)", JSON.stringify(await eds2.allInnerTexts()) === JSON.stringify(PAGE2), JSON.stringify(await eds2.allInnerTexts()));
 check("the line starting with a Hebrew quote shows left to right, like its page", (await eds2.nth(1).getAttribute("dir")) === "ltr" && (await eds2.nth(0).getAttribute("dir")) === "ltr");
 // the whole quote (a right-to-left stretch) stands at the left start, "and the" after it on the right
 const quoteAt = await eds2.nth(1).evaluate((el) => {
