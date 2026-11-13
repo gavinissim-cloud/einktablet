@@ -110,6 +110,7 @@ export async function installFake(page, truth, opts = {}) {
     const n = ++stats[kind];
     (stats.raw ||= []).push({ kind, raw });
     if (opts.delay) await new Promise((r) => setTimeout(r, opts.delay));
+    if (opts.delayFor) { const d = opts.delayFor(kind, n); if (d === Infinity) return; await new Promise((r) => setTimeout(r, d)); } // Infinity: never answers
     const f = opts.fail?.(kind, n, url);
     if (f) return route.fulfill(err(f.status, f.message));
     const boxes = await page.evaluate(() => window.__boxes).catch(() => null);

@@ -583,12 +583,35 @@ function findLines(src) {
 // ---------- Gemini ----------
 class ReadError extends Error {}
 
+// A request that sends nothing for this long has stalled (Google sometimes leaves a connection
+// hanging): it is dropped and sent again, instead of holding up the whole page.
+// Deep thinking can be silent for longer before it starts answering.
+const STALL_MS = 40 * 1000, STALL_THINKING_MS = 150 * 1000;
 async function streamOnce(body, signal) {
+  const own = new AbortController();
+  const stop = () => own.abort();
+  signal.addEventListener("abort", stop, { once: true });
+  let stalled = false, timer = null;
+  const wait = window.TEST_STALL_MS || (body.generationConfig?.thinkingConfig?.thinkingLevel === "HIGH" ? STALL_THINKING_MS : STALL_MS);
+  const alive = () => { clearTimeout(timer); timer = setTimeout(() => { stalled = true; own.abort(); }, wait); };
+  alive();
+  try {
+    return await streamOnceWith(body, own.signal, alive);
+  } catch (e) {
+    if (stalled && !signal.aborted) throw Object.assign(new ReadError("Gemini stopped answering."), { status: 503, stalled: true });
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", stop);
+  }
+}
+async function streamOnceWith(body, signal, alive) {
   const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${getModel()}:streamGenerateContent?alt=sse`, {
     method: "POST", signal,
     headers: { "Content-Type": "application/json", "x-goog-api-key": getKey() },
     body: JSON.stringify(body),
   });
+  alive();
   if (!res.ok) {
     let msg = `${res.status}`;
     try { msg = (await res.json()).error?.message || msg; } catch {}
@@ -610,6 +633,7 @@ async function streamOnce(body, signal) {
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
+    alive();
     buf += dec.decode(value, { stream: true });
     let i;
     while ((i = buf.search(/\r?\n\r?\n/)) >= 0) {
@@ -688,7 +712,9 @@ async function askJsonNow(parts, schema, thinking) {
         // Busy, a server error, a dropped connection, or a cut-off answer: try again, waiting longer each time.
         const network = e instanceof TypeError && !e.status;
         if ((e.status === 429 || e.status >= 500 || network || e instanceof SyntaxError) && attempt < 3) {
-          await new Promise((r) => setTimeout(r, 3000 * (attempt + 1) ** 2)); continue;
+          // A hung connection is sent again at once; busy or failing, after a growing wait.
+          if (!e.stalled) await new Promise((r) => setTimeout(r, 3000 * (attempt + 1) ** 2));
+          continue;
         }
         if (e.status === 400 && /API key/i.test(e.message)) throw new ReadError("Your Gemini key isn't accepted. Check it in Settings.");
         if (e instanceof SyntaxError) throw new ReadError("Gemini's answer could not be read. Try again.");
@@ -1705,7 +1731,33 @@ const typingIn = (id) => {
   return !!(el && a && el.contains(a) && a.matches("textarea, [contenteditable]"));
 };
 const pendingRedraw = new Set();
+function caretOffset(el) {
+  const sel = getSelection();
+  if (!sel.rangeCount || !el.contains(sel.anchorNode)) return el.textContent.length;
+  const r = document.createRange(); r.selectNodeContents(el); r.setEnd(sel.anchorNode, sel.anchorOffset);
+  return r.toString().length;
+}
+function setCaret(el, offset) {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let pos = 0, node = null, off = 0;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) { node = n; off = n.textContent.length; if (offset <= pos + n.textContent.length) { off = offset - pos; break; } pos += n.textContent.length; }
+  const r = document.createRange();
+  if (node) r.setStart(node, Math.max(0, off)); else r.selectNodeContents(el);
+  r.collapse(!node ? false : true);
+  const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+}
 function renderPageSoon(page) {
+  // Typing in a line that came in while the page is still being read: the page is redrawn right
+  // away as more lines come in (or it is done), and the typing carries on in the same line.
+  const a = document.activeElement;
+  if (a?.dataset?.key && a.closest(".draft-row") && document.getElementById("page-" + page.id)?.contains(a)) {
+    const caret = caretOffset(a), key = a.dataset.key;
+    renderPage(page).then(() => {
+      const ed = [...(document.getElementById("page-" + page.id)?.querySelectorAll("[data-key]") || [])].find((x) => x.dataset.key === key);
+      if (ed) { ed.focus(); setCaret(ed, caret); }
+    });
+    return;
+  }
   if (typingIn(page.id)) {
     if (!pendingRedraw.has(page.id)) {
       pendingRedraw.add(page.id);
@@ -1767,17 +1819,28 @@ async function renderPage(page) {
   };
   head.append(rm);
 
+  if (page.status === "done" && page.draftEdits) applyDraftEdits(page);
   const body = document.createElement("div");
   if (page.status === "working" && page.draft?.length) {
-    body.innerHTML = '<div class="draft-note">Every line is being read at the same time; you can edit as soon as they are all in.</div>';
+    body.innerHTML = '<div class="draft-note">Every line is being read at the same time. You can already fix a line that is in; word choices come when the whole page is in.</div>';
     const draft = page.draft; // the reading may finish while the pictures are cut
     const imgs = await crops(page, draft);
     draft.forEach((l, i) => {
-      const row = document.createElement("div"); row.className = "row"; row.dir = "rtl";
+      const row = document.createElement("div"); row.className = "row draft-row"; row.dir = "rtl";
       row.innerHTML = `<img alt=""><div class="draft-text" dir="rtl" lang="he"></div>`;
       if (imgs[i]) row.querySelector("img").src = imgs[i]; else row.querySelector("img").remove();
-      row.querySelector(".draft-text").textContent = l.done ? l.text : "reading…";
-      if (!l.done) row.querySelector(".draft-text").classList.add("muted");
+      const t = row.querySelector(".draft-text");
+      if (l.done) {
+        // Editable already: what is typed here is kept when the page is done.
+        const edit = page.draftEdits?.[l.top + "," + l.left];
+        t.textContent = edit ? edit.text : l.text;
+        t.classList.add("line-edit"); t.dataset.key = l.top + "," + l.left;
+        try { t.contentEditable = "plaintext-only"; } catch { t.contentEditable = "true"; }
+        if (t.contentEditable !== "plaintext-only") t.contentEditable = "true";
+        t.spellcheck = false;
+        t.oninput = () => { (page.draftEdits ||= {})[l.top + "," + l.left] = { before: l.text, text: t.innerText.replace(/\n+/g, " ") }; };
+        t.onkeydown = (e) => { if (e.key === "Enter") e.preventDefault(); };
+      } else { t.textContent = "reading…"; t.classList.add("muted"); }
       body.append(row);
     });
   } else if (page.status === "done" && !page.lines.length) {
@@ -1798,6 +1861,41 @@ async function renderPage(page) {
   }
   if (el._seq !== seq) return;
   el.replaceChildren(head, body);
+}
+
+/**
+ * Lines fixed while the rest of the page was still being read: their text is used now (where
+ * the line came out the same as the one that was edited), and the fixes are learned.
+ */
+const draftBefore = new WeakMap();
+function applyDraftEdits(page) {
+  const edits = page.draftEdits; delete page.draftEdits;
+  let any = false, lost = 0;
+  for (const [key, e] of Object.entries(edits || {})) {
+    const line = page.lines.find((l) => `${l.top},${l.left}` === key);
+    const text = e.text.replace(/\s+/g, " ").trim();
+    if (text === e.before.replace(/\s+/g, " ").trim()) continue;
+    if (!line || line.text !== line.ai) { lost++; continue; }
+    const before = e.before.replace(/\s+/g, " ").trim();
+    line.text = text;
+    // Still typing in it: learned when they leave the line (from what was read, not from midway).
+    if (document.activeElement?.dataset?.key === key) draftBefore.set(line, before);
+    else learnTyped(page, line, before);
+    line.unclear = (line.unclear || []).filter((u) => text.split(/\s+/).includes(u));
+    line.alts = (line.alts || []).filter((a) => findTokens(text, a.word) >= 0);
+    any = true;
+  }
+  if (any) scheduleSave(page);
+  if (lost) showToast(`${lost} line${lost === 1 ? "" : "s"} you fixed while the page was being read came out differently in the end: please check ${lost === 1 ? "it" : "them"} again.`);
+  return any;
+}
+/** What the person typed over a line's text `before`, word by word, is remembered. */
+function learnTyped(page, line, before) {
+  let idx = 0;
+  for (const part of alignWords(before.split(/\s+/).filter(Boolean), line.text.split(/\s+/).filter(Boolean))) {
+    if (!part.same && part.a.length === part.b.length) part.a.forEach((from, k) => rememberCorrection(page, line, idx + k, from, part.b[k]).catch(() => {}));
+    idx += part.b.length;
+  }
 }
 
 /** Highlight whole words only (a short word inside a longer one is left alone). */
@@ -1822,10 +1920,11 @@ function lineRow(page, line, img) {
   }
   const ed = document.createElement("div");
   ed.className = "line-edit"; ed.lang = "he"; ed.dir = "rtl"; ed.spellcheck = false;
+  ed.dataset.key = line.top + "," + line.left;
   try { ed.contentEditable = "plaintext-only"; } catch { ed.contentEditable = "true"; }
   if (ed.contentEditable !== "plaintext-only") ed.contentEditable = "true";
   ed.innerHTML = highlight(line.text, doubtful());
-  let typed = false;
+  let typed = draftBefore.has(line);
   ed.oninput = () => {
     // A pasted line break or an emptied box can leave <br>/<div>: kept as plain text.
     if (ed.querySelector("br, div")) {
@@ -1840,17 +1939,14 @@ function lineRow(page, line, img) {
     const next = row.nextElementSibling?.querySelector(".line-edit");
     if (next) { next.focus(); const r = document.createRange(); r.selectNodeContents(next); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); }
   };
-  const textBefore = line.text;
+  const textBefore = draftBefore.get(line) ?? line.text;
+  draftBefore.delete(line);
   // What the person typed is learned once they are done with the line.
   ed._commit = () => {
     if (!typed) return false;
     typed = false;
     line.text = line.text.replace(/\s+/g, " ").trim();
-    let idx = 0;
-    for (const part of alignWords(textBefore.split(/\s+/).filter(Boolean), line.text.split(/\s+/).filter(Boolean))) {
-      if (!part.same && part.a.length === part.b.length) part.a.forEach((from, k) => rememberCorrection(page, line, idx + k, from, part.b[k]).catch(() => {}));
-      idx += part.b.length;
-    }
+    learnTyped(page, line, textBefore);
     line.unclear = doubtful();
     line.alts = (line.alts || []).filter((a) => findTokens(line.text, a.word) >= 0);
     return true;
