@@ -54,7 +54,12 @@ const after = await ed.innerText();
 const chosen = opts[0];
 check("the choice replaced exactly the clicked word (not the first «זה»)", after === `זה הספר של ${chosen} האיש הטוב`, after);
 await page.waitForTimeout(1000);
-check("a real word elsewhere is only highlighted, not changed", (await page.locator(".row").first().locator("mark").allTextContents()).includes("זה"));
+// The other «זה» (a real word, maybe right where it is): not changed and not highlighted for it,
+// but the correction is now one of its choices.
+check("a real word elsewhere is not changed or highlighted for the correction", !(await page.locator(".row").first().locator("mark").allTextContents()).includes("זה") && (await ed.innerText()).startsWith("זה "));
+await clickWord(0);
+check("…but the correction is one of its choices", (await page.locator(".popover button").allTextContents()).includes(chosen), JSON.stringify(await page.locator(".popover button").allTextContents()));
+await page.keyboard.press("Escape");
 // More word options
 await page.locator(".page-head button", { hasText: "More word options" }).click();
 await page.waitForFunction(() => !/getting word options/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 60000 });

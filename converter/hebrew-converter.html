@@ -57,6 +57,7 @@ h2 { font-size: 17px; margin: 0 0 10px; }
 .popover { position: absolute; z-index: 5; display: flex; flex-wrap: wrap; max-width: 100%; box-sizing: border-box; gap: 6px; padding: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
 .popover button { padding: 3px 12px; font-size: 19px; background: var(--card); color: var(--ink); border-color: var(--line); }
 .popover button.keep { color: #1a7f37; font-weight: 700; }
+.popover .review-help { flex-basis: 100%; font-size: 12px; color: var(--muted); }
 .popover .word-field { font: 19px "Segoe UI", Arial, sans-serif; padding: 3px 8px; border: 1px solid var(--accent); border-radius: 8px; width: 9em; min-width: 0; }
 .choices { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 15px; color: var(--warn-ink); }
 .choice-group { display: inline-flex; gap: 4px; align-items: center; }
@@ -769,9 +770,9 @@ function cleanLines(lines) {
     if (bottom < top) [top, bottom] = [bottom, top];
     if (right < left) [left, right] = [right, left];
     if (bottom - top < 6) { top = Math.max(0, top - 10); bottom = Math.min(1000, bottom + 10); } // a box with no height
-    const text = (MIXED ? noForeign(String(l.text || "")) : String(l.text || "")).replace(/\s+/g, " ").trim();
+    const text = (MIXED ? hebMarksIn(noForeign(String(l.text || ""))) : String(l.text || "")).replace(/\s+/g, " ").trim();
     const words = new Set(text.split(/\s+/));
-    const unclear = (l.unclear || []).filter((w) => typeof w === "string" && words.has(w));
+    const unclear = (l.unclear || []).filter((w) => typeof w === "string").map(hebMarksIn).filter((w) => words.has(w));
     for (const w of words) if (w.includes("□") && !unclear.includes(w)) unclear.push(w); // unreadable letters
     return { text, top, bottom, left, right, unclear, ...(MIXED && (l.direction === "rtl" || l.direction === "ltr") ? { dir: l.direction } : {}) };
   }).filter((l) => l.text);
@@ -928,7 +929,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
           if (MIXED && hasLatin(lines[it.line].text)) { texts[it.line][it.pos] = ""; sure[it.line][it.pos] = true; }
           continue;
         }
-        texts[it.line][it.pos] = (MIXED ? noForeign(r.text) : r.text).trim().replace(/\s+/g, " ");
+        texts[it.line][it.pos] = (MIXED ? hebMarksIn(noForeign(r.text)) : r.text).trim().replace(/\s+/g, " ");
         sure[it.line][it.pos] = r.sure !== false;
       }
       if (batch.every((it) => texts[it.line][it.pos] !== null)) break;
@@ -1093,6 +1094,21 @@ function isKnownWord(w) {
 // handwritten letter): such a line is read again, and what still isn't Hebrew or English is □.
 const hasForeign = (t) => /(?![\u05d0-\u05eaA-Za-z\u00c0-\u00ff])\p{L}/u.test(String(t));
 const noForeign = (t) => String(t).replace(/\u05f0/g, "וו").replace(/\u05f1/g, "וי").replace(/\u05f2/g, "יי").replace(/(?![\u05d0-\u05eaA-Za-z\u00c0-\u00ff])\p{L}/gu, "□");
+// Hebrew + English: ' and " right after a Hebrew letter are the Hebrew marks geresh ׳ and
+// gershayim ״. Those stay with the Hebrew letters on screen; the keyboard ones belong to no
+// language and jump to the English side of a Hebrew word (גמ' showing as 'גמ).
+const hebMarksIn = (t) => (MIXED ? String(t).replace(/([\u05d0-\u05ea])"(?=[\u05d0-\u05ea])/g, "$1\u05f4").replace(/([\u05d0-\u05ea])'/g, "$1\u05f3") : t);
+/** The same in a line box while the person types, keeping the caret where it is. */
+function hebMarksTyped(ed) {
+  if (!MIXED || !/[\u05d0-\u05ea]['"]/.test(ed.textContent)) return;
+  const sel = getSelection(), keep = sel.rangeCount ? [sel.anchorNode, sel.anchorOffset] : null;
+  const walker = document.createTreeWalker(ed, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const fixed = hebMarksIn(n.data);
+    for (let i = 0; i < n.data.length; i++) if (fixed[i] !== n.data[i]) n.replaceData(i, 1, fixed[i]);
+  }
+  if (keep && keep[0].isConnected) { try { sel.collapse(keep[0], keep[1]); } catch {} }
+}
 const FOREIGN_REMINDER = "\n\nREMINDER: use only Hebrew letters (א–ת) and English letters (A–Z, a–z). Letters of other alphabets (Armenian, Greek, Cyrillic…) never appear on these pages, even when a handwritten letter looks like one.";
 const hasHebrew = (t) => /[\u05d0-\u05ea]/.test(t);
 const hasLatin = (t) => /[A-Za-z]/.test(t);
@@ -1505,7 +1521,7 @@ async function readPage(doc, page, onStep) {
     onStep(1, boxes.map((b) => ({ ...b, text: "", unclear: [] })));
     const read = await readLinesExactly(bitmap, boxes, known, {
       group: LINE_GROUP, thinking: lineThinking(),
-      onLines: (out) => onStep(1, boxes.map((b, i) => ({ ...b, text: MIXED ? noForeign(out[i]?.text ?? "") : out[i]?.text ?? "", unclear: out[i]?.unclear || [], done: !!out[i], ...(out[i]?.dir ? { dir: out[i].dir } : {}) }))),
+      onLines: (out) => onStep(1, boxes.map((b, i) => ({ ...b, text: MIXED ? hebMarksIn(noForeign(out[i]?.text ?? "")) : out[i]?.text ?? "", unclear: out[i]?.unclear || [], done: !!out[i], ...(out[i]?.dir ? { dir: out[i].dir } : {}) }))),
     }).catch((e) => {
       if (/key isn't accepted/.test(e.message)) throw e; // reading the whole page wouldn't help
       console.warn("Reading the lines failed; Gemini reads the whole page instead:", e);
@@ -1526,7 +1542,7 @@ async function readPage(doc, page, onStep) {
     }
     if (read && read.every(Boolean)) {
       // A line answered with nothing stays (empty, flagged) next to its picture, never silently dropped.
-      if (MIXED) for (const r of read) { r.text = noForeign(r.text); r.unclear = r.unclear.map(noForeign); }
+      if (MIXED) for (const r of read) { r.text = hebMarksIn(noForeign(r.text)); r.unclear = r.unclear.map((w) => hebMarksIn(noForeign(w))); }
       lines = boxes.map((b, i) => ({ ...b, text: read[i].text, unclear: read[i].unclear.flatMap((w) => w.split(/\s+/)), ...(read[i].text ? {} : { empty: true }), ...(read[i].dir ? { dir: read[i].dir } : {}) }));
       for (const l of lines) for (const w of l.text.split(/\s+/)) if (w.includes("□") && !l.unclear.includes(w)) l.unclear.push(w);
     }
@@ -1909,6 +1925,19 @@ async function showDoc(id) {
   const doc = await getOne("docs", id);
   if (!doc) return showHome();
   state.doc = doc; state.crops = new Map(); pageBitmaps.clear();
+  if (MIXED) for (const p of doc.pages) {
+    // Pages read before ' and " after Hebrew letters were turned into ׳ and ״.
+    let changed = false;
+    for (const l of p.lines || []) {
+      const t = hebMarksIn(l.text);
+      if (t === l.text) continue;
+      if (l.ai === l.text) l.ai = t;
+      l.text = t; changed = true;
+      l.unclear = (l.unclear || []).map(hebMarksIn);
+      l.alts = (l.alts || []).map((a) => ({ ...a, word: hebMarksIn(a.word), alt: hebMarksIn(a.alt) }));
+    }
+    if (changed && p.status === "done") scheduleSave(p);
+  }
   state.writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
   show("docView");
   $("#docTitle").value = doc.title || "";
@@ -1940,11 +1969,11 @@ async function showWriter(id) {
   const fixes = Object.entries(writerMemory(w).fixes).sort((a, b) => b[1].count - a[1].count || (b[1].at || "").localeCompare(a[1].at || ""));
   if (fixes.length) {
     const head = document.createElement("div"); head.className = "pad"; head.style.borderTop = "1px solid var(--line)";
-    head.innerHTML = `<b>Remembered corrections</b> <span class="muted">— wherever the misreading comes up again in ${esc(w.name)}'s pages it is highlighted, with the correction as the first choice. Nothing is changed by itself.</span>`;
+    head.innerHTML = `<b>Remembered corrections</b> <span class="muted">— offered among the choices when you click the same word on ${esc(w.name)}'s pages. Nothing is changed or highlighted for it, since the word may be right elsewhere.</span>`;
     list.append(head);
     for (const [from, f] of fixes) {
       const row = document.createElement("div"); row.className = "example";
-      row.innerHTML = `<div class="he"><span class="muted">${esc(from)}</span> → <b>${esc(f.to)}</b></div><div class="muted">suggested first · corrected ${f.count}×</div>`;
+      row.innerHTML = `<div class="he"><span class="muted">${esc(from)}</span> → <b>${esc(f.to)}</b></div><div class="muted">offered as a choice · corrected ${f.count}×</div>`;
       const b = document.createElement("button"); b.className = "secondary"; b.textContent = "Forget";
       b.onclick = async () => { await modify("writers", id, (x) => { if (x.memory?.fixes) delete x.memory.fixes[from]; }); showWriter(id); };
       row.append(b); list.append(row);
@@ -2116,6 +2145,14 @@ async function renderPage(page) {
   const view = document.createElement("button"); view.className = "secondary"; view.textContent = "View page";
   view.onclick = () => openLightbox(URL.createObjectURL(page.image));
   head.append(view);
+  const toCheck = page.status === "done" ? page.lines.reduce((n, l) => n + (l.unclear || []).filter((u) => l.text.split(/\s+/).includes(u)).length, 0) : 0;
+  if (toCheck && state.view === "lines") {
+    // Go through the highlighted words one after another: Enter if it's right (or type it), Tab to skip.
+    const go = document.createElement("button"); go.className = "secondary check-words"; go.textContent = "Check words ▸";
+    go.title = "Go through the highlighted words one by one: Enter if the word is right (or type the right word, then Enter), Tab to skip, Esc to stop";
+    go.onclick = () => { const first = document.getElementById("page-" + page.id)?.querySelector(".row:not(.draft-row)"); if (first) reviewFrom(first, 0); };
+    head.append(go);
+  }
   if (page.status === "done" && !page.optionsProgress && !page.checking) {
     const more = document.createElement("button"); more.className = "secondary"; more.textContent = "More word options";
     more.title = "For pages that need a lot of editing: Gemini gives its 5 best readings of every word (takes a little while; you can keep editing)";
@@ -2259,6 +2296,7 @@ function lineRow(page, line, img) {
   ed.innerHTML = highlight(line.text, doubtful(), ed.dir);
   let typed = draftBefore.has(line);
   ed.oninput = () => {
+    hebMarksTyped(ed);
     // A pasted line break or an emptied box can leave <br>/<div>: kept as plain text.
     if (ed.querySelector("br, div")) {
       ed.textContent = ed.innerText.replace(/\n+/g, " ").replace(/^ $/, "");
@@ -2306,6 +2344,7 @@ function lineRow(page, line, img) {
     hint.textContent = "Click a yellow word to see its other readings, or just type over it.";
     row.append(hint);
   }
+  ed._open = (at, opts) => openWordMenu(page, line, row, img, at, opts);
   // Clicking any word shows where it is in the handwriting, and its choices right under it.
   ed.addEventListener("click", () => {
     const at = caretToken(ed);
@@ -2438,7 +2477,7 @@ function isCommonWord(w) {
 }
 // Every word a person corrects is remembered for that writer (writer.memory): which misreading
 // becomes which word, the writer's own words, and a picture of the corrected word. The same
-// misreading elsewhere in the document and on future pages is highlighted with it as the first choice, and
+// word is offered the correction among its choices when it is clicked (nothing is highlighted for it), and
 // Gemini is shown the writer's corrected words to learn their letters.
 const MAX_WORD_EXAMPLES = 300;
 function writerMemory(w) { return w?.memory || { fixes: {}, vocab: {} }; }
@@ -2470,49 +2509,14 @@ async function rememberCorrection(page, line, index, from, to) {
     }).catch((e) => console.warn("Couldn't remember the correction:", e));
     if (saved && state.doc === doc) state.writer = saved;
   }
-  if (state.doc === doc) propagateCorrection(page, line, from, to);
 }
 /**
- * The same misreading elsewhere in this document is highlighted, with the correction as its
- * first choice: one click applies it. Nothing is changed by itself (it may be right there).
+ * What was learned from this writer's corrections, on a freshly read line. Nothing is changed or
+ * highlighted for it: a word corrected before (even several times) may well be right elsewhere.
+ * The correction is offered among the word's choices when it is clicked (optionsFor), and Gemini
+ * sees the corrections when it reads this writer's pages.
  */
-function propagateCorrection(srcPage, srcLine, from, to) {
-  let n = 0;
-  for (const p of state.doc?.pages || []) {
-    if (p.status !== "done") continue;
-    let touched = false;
-    p.lines.forEach((l) => {
-      const hits = l.text.split(/\s+/).filter((t) => t === from).length;
-      if (!hits) return;
-      n += hits;
-      l.unclear = [...new Set([...(l.unclear || []), from])];
-      l.alts = [...(l.alts || []).filter((a) => !(a.word === from && a.alt === to)), { word: from, alt: to, memory: true }];
-      touched = true;
-    });
-    if (touched) { scheduleSave(p); renderPageSoon(p); }
-  }
-  if (n) showToast(`«${from}» appears in ${n} other place${n === 1 ? "" : "s"}: highlighted, with «${to}» as the first choice.`);
-}
-/** Apply what was learned from this writer's corrections to a freshly read line. */
-function applyMemory(l, writer) {
-  const memory = writerMemory(writer);
-  if (!Object.keys(memory.fixes).length) return l;
-  const tokens = l.text.split(/\s+/).filter(Boolean);
-  const unclear = new Set(l.unclear), alts = [...(l.alts || [])];
-  tokens.forEach((t) => {
-    const p = wordParts(t) || { pre: "", core: t, post: "" };
-    const f = fixOf(memory, t) || fixOf(memory, p.core);
-    if (!f || f.to === t) return;
-    const to = fixOf(memory, t) ? f.to : p.pre + f.to + p.post;
-    if (to === t) return;
-    // Never changed by itself: highlighted, with the correction as the first choice.
-    unclear.add(t);
-    if (!alts.some((x) => x.word === t && x.alt === to)) alts.push({ word: t, alt: to, memory: true });
-  });
-  l.unclear = [...unclear].filter((u) => tokens.includes(u));
-  l.alts = alts;
-  return l;
-}
+function applyMemory(l) { return l; }
 /** A small note at the bottom of the window, with an optional button. */
 function showToast(message, action, onAction) {
   document.querySelector(".toast")?.remove();
@@ -2576,7 +2580,7 @@ async function fetchWordOptionsOnce(docId, pageId) {
       const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, true);
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
-        if (it && Array.isArray(r.options)) perLine[it.line][it.pos] = r.options.filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5);
+        if (it && Array.isArray(r.options)) perLine[it.line][it.pos] = r.options.filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map(hebMarksIn).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5);
       }
     } catch (e) { console.warn("Word options failed for some words:", e); }
     done += batch.length; progress();
@@ -2632,7 +2636,8 @@ function preferredWords(except) {
 /** Up to 5 other readings for one word: the check's reading, abbreviations, Gemini's options, real words one letter away. */
 function optionsFor(line, word) {
   const out = [];
-  const remembered = fixOf(writerMemory(state.writer), word);
+  const mem = writerMemory(state.writer), wp = wordParts(word) || (MIXED ? englishParts(word) : null);
+  const remembered = fixOf(mem, word) || (wp && fixOf(mem, wp.core) ? { to: wp.pre + fixOf(mem, wp.core).to + wp.post } : null);
   const add = (w, why) => { if (w !== undefined && w !== word && !out.some((o) => o.text === w) && out.length < 5) out.push({ text: w, why }); };
   if (remembered) add(remembered.to, "how you corrected this before");
   const rank = (a) => (a.memory ? -1 : a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
@@ -2653,7 +2658,31 @@ function optionsFor(line, word) {
 
 /** The menu for one word, right under it: its choices, ✓, and where it is in the handwriting. */
 let closeWordMenu = () => {};
-async function openWordMenu(page, line, row, img, at) {
+/** Which words of a line box are highlighted (their numbers in the line). */
+function markedIndexes(ed) {
+  return [...ed.querySelectorAll("mark")].map((m) => {
+    const r = document.createRange(); r.selectNodeContents(ed); r.setEndBefore(m);
+    return (r.toString().match(/\S+/g) || []).length;
+  });
+}
+/** Open the next highlighted word at or after word `fromIndex` of this row (then the rows below), for checking. */
+function reviewFrom(rowEl, fromIndex) {
+  const rows = [...document.querySelectorAll("#pages .row:not(.draft-row)")].filter((r) => r.querySelector(".line-edit")?._open);
+  let k = rows.indexOf(rowEl);
+  if (k < 0) { k = 0; fromIndex = 0; }
+  for (; k < rows.length; k++, fromIndex = 0) {
+    const ed = rows[k].querySelector(".line-edit");
+    const idx = markedIndexes(ed).find((i) => i >= fromIndex);
+    if (idx === undefined) continue;
+    rows[k].scrollIntoView({ block: "center" });
+    const at = tokenAt(ed.textContent, idx);
+    if (at) { ed._open(at, { review: true }); return true; }
+  }
+  closeWordMenu();
+  showToast("All highlighted words are checked.");
+  return false;
+}
+async function openWordMenu(page, line, row, img, at, { review = false } = {}) {
   closeWordMenu();
   document.querySelector(".popover")?.remove();
   row.querySelectorAll(".word-box").forEach((b) => { b.hidden = true; });
@@ -2678,10 +2707,15 @@ async function openWordMenu(page, line, row, img, at) {
     line.text = replacement === null ? text : replaceTokenAt(text, at.index, replacement);
     if (replacement) rememberCorrection(page, line, at.index, word, replacement).catch(() => {});
     line.alts = (line.alts || []).filter((x) => x.word !== word && findTokens(line.text, x.word) >= 0);
-    line.unclear = line.unclear.filter((u) => u !== word && line.text.split(/\s+/).includes(u));
+    // Confirmed right (✓ or Enter): that word is no longer highlighted. Replaced: another copy of
+    // the same word in the line is still to be checked, so it stays highlighted.
+    line.unclear = line.unclear.filter((u) => (u !== word || replacement !== null) && line.text.split(/\s+/).includes(u));
     closeWordMenu();
     scheduleSave(page);
-    row.replaceWith(lineRow(page, line, img));
+    const fresh = lineRow(page, line, img);
+    row.replaceWith(fresh);
+    // Checking word after word: on to the next highlighted one.
+    if (review) reviewFrom(fresh, at.index + (replacement === null ? 1 : replacement.split(/\s+/).filter(Boolean).length));
   };
   const opts = optionsFor(line, word);
   for (const o of opts) {
@@ -2707,15 +2741,25 @@ async function openWordMenu(page, line, row, img, at) {
   field.oninput = () => { if (MIXED) field.dir = lineDir(field.value || word); };
   field.onkeydown = (e) => {
     e.stopPropagation();
-    if (e.key === "Escape") { closeWordMenu(); ed.focus(); return; }
+    if (e.key === "Escape") { closeWordMenu(); if (!review) ed.focus(); return; }
+    if (e.key === "Tab" && review) { e.preventDefault(); closeWordMenu(); reviewFrom(row, at.index + 1); return; }
     if (e.key !== "Enter") return;
     e.preventDefault();
-    const v = field.value.replace(/\s+/g, " ").trim();
+    const v = hebMarksIn(field.value.replace(/\s+/g, " ").trim());
     if (!v) return;
     settle(v === word ? null : v);
   };
   field.onmousedown = (e) => e.stopPropagation();
   pop.append(field);
+  if (review) {
+    const skip = document.createElement("button");
+    skip.className = "secondary"; skip.textContent = "Skip ›"; skip.title = "Leave this word as it is and go to the next highlighted word (Tab)";
+    skip.onmousedown = (e) => e.preventDefault();
+    skip.onclick = (e) => { e.stopPropagation(); closeWordMenu(); reviewFrom(row, at.index + 1); };
+    const help = document.createElement("div"); help.className = "review-help"; help.dir = "ltr";
+    help.textContent = "Enter: the word is right (or type the right word, then Enter) · Tab: skip · Esc: stop";
+    pop.append(skip, help);
+  }
   // Position: under the word.
   const r = document.createRange();
   const walker = document.createTreeWalker(ed, NodeFilter.SHOW_TEXT);
@@ -2738,6 +2782,7 @@ async function openWordMenu(page, line, row, img, at) {
   const room = row.clientWidth, w = Math.min(Math.ceil(pop.getBoundingClientRect().width) + 1, room);
   pop.style.width = `${w}px`;
   pop.style.right = `${Math.max(0, Math.min(base.right - rect.right, room - w))}px`;
+  if (review) { field.focus(); field.select(); } // Enter right away if the word is right
   const close = (e) => {
     if (e.type === "keydown" && pop.contains(e.target)) return; // typing in the menu's word box
     const typing = e.type === "input" || (e.type === "keydown" && (e.key === "Escape" || e.key.length === 1 || e.key === "Backspace" || e.key === "Delete"));

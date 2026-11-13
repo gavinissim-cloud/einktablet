@@ -277,7 +277,7 @@ await tagCrops(page);
 // …and Gemini types Hebrew phrases in Hebrew order although the writer put them down the other
 // way round («"נאה יותר"» on the page, «"יותר נאה"» typed; «:ו דף» typed «דף ו:»), reads «פרישה» as
 // «שילה», and answers nothing for the picture of the dash.
-const madeUp2 = (t) => t.replace("תוס׳", "The").replace("חידוש", "חידושים").replace("\"נאה יותר\"", "\"יותר נאה\"").replace(":ו דף", "דף ו:").replace("פרישה", "שילה");
+const madeUp2 = (t) => t.replace("תוס׳", "The").replace("חידוש", "חידושים").replace("\"נאה יותר\"", "\"יותר נאה\"").replace(":ו דף", "דף ו:").replace("פרישה", "שילה").replace("ע״י", 'ע"י');
 const armenian = (t) => t.replace(/ד״ה/g, "ՀՋ").replace("מה הדין", "մnu הדין");
 const stats2 = await installFake(page, truth2, { lineText: (t, n) => (n === 1 ? armenian(madeUp2(t)) : madeUp2(t).replace(/ד״ה/g, "מ״ה")), wordText: (t) => (t === "-" ? "" : t) });
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
@@ -291,6 +291,22 @@ check("no letters of another alphabet anywhere (those lines were read again)", t
 check("«The» for «תוס׳», «מ״ה» for «ד״ה», «שילה» for «פרישה» and the made-up «חידושים» are put back as each word's picture says", JSON.stringify(texts2) === JSON.stringify(PAGE2), JSON.stringify(texts2));
 check("Hebrew phrases typed in Hebrew order are turned to the order they stand on the page («\"נאה יותר\"», «:ו דף»)", texts2[3]?.includes("\"נאה יותר\"") && texts2[1]?.includes(":ו דף"), JSON.stringify(texts2));
 check("…highlighted", ["תוס׳", "ד״ה"].every((w) => texts2[1] && 1) && (await marksOf(page, 1)).includes("תוס׳"), JSON.stringify(await marksOf(page, 1)));
+check("keyboard marks after Hebrew letters (ע\"י) become the Hebrew ones (ע״י), which stay with the Hebrew letters", texts2[1]?.includes("ע״י.") && !texts2.some((t) => /[\u05d0-\u05ea]['"][\u05d0-\u05ea]/.test(t)), JSON.stringify(texts2));
+// typing ' after a Hebrew word: it becomes ׳, right where it was typed, and the caret stays after it
+{
+  const ed = eds2.nth(2);
+  await ed.evaluate((el) => {
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) { const i = n.textContent.indexOf("חידוש"); if (i >= 0) { const r = document.createRange(); r.setStart(n, i + 5); r.collapse(true); el.focus(); getSelection().removeAllRanges(); getSelection().addRange(r); break; } }
+  });
+  await page.keyboard.type("'x");
+  const typed = await ed.innerText();
+  check("typing ' after a Hebrew letter gives ׳, with the caret right after it", typed.includes("חידוש׳x"), typed);
+  await page.keyboard.press("Backspace"); await page.keyboard.press("Backspace");
+  check("…and deleting it again leaves the line as it was", (await ed.innerText()) === PAGE2[2], await ed.innerText());
+  await page.locator("#docTitle").click();
+  await page.waitForTimeout(600);
+}
 check("lines written left to right are shown left to right", (await eds2.evaluateAll((els) => els.every((e) => e.dir === "ltr"))));
 // On screen every word stands where it stands on the page: in the written order, left to right.
 const placesOn = (sel) => page.locator(sel).evaluate((el) => [...el.querySelectorAll("span[dir]")].map((sp) => ({ t: sp.textContent, left: Math.round(sp.getBoundingClientRect().left), right: Math.round(sp.getBoundingClientRect().right) })));
