@@ -1941,10 +1941,13 @@ async function showDoc(id) {
     }
     if (changed && p.status === "done") scheduleSave(p);
   }
-  state.writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
+  const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
+  if (state.doc !== doc) return; // left (Back, another document) while it was opening
+  state.writer = writer;
   show("docView");
   $("#docTitle").value = doc.title || "";
   const writers = await getAll("writers");
+  if (state.doc !== doc) return;
   const sel = $("#writerSelect"); sel.innerHTML = "";
   for (const w of writers) sel.add(new Option(w.name, w.id));
   sel.add(new Option("Not sure", ""));
