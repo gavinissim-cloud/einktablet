@@ -74,11 +74,16 @@ export async function readTag(b64) {
   return id;
 }
 
-/** Which true words a box covers (by overlap), in reading order. */
-export function wordsIn(truth, box) {
+/** The true line a box is on. */
+export function lineOf(truth, box) {
   const mid = (box.top + box.bottom) / 2;
   let line = null, best = Infinity;
   for (const l of truth) { const d = Math.abs((l.top + l.bottom) / 2 - mid); if (d < best) { best = d; line = l; } }
+  return line;
+}
+/** Which true words a box covers (by overlap), in reading order. */
+export function wordsIn(truth, box) {
+  const line = lineOf(truth, box);
   if (!line) return [];
   return line.words.filter((w) => {
     const ov = Math.min(w.right, box.right) - Math.max(w.left, box.left);
@@ -138,9 +143,11 @@ export async function installFake(page, truth, opts = {}) {
     if (kind === "lines") {
       const lines = [];
       for (const { n: k, data } of numbered) {
-        let text = wordsIn(truth, { ...(await boxOf(data)), left: 0, right: 1000 }).join(" ");
-        if (opts.lineText) text = opts.lineText(text);
-        lines.push({ image: k, text, unclear: [] });
+        const box = await boxOf(data);
+        let text = wordsIn(truth, { ...box, left: 0, right: 1000 }).join(" ");
+        if (opts.lineText) text = opts.lineText(text, n);
+        const dir = lineOf(truth, box)?.dir;
+        lines.push({ image: k, text, unclear: [], ...(dir ? { direction: dir } : {}) });
       }
       return route.fulfill(sse({ lines }));
     }

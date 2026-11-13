@@ -26,13 +26,14 @@ const layOut = (lines) => page.evaluate(({ lines, W, H }) => {
   x.fillStyle = "#123"; x.font = "56px DejaVu Sans"; x.textBaseline = "alphabetic"; x.textAlign = "left";
   const out = [];
   lines.forEach((line, li) => {
-    const { text, dir = "auto", size = 56 } = typeof line === "string" ? { text: line } : line;
+    const { text, dir = "auto", size = 56, wordByWord = false } = typeof line === "string" ? { text: line } : line;
     x.font = `${size}px DejaVu Sans`;
     const div = document.createElement("div");
     div.dir = dir;
     div.style.cssText = `position:absolute;left:100px;top:0;width:1800px;font:${size}px DejaVu Sans;white-space:pre;word-spacing:${Math.round(size * 0.7)}px;unicode-bidi:plaintext;text-align:start`;
     if (dir !== "auto") div.style.unicodeBidi = "isolate";
-    div.innerHTML = text.split(" ").map((w) => `<span>${w.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</span>`).join(" ");
+    // wordByWord: the writer put each word down in turn along the line, Hebrew words too (each word in its own place).
+    div.innerHTML = text.split(" ").map((w) => `<span${wordByWord ? ` dir="${dir}"` : ""}>${w.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</span>`).join(" ");
     document.body.append(div);
     const base = 170 + li * 210, top = base - 70, bottom = base + 25;
     const box = div.getBoundingClientRect();
@@ -40,29 +41,33 @@ const layOut = (lines) => page.evaluate(({ lines, W, H }) => {
     // its letters in mixed text); a word's place is where its letters are.
     const words = [...div.querySelectorAll("span")].map((s) => {
       const node = s.firstChild, t = node.textContent;
-      let L = Infinity, R = -Infinity;
+      let L = Infinity, R = -Infinity, mL = Infinity, mR = -Infinity;
       // each run of letters drawn whole (in its own direction) where the browser put the run; each mark on its own
       for (const m of t.matchAll(/[\u05d0-\u05ea]+|[A-Za-z0-9]+|[^\u05d0-\u05eaA-Za-z0-9]/g)) {
         const rg = document.createRange(); rg.setStart(node, m.index); rg.setEnd(node, m.index + m[0].length);
         const r = rg.getBoundingClientRect(), left = 100 + (r.left - box.left);
         x.direction = /[\u05d0-\u05ea]/.test(m[0]) ? "rtl" : "ltr"; x.textAlign = "left"; x.fillText(m[0], left, base);
         if (/[\u05d0-\u05eaA-Za-z0-9]/.test(m[0])) { L = Math.min(L, left); R = Math.max(R, left + r.width); }
+        mL = Math.min(mL, left); mR = Math.max(mR, left + r.width);
       }
+      if (L === Infinity) { L = mL; R = mR; } // a word that is only a mark ("-"): where the mark is
       return { text: t, left: (L / W) * 1000, right: (R / W) * 1000 };
     });
+    const lineDir = getComputedStyle(div).direction;
     div.remove();
     const l = Math.min(...words.map((w) => w.left)), r = Math.max(...words.map((w) => w.right));
-    out.push({ text, top: (top / H) * 1000, bottom: (bottom / H) * 1000, left: l - 15, right: r + 15, words });
+    out.push({ text, top: (top / H) * 1000, bottom: (bottom / H) * 1000, left: l - 15, right: r + 15, words, dir: dir === "auto" ? lineDir : dir });
   });
   window.__png = c.toDataURL("image/png");
   return out;
 }, { lines, W, H });
-const truth = await layOut(MIXED_TRUTH);
+// The English line with Hebrew words was written word by word, left to right (the Hebrew words too).
+const truth = await layOut(MIXED_TRUTH.map((text, i) => (i === 3 ? { text, dir: "ltr", wordByWord: true } : text)));
 fs.writeFileSync(`${S}/e2e/mixed.png`, Buffer.from((await page.evaluate(() => window.__png)).split(",")[1], "base64"));
 // the layout itself: English words of a Hebrew line stand left to right, and the other way round
 const pos = (li, w) => truth[li].words.find((x) => x.text === w);
 check("test page: «New» stands left of «York» in the Hebrew line", pos(2, "New").right <= pos(2, "York").left);
-check("test page: «שלום» stands right of «עליכם» in the English line", pos(3, "שלום").left >= pos(3, "עליכם").right);
+check("test page: «שלום» stands left of «עליכם» in the English line (written word by word)", pos(3, "שלום").right <= pos(3, "עליכם").left);
 check("test page: the English line starts on the left", pos(1, "Hello").left < 100);
 
 await tagCrops(page);
@@ -223,13 +228,13 @@ const [dl] = await Promise.all([page.waitForEvent("download"), page.click("#expo
 await dl.saveAs(`${S}/e2e/mixed.docx`);
 const xml = execFileSync("unzip", ["-p", `${S}/e2e/mixed.docx`, "word/document.xml"]).toString();
 const paras = [...xml.matchAll(/<w:p>(.*?)<\/w:p>/g)].map((m) => ({ bidi: m[1].includes("<w:bidi/>"), runs: [...m[1].matchAll(/<w:r>(.*?)<\/w:r>/g)].map((r) => ({ rtl: r[1].includes("<w:rtl/>"), t: (r[1].match(/<w:t[^>]*>(.*?)<\/w:t>/) || [])[1] })) }));
-const para = (text) => paras.find((p) => p.runs.map((r) => r.t).join("") === text.replace(/&/g, "&amp;"));
+const para = (text) => paras.find((p) => p.runs.map((r) => r.t).join("").replace(/\u200e/g, "") === text.replace(/&/g, "&amp;"));
 const p1 = para(MIXED_TRUTH[1]), p2 = para("היום נלמד על New Yorkshire ועל ההיסטוריה שלה."), p3 = para("The words שלום עליכן mean peace be with you.");
 const FINAL = [MIXED_TRUTH[0], MIXED_TRUTH[1], "היום נלמד על New Yorkshire ועל ההיסטוריה שלה.", "The words שלום עליכן mean peace be with you.", "בשנת 1990 עברו 25 people לעיר החדשה.", MIXED_TRUTH[5]];
 check("Word: every line is there, in reading order", FINAL.every((t) => para(t)), JSON.stringify(paras.map((p) => p.runs.map((r) => r.t).join(""))));
 check("Word: an English line is a left-to-right paragraph", p1 && !p1.bidi && p1.runs.every((r) => !r.rtl));
 check("Word: a Hebrew line with «New York» is right to left, with «New York» marked left to right", p2 && p2.bidi && p2.runs.some((r) => !r.rtl && r.t.includes("New Yorkshire")) && p2.runs.filter((r) => r.rtl).map((r) => r.t).join("|").includes("היום"), JSON.stringify(p2));
-check("Word: an English line with «שלום עליכם» is left to right, with the Hebrew marked right to left", p3 && !p3.bidi && p3.runs.some((r) => r.rtl && r.t.includes("שלום עליכן")), JSON.stringify(p3));
+check("Word: an English line with «שלום עליכם» is left to right, each Hebrew word marked right to left and kept in its place", p3 && !p3.bidi && p3.runs.some((r) => r.rtl && r.t.includes("שלום")) && p3.runs.some((r) => r.rtl && r.t.includes("עליכן")) && p3.runs.map((r) => r.t).join("").includes("\u200e"), JSON.stringify(p3));
 
 // Fully separate from the Hebrew-only converter: its own storage, settings and key.
 const db = await dbDump(page);
@@ -251,39 +256,64 @@ await heb.setInputFiles("#restoreInput", `${S}/e2e/mixed-backup.json`);
 await heb.waitForTimeout(500);
 check("a Hebrew + English backup is refused by the Hebrew-only converter", /Hebrew \+ English converter/.test(await heb.textContent(".dialog p").catch(() => "")));
 await heb.close();
-// An English page whose lines fill the width, one of them starting with a Hebrew quote: written
-// left to right like the rest of the page, so it must show and be matched left to right too
-// (not as a Hebrew line because its first letter is Hebrew).
+// Two lines from a real page (as the writer put them down): English sentences with Hebrew words
+// written word by word along the line, left to right, each Hebrew word in its own place, and a
+// colon standing at the left of «ו». Gemini's mistakes on it: Armenian look-alike letters for
+// Hebrew ones, the Hebrew abbreviation «תוס׳» read as the English «The», «ד״ה» read as «מ״ה», and
+// «חידוש» made up into «חידושים».
 const PAGE2 = [
-  "The Gemara asks why only the last one is חייב and not the others",
-  "\"דבקה קסמין בהו תגר\" and the חידוש is כוחו כגופו so we learn",
-  "from here that all who sit on the bench share in the damage.",
+  "handedly broke it. The ד״ה asks מה הדין if the bench",
+  "more נסב - ע״י. The תוס׳ ד״ה on :ו דף asks that",
+  "we could have said a different חידוש here.",
 ];
-const truth2 = await layOut(PAGE2.map((text) => ({ text, dir: "ltr", size: 44 })));
+const truth2 = await layOut(PAGE2.map((text) => ({ text, dir: "ltr", wordByWord: true, size: 48 })));
 fs.writeFileSync(`${S}/e2e/mixed2.png`, Buffer.from((await page.evaluate(() => window.__png)).split(",")[1], "base64"));
-{ const q = truth2[1].words.slice(0, 4), and = truth2[1].words.find((w) => w.text === "and");
-  check("test page 2: the Hebrew quote stands at the left start of its line, before «and»", Math.min(...q.map((w) => w.left)) < 100 && q.every((w) => w.right < and.left)); }
+{ const w = truth2[1].words; check("test page 2: its words stand left to right in the order written", w.every((x, i) => !i || w[i - 1].right < x.left)); }
 await browser.close();
 // (a fresh browser: a new person's first page)
 ({ browser, ctx, page, errors } = await start(FILE));
 await tagCrops(page);
-const stats2 = await installFake(page, truth2, { lineText: (t) => t.replace("חידוש", "חידושים") });
+const madeUp2 = (t) => t.replace("תוס׳", "The").replace("חידוש", "חידושים");
+const armenian = (t) => t.replace(/ד״ה/g, "ՀՋ").replace("מה הדין", "մnu הדין");
+const stats2 = await installFake(page, truth2, { lineText: (t, n) => (n === 1 ? armenian(madeUp2(t)) : madeUp2(t).replace(/ד״ה/g, "מ״ה")) });
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", `${S}/e2e/mixed2.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Page2"); await page.click(".dialog button[type=submit]");
 await allReady(page, stats2);
-await page.waitForFunction(() => /\d+ lines/.test(document.querySelector(".page-head .state")?.textContent || "") && !/checking|getting/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 60000 });
 const eds2 = page.locator(".row .line-edit");
-check("page 2 read (the made-up «חידושים» put back to «חידוש», as its picture says)", JSON.stringify(await eds2.allInnerTexts()) === JSON.stringify(PAGE2), JSON.stringify(await eds2.allInnerTexts()));
-check("the line starting with a Hebrew quote shows left to right, like its page", (await eds2.nth(1).getAttribute("dir")) === "ltr" && (await eds2.nth(0).getAttribute("dir")) === "ltr");
-// the whole quote (a right-to-left stretch) stands at the left start, "and the" after it on the right
-const quoteAt = await eds2.nth(1).evaluate((el) => {
-  const t = el.textContent, q = t.indexOf("\" and"), node = el.firstChild, b = el.getBoundingClientRect();
-  const r = document.createRange(); r.setStart(node, 0); r.setEnd(node, q + 1);
-  const r2 = document.createRange(); r2.setStart(node, q + 2); r2.setEnd(node, q + 5);
-  return { quoteLeft: Math.round(r.getBoundingClientRect().left - b.left), quoteRight: Math.round(r.getBoundingClientRect().right - b.left), andLeft: Math.round(r2.getBoundingClientRect().left - b.left) };
+if (process.env.SHOT) await page.locator("#pages > .card").first().screenshot({ path: process.env.SHOT + "/page2-lines.png" }); // to look at
+const texts2 = await eds2.allInnerTexts();
+check("no letters of another alphabet anywhere (those lines were read again)", texts2.every((t) => !/[\u0530-\u058f\u0370-\u03ff\u0400-\u04ff]/.test(t)) && stats2.lines >= 2, JSON.stringify(texts2) + " " + stats2.lines);
+check("«The» for «תוס׳», «מ״ה» for «ד״ה» and the made-up «חידושים» are put back as each word's picture says", JSON.stringify(texts2) === JSON.stringify(PAGE2), JSON.stringify(texts2));
+check("…highlighted", ["תוס׳", "ד״ה"].every((w) => texts2[1] && 1) && (await marksOf(page, 1)).includes("תוס׳"), JSON.stringify(await marksOf(page, 1)));
+check("lines written left to right are shown left to right", (await eds2.evaluateAll((els) => els.every((e) => e.dir === "ltr"))));
+// On screen every word stands where it stands on the page: in the written order, left to right.
+const placesOn = (sel) => page.locator(sel).evaluate((el) => [...el.querySelectorAll("span[dir]")].map((sp) => ({ t: sp.textContent, left: Math.round(sp.getBoundingClientRect().left), right: Math.round(sp.getBoundingClientRect().right) })));
+const shownLine = await placesOn(".row:nth-child(2) .line-edit").catch(async () => eds2.nth(1).evaluate((el) => [...el.querySelectorAll("span[dir]")].map((sp) => ({ t: sp.textContent, left: Math.round(sp.getBoundingClientRect().left), right: Math.round(sp.getBoundingClientRect().right) }))));
+const inOrder = (ws) => ws.length === PAGE2[1].split(" ").length && ws.every((w, i) => w.t === PAGE2[1].split(" ")[i] && (!i || ws[i - 1].right <= w.left));
+check("on screen, «נסב» stands right after «more», then «-», then «ע״י.»: every word in its place", inOrder(shownLine), JSON.stringify(shownLine));
+// every line: each word's letters on screen in the same left-to-right order as in the handwriting
+for (let li = 0; li < PAGE2.length; li++) {
+  const onScreen = await eds2.nth(li).evaluate((el) => [...el.querySelectorAll("span[dir]")].map((sp) => {
+    // where the word's letters are (not its marks)
+    const n = sp.firstChild.nodeType === 3 ? sp.firstChild : sp.firstChild.firstChild, t = n.textContent;
+    let L = Infinity;
+    for (let i = 0; i < t.length; i++) if (/[\u05d0-\u05eaA-Za-z0-9]/.test(t[i])) { const r = document.createRange(); r.setStart(n, i); r.setEnd(n, i + 1); L = Math.min(L, r.getBoundingClientRect().left); }
+    return { t, L };
+  }));
+  const screenOrder = onScreen.filter((w) => w.L < Infinity).sort((a, b) => a.L - b.L).map((w) => w.t);
+  const pageOrder = truth2[li].words.filter((w) => /[\u05d0-\u05eaA-Za-z0-9]/.test(w.text)).sort((a, b) => a.left - b.left).map((w) => w.text);
+  check(`line ${li + 1}: the words on screen stand in the handwriting's order`, JSON.stringify(screenOrder) === JSON.stringify(pageOrder), JSON.stringify(screenOrder) + " vs " + JSON.stringify(pageOrder));
+}
+const marksAt = await eds2.nth(1).evaluate((el) => {
+  const at = (sp, ch) => { const n = sp.firstChild.nodeType === 3 ? sp.firstChild : sp.firstChild.firstChild; const i = n.textContent.indexOf(ch); const r = document.createRange(); r.setStart(n, i); r.setEnd(n, i + 1); return r.getBoundingClientRect(); };
+  const sps = [...el.querySelectorAll("span[dir]")];
+  const colon = sps.find((s) => s.textContent === ":ו"), eyi = sps.find((s) => s.textContent === "ע״י.");
+  return { colonLeftOfVav: at(colon, ":").right <= at(colon, "ו").left + 1, periodRightOfAyinYud: at(eyi, ".").left >= at(eyi, "ע").right - 1 };
 });
-check("…with the quote at its left start, and the English after it", quoteAt.quoteLeft < 30 && quoteAt.andLeft > quoteAt.quoteRight, JSON.stringify(quoteAt));
+check("the colon stands at the left of «ו», as written", marksAt.colonLeftOfVav, JSON.stringify(marksAt));
+check("the period stands at the right of «ע״י», as written", marksAt.periodRightOfAyinYud, JSON.stringify(marksAt));
+// clicking each word of that line marks that word in the picture
 const lines2 = await page.evaluate(() => state.doc.pages[0].lines.map((l) => ({ top: l.top, bottom: l.bottom, left: l.left, right: l.right })));
 let ok2 = 0; const bad2 = [];
 const words2 = PAGE2[1].split(" ");
@@ -303,28 +333,37 @@ for (let wi = 0; wi < words2.length; wi++) {
   const trueMid = 100 * (1 - (((tw.left + tw.right) / 2 / 1000) * W - x0) / (x1 - x0));
   if (spot && trueMid >= spot.right - 1 && trueMid <= spot.right + spot.width + 1) ok2++; else bad2.push(`${words2[wi]}: ${JSON.stringify(spot)} true ${trueMid.toFixed(1)}`);
 }
-check(`…and clicking each of its words marks that word in the picture (${ok2}/${words2.length})`, ok2 === words2.length, bad2.join("; "));
+check(`clicking each of its words marks that word in the picture (${ok2}/${words2.length})`, ok2 === words2.length, bad2.join("; "));
+// «תוס׳»: the line's reading «The» is one click away
 await page.keyboard.press("Escape");
+await page.locator(".row").nth(1).locator("mark", { hasText: "תוס׳" }).click();
+await page.waitForSelector(".popover");
+const tosOpts = await page.locator(".popover button").allTextContents();
+check("«תוס׳» offers the line's reading «The» as a choice", tosOpts.includes("The"), JSON.stringify(tosOpts));
+await page.keyboard.press("Escape");
+// document view: the same places
 await page.click("#viewDoc"); await page.waitForSelector(".doc");
-const docLine = await page.locator(".doc").evaluate((d) => {
-  // where the quote of the second line stands in the document view
-  const t = d.firstChild.nodeType === 3 ? null : null;
-  const walker = document.createTreeWalker(d, NodeFilter.SHOW_TEXT); let found = null;
-  for (let n = walker.nextNode(); n && !found; n = walker.nextNode()) { const i = n.textContent.indexOf("\"דבקה"), j = n.textContent.indexOf("\" and"); if (i >= 0) { const r = document.createRange(); r.setStart(n, i); r.setEnd(n, j + 1); found = Math.round(r.getBoundingClientRect().left - d.getBoundingClientRect().left); } }
-  return found;
+const docWords = await page.locator(".doc").evaluate((d) => {
+  const spans = [...d.querySelectorAll("span[dir]")]; const i = spans.findIndex((s) => s.textContent === "more");
+  return spans.slice(i, i + 12).map((sp) => ({ t: sp.textContent, left: Math.round(sp.getBoundingClientRect().left), right: Math.round(sp.getBoundingClientRect().right) }));
 });
-check("document view: that line stands left to right too (the quote on the left)", docLine !== null && docLine < 50, String(docLine));
-// editing in the document view keeps the text clean (the direction marks are never saved)
+check("document view: every word in its place too", inOrder(docWords), JSON.stringify(docWords));
 await page.locator(".doc").evaluate((d) => { d.append(""); d.dispatchEvent(new Event("input")); });
 await page.waitForTimeout(1200);
 const saved2 = (await dbDump(page)).docs[0].pages[0].lines.map((l) => l.text);
-check("…and its direction marks are never saved", JSON.stringify(saved2) === JSON.stringify(PAGE2), JSON.stringify(saved2));
+check("…and its invisible direction marks are never saved", JSON.stringify(saved2) === JSON.stringify(PAGE2), JSON.stringify(saved2));
 await page.click("#viewLines");
+// Word and TXT: the same order, kept by invisible left-to-right marks
 const [dl2] = await Promise.all([page.waitForEvent("download"), page.click("#exportWord")]);
 await dl2.saveAs(`${S}/e2e/mixed2.docx`);
 const xml2 = execFileSync("unzip", ["-p", `${S}/e2e/mixed2.docx`, "word/document.xml"]).toString();
-const q = [...xml2.matchAll(/<w:p>(.*?)<\/w:p>/g)].find((m) => m[1].includes("דבקה"));
-check("Word: that line is a left-to-right paragraph, the quote marked right to left", q && !q[1].includes("<w:bidi/>") && /<w:rtl\/>[^]*?דבקה/.test(q[1]), q ? q[1].slice(0, 300) : "missing");
+const q = [...xml2.matchAll(/<w:p>(.*?)<\/w:p>/g)].find((m) => m[1].includes("נסב"));
+const qText = q ? [...q[1].matchAll(/<w:t[^>]*>(.*?)<\/w:t>/g)].map((m) => m[1]).join("") : "";
+check("Word: a left-to-right paragraph, each Hebrew word kept in its place with a left-to-right mark", q && !q[1].includes("<w:bidi/>") && qText.replace(/\u200e/g, "") === PAGE2[1] && (qText.match(/\u200e/g) || []).length >= words2.length, qText);
+const [dl3] = await Promise.all([page.waitForEvent("download"), page.click("#exportTxt")]);
+await dl3.saveAs(`${S}/e2e/mixed2.txt`);
+const txt2 = fs.readFileSync(`${S}/e2e/mixed2.txt`, "utf8").split("\n");
+check("TXT: the same, with the marks", txt2[1].replace(/\u200e/g, "") === PAGE2[1] && txt2[1].includes("\u200e"), JSON.stringify(txt2[1]));
 
 check("no page errors", errors.length === 0, errors.join("\n"));
 await browser.close();

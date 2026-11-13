@@ -678,9 +678,11 @@ async function streamOnceWith(body, signal, alive) {
 // Hebrew + English only: how to write pages in both languages.
 const MIXED_RULES = MIXED ? `
 
-PAGES IN HEBREW AND ENGLISH. These pages mix Hebrew and English: some lines are all Hebrew, some all English, some have both. Write every word in the script it is written in, letter for letter. Never translate and never transliterate: an English word stays in Latin letters, a Hebrew word in Hebrew letters, exactly as written.
-Write each line's text in logical order, the way it would be typed on a keyboard: the words in the order they are read. A Hebrew line is read right to left; an English phrase inside it is read left to right, so its words are written in their left-to-right order (for example a Hebrew line with "New York" in it is typed with "New" before "York"). An English line is read left to right; a Hebrew phrase inside it is read right to left. Never reverse the letters of a word.
-English: keep capital and small letters, spelling, apostrophes, numbers and punctuation exactly as written; do not correct spelling or grammar. English letters that look alike in handwriting (a/o/u, e/c, i/l/t, n/h/r/u/v, m/rn, d/cl, g/q/y, b/h/k, s/5, o/0, l/1): decide from the strokes. Don't read English letters as Hebrew ones or Hebrew letters as English ones (ו and l, ס and o, ן and l, ר and r look alike).` : "";
+PAGES IN HEBREW AND ENGLISH. These pages mix Hebrew and English: some lines are written right to left (Hebrew sentences), some left to right (English sentences), and many have words of both. Write every word in the script it is written in, letter for letter. Never translate and never transliterate: an English word stays in English letters, a Hebrew word in Hebrew letters.
+USE ONLY HEBREW LETTERS (א–ת, with ך ם ן ף ץ) AND ENGLISH LETTERS (A–Z, a–z), digits and the punctuation marks listed. Never use letters of any other alphabet (no Armenian, Greek, Cyrillic, Arabic, symbols or look-alike characters), even when a handwritten letter resembles one: every letter on these pages is Hebrew or English. A letter you can't read is □.
+For each line, say which way it is written: "ltr" for a line written left to right (an English sentence, even with Hebrew words in it), "rtl" for a line written right to left (a Hebrew sentence, even with English words in it).
+WORD ORDER. In a line written left to right ("ltr"), write the words and marks exactly in the order they stand on the page from left to right, Hebrew words included: a Hebrew word written further left comes first, even inside a Hebrew phrase. Each Hebrew word's own letters are written in their normal Hebrew order. A mark standing to the left of a word is written before it, one standing to its right after it (for example, if a Hebrew reference stands on the page as ":ו דף" with the colon at the far left, write ":ו דף"). In a line written right to left ("rtl"), write it as Hebrew is typed: the words from right to left, and an English phrase inside it in its own left-to-right order.
+English: keep capital and small letters, spelling, apostrophes, numbers and punctuation exactly as written; do not correct spelling or grammar. English letters that look alike in handwriting (a/o/u, e/c, i/l/t, n/h/r/u/v, m/rn, d/cl, g/q/y, b/h/k, s/5, o/0, l/1): decide from the strokes. Hebrew abbreviations (ד״ה, תוס׳, ע״ש, ר״ל…) appear inside English sentences too: read them as Hebrew. Don't read Hebrew letters as English ones or English letters as Hebrew ones (ו and l, ס and o, ן and l, ר and r, ת and n look alike); decide by the strokes and by the language of the word.` : "";
 const EXACT_RULES = `KEEP THE WRITER'S EXACT WORDS, SPELLING AND GRAMMAR. Never add or remove a letter to make a word "correct": if the writer wrote הסטוריה, write הסטוריה, not היסטוריה; if they wrote אמא, don't write אימא; if they used the wrong gender, tense or preposition, or left a word out, keep it exactly that way. Never add, drop, reorder or replace words, and never add punctuation the writer didn't write. Read each word from its own letters, not from what the sentence suggests. The texts are often Torah or Gemara study notes mixing Hebrew and Aramaic (for example דבלא, היגיע, מזונותיה, דצורת, ממילא, ואי); their spellings and words are correct as written. Never turn them into everyday modern Hebrew.
 
 WHEN YOU CAN'T READ A LETTER, WRITE □ IN ITS PLACE. For example, if you can read מז and נותיה but not the letter between them, write מז□נותיה. If you can't read a whole word, write one □ for each letter you think it has, or just □□□. A □ is always right; a guessed letter or word is always wrong. Never fill a hard-to-read spot with a word that fits the sentence. (Use □ only for unreadable letters; a question mark the writer wrote is written as ?.)
@@ -767,14 +769,19 @@ function cleanLines(lines) {
     if (bottom < top) [top, bottom] = [bottom, top];
     if (right < left) [left, right] = [right, left];
     if (bottom - top < 6) { top = Math.max(0, top - 10); bottom = Math.min(1000, bottom + 10); } // a box with no height
-    const text = String(l.text || "").replace(/\s+/g, " ").trim();
+    const text = (MIXED ? noForeign(String(l.text || "")) : String(l.text || "")).replace(/\s+/g, " ").trim();
     const words = new Set(text.split(/\s+/));
     const unclear = (l.unclear || []).filter((w) => typeof w === "string" && words.has(w));
     for (const w of words) if (w.includes("□") && !unclear.includes(w)) unclear.push(w); // unreadable letters
-    return { text, top, bottom, left, right, unclear };
+    return { text, top, bottom, left, right, unclear, ...(MIXED && (l.direction === "rtl" || l.direction === "ltr") ? { dir: l.direction } : {}) };
   }).filter((l) => l.text);
 }
 
+// Hebrew + English: each line also says which way it was written ("rtl" or "ltr").
+if (MIXED) for (const sch of [EXACT_SCHEMA, LINE_SCHEMA]) {
+  sch.properties.lines.items.properties.direction = { type: "string", enum: ["rtl", "ltr"] };
+  sch.properties.lines.items.required.push("direction");
+}
 const ask = async (parts) => cleanLines((await askJson(parts, LINE_SCHEMA)).lines || []);
 
 const EXACT_BATCH = 12; // lines per request when a line can't be split into words
@@ -915,7 +922,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
         if (!it || typeof r.text !== "string" || !r.text.trim()) continue; // missing or empty: that line is read whole instead
-        texts[it.line][it.pos] = r.text.trim().replace(/\s+/g, " ");
+        texts[it.line][it.pos] = (MIXED ? noForeign(r.text) : r.text).trim().replace(/\s+/g, " ");
         sure[it.line][it.pos] = r.sure !== false;
       }
       if (batch.every((it) => texts[it.line][it.pos] !== null)) break;
@@ -1076,6 +1083,11 @@ function isKnownWord(w) {
     lexicon.has(part) || lexicon.has(part.replace(/["']$/, "")));
 }
 // ---------- English words (Hebrew + English only) ----------
+// Letters of any other alphabet (Gemini sometimes writes an Armenian or Greek look-alike for a
+// handwritten letter): such a line is read again, and what still isn't Hebrew or English is □.
+const hasForeign = (t) => /(?![\u05d0-\u05eaA-Za-z\u00c0-\u00ff])\p{L}/u.test(String(t));
+const noForeign = (t) => String(t).replace(/\u05f0/g, "וו").replace(/\u05f1/g, "וי").replace(/\u05f2/g, "יי").replace(/(?![\u05d0-\u05eaA-Za-z\u00c0-\u00ff])\p{L}/gu, "□");
+const FOREIGN_REMINDER = "\n\nREMINDER: use only Hebrew letters (א–ת) and English letters (A–Z, a–z). Letters of other alphabets (Armenian, Greek, Cyrillic…) never appear on these pages, even when a handwritten letter looks like one.";
 const hasHebrew = (t) => /[\u05d0-\u05ea]/.test(t);
 const hasLatin = (t) => /[A-Za-z]/.test(t);
 /** An English word split into leading punctuation, the word, trailing punctuation (null if it has Hebrew or no Latin letters). */
@@ -1155,6 +1167,7 @@ function lineDir(text) {
  * otherwise (it fills the width) it goes the way of the page's main language.
  */
 function lineDirOn(lines, line) {
+  if (line?.dir === "rtl" || line?.dir === "ltr") return line.dir; // as Gemini saw it written
   const text = line?.text || "";
   const h = (text.match(/[\u05d0-\u05ea]/g) || []).length, l = (text.match(/[A-Za-z]/g) || []).length;
   if (!h && !l) return pageDir(lines);
@@ -1176,6 +1189,23 @@ function pageDir(lines) {
   let h = 0, l = 0;
   for (const x of lines || []) { const t = x.text || ""; h += (t.match(/[\u05d0-\u05ea]/g) || []).length; l += (t.match(/[A-Za-z]/g) || []).length; }
   return l > h ? "ltr" : "rtl";
+}
+/**
+ * Where a line's words stand on the page, right to left (the order of the word pictures), as
+ * indices into its text. A line written left to right holds its words in the order they stand
+ * from left to right (Hebrew words too), so this is simply backwards; a line written right to
+ * left is typed the Hebrew way, so its English phrases stand left to right (visualOrder).
+ */
+function placeOrder(words, dir) {
+  return dir === "ltr" ? words.map((_, i) => i).reverse() : visualOrder(words, "rtl");
+}
+/** A line written left to right: shown word by word in its own order (each word kept in its place, a Hebrew one too). */
+const wordByWord = (dir) => MIXED && dir === "ltr";
+/** A line's text for a file or the clipboard: a line written left to right gets an invisible
+ *  left-to-right mark after each word, so other programs show its words in the same places. */
+function exportLine(text, dir) {
+  if (!wordByWord(dir)) return text;
+  return "\u200e" + text.split(/(\s+)/).map((t) => (/\S/.test(t) ? t + "\u200e" : t)).join("");
 }
 function visualOrder(words, dir) {
   const { rtl, cls } = wordDirections(words, dir);
@@ -1357,7 +1387,7 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
  * "improve") the sentence. Returns the literal text per line (null where a
  * line could not be read).
  */
-async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thinking = THINKING, onLines = () => {} } = {}) {
+async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thinking = THINKING, onLines = () => {}, extra = "" } = {}) {
   const order = lines.map((_, i) => i);
   for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
   const out = new Array(lines.length).fill(null);
@@ -1366,7 +1396,7 @@ async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thi
   for (let i = 0; i < order.length; i += group) batches.push(order.slice(i, i + group));
   let failures = 0;
   await Promise.all(batches.map(async (batch) => {
-    const parts = [...known, { text: forMixed(`Below are ${batch.length} images, each one handwritten line cut out of a page, in random order (they do not form a text together). For each image, transcribe exactly the letters written on the main line in the middle of the image, letter by letter and word by word, right to left. Ignore cut-off bits of the lines above or below it. Do not guess from meaning: a word you can't read fully goes in "unclear" with the letters you can see. Keep the writer's spelling and grammar exactly, even when wrong. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.`, ["letter by letter and word by word, right to left.", "letter by letter and word by word, in reading order (Hebrew right to left, English left to right; see the rules for pages in Hebrew and English)."]) }];
+    const parts = [...known, { text: forMixed(`Below are ${batch.length} images, each one handwritten line cut out of a page, in random order (they do not form a text together). For each image, transcribe exactly the letters written on the main line in the middle of the image, letter by letter and word by word, right to left. Ignore cut-off bits of the lines above or below it. Do not guess from meaning: a word you can't read fully goes in "unclear" with the letters you can see. Keep the writer's spelling and grammar exactly, even when wrong. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.`, ["letter by letter and word by word, right to left.", "letter by letter and word by word, in the word order the rules for pages in Hebrew and English give (a line written left to right: its words from left to right as they stand on the page, Hebrew words too)."]) + extra }];
     for (const [k, idx] of batch.entries()) {
       const box = lines[idx];
       // A little extra height, since line boxes are approximate.
@@ -1382,6 +1412,7 @@ async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thi
         const idx = batch[Number(r.image) - 1];
         if (idx === undefined || typeof r.text !== "string") continue;
         out[idx] = { text: r.text.replace(/\s+/g, " ").trim(), unclear: (Array.isArray(r.unclear) ? r.unclear : []).filter((w) => typeof w === "string") };
+        if (MIXED && (r.direction === "rtl" || r.direction === "ltr")) out[idx].dir = r.direction;
       }
       onLines(out);
     } catch (e) {
@@ -1468,7 +1499,7 @@ async function readPage(doc, page, onStep) {
     onStep(1, boxes.map((b) => ({ ...b, text: "", unclear: [] })));
     const read = await readLinesExactly(bitmap, boxes, known, {
       group: LINE_GROUP, thinking: lineThinking(),
-      onLines: (out) => onStep(1, boxes.map((b, i) => ({ ...b, text: out[i]?.text ?? "", unclear: out[i]?.unclear || [], done: !!out[i] }))),
+      onLines: (out) => onStep(1, boxes.map((b, i) => ({ ...b, text: MIXED ? noForeign(out[i]?.text ?? "") : out[i]?.text ?? "", unclear: out[i]?.unclear || [], done: !!out[i], ...(out[i]?.dir ? { dir: out[i].dir } : {}) }))),
     }).catch((e) => {
       if (/key isn't accepted/.test(e.message)) throw e; // reading the whole page wouldn't help
       console.warn("Reading the lines failed; Gemini reads the whole page instead:", e);
@@ -1481,9 +1512,16 @@ async function readPage(doc, page, onStep) {
       // A line still without an entry although Gemini answered for it has nothing readable on it.
       missing.forEach((i, k) => { if (again[k]) read[i] = again[k]; else if (again.answered?.has(k)) read[i] = { text: "", unclear: [] }; });
     }
+    // Hebrew + English: a line with letters of another alphabet is read once more on its own.
+    const foreign = MIXED && read ? read.map((r, i) => (r && hasForeign(r.text) ? i : null)).filter((i) => i !== null) : [];
+    if (foreign.length) {
+      const again = await readLinesExactly(bitmap, foreign.map((i) => boxes[i]), known, { group: 1, thinking: lineThinking(), extra: FOREIGN_REMINDER }).catch(() => []);
+      foreign.forEach((i, k) => { if (again[k] && !hasForeign(again[k].text)) read[i] = again[k]; });
+    }
     if (read && read.every(Boolean)) {
       // A line answered with nothing stays (empty, flagged) next to its picture, never silently dropped.
-      lines = boxes.map((b, i) => ({ ...b, text: read[i].text, unclear: read[i].unclear.flatMap((w) => w.split(/\s+/)), ...(read[i].text ? {} : { empty: true }) }));
+      if (MIXED) for (const r of read) { r.text = noForeign(r.text); r.unclear = r.unclear.map(noForeign); }
+      lines = boxes.map((b, i) => ({ ...b, text: read[i].text, unclear: read[i].unclear.flatMap((w) => w.split(/\s+/)), ...(read[i].text ? {} : { empty: true }), ...(read[i].dir ? { dir: read[i].dir } : {}) }));
       for (const l of lines) for (const w of l.text.split(/\s+/)) if (w.includes("□") && !l.unclear.includes(w)) l.unclear.push(w);
     }
     // Otherwise (some lines couldn't be read at all) Gemini reads the whole page instead.
@@ -1639,7 +1677,7 @@ async function checkWordsOnce(docId, pageId, readId) {
 function mergeByPlace(line, e, dir, real) {
   const rd = line.ai.split(/\s+/).filter(Boolean);
   if (!rd.length) return null;
-  const order = visualOrder(rd, dir); // order[v] = index of the word standing at place v (right to left)
+  const order = placeOrder(rd, dir); // order[v] = index of the word standing at place v (right to left)
   const rdV = order.map((i) => rd[i]);
   // Each picture's words, right to left (an English picture of two words reads left to right).
   const litV = e.pics.flatMap((t) => { const w = String(t || "").split(/\s+/).filter(Boolean); return hasLatin(t) && !hasHebrew(t) ? w.reverse() : w; })
@@ -1657,13 +1695,16 @@ function mergeByPlace(line, e, dir, real) {
     if (a.length === b.length) {
       a.forEach((litW, k) => {
         const lineW = b[k];
-        // The picture's reading keeps the line word's marks (a comma, a quote) around its letters.
-        const lp = lineW.match(/^([^\u05d0-\u05eaA-Za-z0-9□]*)(.*?)([^\u05d0-\u05eaA-Za-z0-9□]*)$/);
-        const litCore = key(litW) ? litW.replace(/^[^\u05d0-\u05eaA-Za-z0-9□]+|[^\u05d0-\u05eaA-Za-z0-9□]+$/g, "") : litW;
+        // The picture's reading keeps the line word's punctuation (a comma, a colon, a bracket)
+        // around its letters; an abbreviation's own marks (׳ ״) belong to the word and stay.
+        const P = "[.,:;!?()\\[\\]{}\\-\u2013\u2014\u2026/]";
+        const lp = lineW.match(new RegExp(`^(${P}*)(.*?)(${P}*)$`));
+        const litCore = key(litW) ? litW.replace(new RegExp(`^${P}+|${P}+$`, "g"), "") : litW;
         const lit = lp[1] + litCore + lp[3];
-        // Only a reading in the same alphabet, of a word with letters, can take a word's place.
-        const script = (t) => (hasHebrew(t) ? "he" : hasLatin(t) ? "en" : "");
-        if (!script(lineW) || script(lit) !== script(lineW)) { outV.push(lineW); if (!real(lineW)) flagged.add(lineW); return; }
+        // Only a word with letters takes the place of a word with letters (never a number or a mark);
+        // it may be in the other alphabet (a Hebrew abbreviation read as an English word, "The" for תוס׳).
+        const letters = (t) => hasHebrew(t) || hasLatin(t);
+        if (!letters(lineW) || !letters(lit) || (hasHebrew(lit) && hasLatin(lit))) { outV.push(lineW); if (!real(lineW)) flagged.add(lineW); return; }
         const chosen = real(lit) ? lit : lineW, other = chosen === lit ? lineW : lit;
         outV.push(chosen); flagged.add(chosen);
         if (other !== chosen) alts.push({ word: chosen, alt: other, check: true });
@@ -2084,7 +2125,7 @@ async function renderPage(page) {
       if (l.done) {
         // Editable already: what is typed here is kept when the page is done.
         const edit = page.draftEdits?.[l.top + "," + l.left];
-        t.textContent = edit ? edit.text : l.text;
+        if (wordByWord(t.dir)) t.innerHTML = highlight(edit ? edit.text : l.text, [], t.dir); else t.textContent = edit ? edit.text : l.text;
         t.classList.add("line-edit"); t.dataset.key = l.top + "," + l.left;
         try { t.contentEditable = "plaintext-only"; } catch { t.contentEditable = "true"; }
         if (t.contentEditable !== "plaintext-only") t.contentEditable = "true";
@@ -2104,7 +2145,7 @@ async function renderPage(page) {
     // Hebrew + English: each line starts with an invisible direction mark (the way it was
     // written, as in the line-by-line view); the marks are never saved.
     const mark = (l) => (MIXED ? (lineDirOn(page.lines, l) === "ltr" ? "\u200e" : "\u200f") : "");
-    d.innerHTML = page.lines.map((l) => mark(l) + highlight(l.text, l.unclear)).join("\n");
+    d.innerHTML = page.lines.map((l) => mark(l) + highlight(l.text, l.unclear, MIXED ? lineDirOn(page.lines, l) : "rtl")).join("\n");
     const original = page.lines.map((l) => ({ ...l }));
     d.oninput = () => {
       const texts = d.innerText.replace(/\n$/, "").split("\n").map((t) => (MIXED ? t.replace(/[\u200e\u200f]/g, "") : t));
@@ -2179,7 +2220,7 @@ function lineRow(page, line, img) {
   ed.dataset.key = line.top + "," + line.left;
   try { ed.contentEditable = "plaintext-only"; } catch { ed.contentEditable = "true"; }
   if (ed.contentEditable !== "plaintext-only") ed.contentEditable = "true";
-  ed.innerHTML = highlight(line.text, doubtful());
+  ed.innerHTML = highlight(line.text, doubtful(), ed.dir);
   let typed = draftBefore.has(line);
   ed.oninput = () => {
     // A pasted line break or an emptied box can leave <br>/<div>: kept as plain text.
@@ -2286,7 +2327,7 @@ async function wordSpot(page, line, index, count, text) {
   let words = text.split(/\s+/).filter(Boolean), at = index;
   if (MIXED) {
     // The word pictures stand right to left on the page; English words in reading order don't.
-    const order = visualOrder(words, lineDirOn(page.lines, { ...line, text }));
+    const order = placeOrder(words, lineDirOn(page.lines, { ...line, text }));
     words = order.map((i) => words[i]); at = order.indexOf(index);
   }
   const box = matchWordToBoxes(boxes, words, at);
@@ -2499,7 +2540,7 @@ async function fetchWordOptionsOnce(docId, pageId) {
       const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, true);
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
-        if (it && Array.isArray(r.options)) perLine[it.line][it.pos] = r.options.filter((o) => typeof o === "string" && o.trim()).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5);
+        if (it && Array.isArray(r.options)) perLine[it.line][it.pos] = r.options.filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5);
       }
     } catch (e) { console.warn("Word options failed for some words:", e); }
     done += batch.length; progress();
@@ -2510,7 +2551,7 @@ async function fetchWordOptionsOnce(docId, pageId) {
     const segs = perLine[i];
     if (!segs) return;
     let tokens = l.text.split(/\s+/).filter(Boolean);
-    if (MIXED) tokens = visualOrder(tokens, lineDirOn(page.lines, l)).map((i) => tokens[i]); // in the pictures' order (right to left on the page)
+    if (MIXED) tokens = placeOrder(tokens, lineDirOn(page.lines, l)).map((i) => tokens[i]); // in the pictures' order (right to left on the page)
     const map = {};
     const first = segs.map((o) => o?.[0] || "");
     if (segs.length === tokens.length) tokens.forEach((t, k) => { if (segs[k]?.length) map[t] = segs[k]; });
@@ -2565,9 +2606,8 @@ function optionsFor(line, word) {
   const gem = line.options?.[word] || [];
   const real = (w) => !lexicon?.size || isKnownWord(w);
   if (MIXED) {
-    // Only readings in the word's own alphabet, and only real words (or Gemini's own first reading).
-    const script = (t) => (hasHebrew(t) ? "he" : hasLatin(t) ? "en" : "");
-    const mine = gem.filter((w) => !script(word) || script(w) === script(word));
+    // Only real words (or Gemini's own first reading), never a word mixing the two alphabets.
+    const mine = gem.filter((w) => !(hasHebrew(w) && hasLatin(w)));
     for (const w of [...mine.filter(real), ...mine.slice(0, 1).filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
   } else for (const w of [...gem.filter(real), ...gem.filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
   // The writer's own words and the words of this document are preferred.
@@ -2679,9 +2719,12 @@ async function openWordMenu(page, line, row, img, at) {
   armed = setTimeout(() => { document.addEventListener("mousedown", close, true); document.addEventListener("keydown", close, true); }, 0);
 }
 
-function highlight(text, unclear) {
+function highlight(text, unclear, dir) {
   const marked = new Set(unclear);
-  return text.split(/(\s+)/).map((t) => (marked.has(t) ? `<mark>${esc(t)}</mark>` : esc(t))).join("");
+  // A line written left to right (Hebrew + English): every word in its own left-to-right box, so
+  // Hebrew words stay in the places they were written instead of being turned around as a phrase.
+  const one = wordByWord(dir) ? (t) => `<span dir="ltr">${t}</span>` : (t) => t;
+  return text.split(/(\s+)/).map((t) => (!/\S/.test(t) ? esc(t) : one(marked.has(t) ? `<mark>${esc(t)}</mark>` : esc(t)))).join("");
 }
 
 /** Where the words of `phrase` appear as whole words in `text` (index of the first), or -1. */
@@ -2809,7 +2852,7 @@ async function addFiles(files) {
 
 // ---------- Export ----------
 function plain(t) { return $("#plainPunct").checked ? t.replace(/״/g, '"').replace(/׳/g, "'").replace(/־/g, "-") : t; }
-function allText() { return state.doc.pages.filter((p) => p.status === "done").map((p) => p.lines.map((l) => plain(l.text)).join("\n")).join("\n\n"); }
+function allText() { return state.doc.pages.filter((p) => p.status === "done").map((p) => p.lines.map((l) => exportLine(plain(l.text), MIXED ? lineDirOn(p.lines, l) : "rtl")).join("\n")).join("\n\n"); }
 function download(blob, name) {
   const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
@@ -2974,7 +3017,7 @@ $("#exportWord").onclick = () => {
   const done = state.doc.pages.filter((p) => p.status === "done");
   done.forEach((p, i) => {
     if (done.length > 1) paras.push([p.name, true]);
-    for (const l of p.lines) paras.push([plain(l.text), false, MIXED ? lineDirOn(p.lines, l) : "rtl"]);
+    for (const l of p.lines) { const dir = MIXED ? lineDirOn(p.lines, l) : "rtl"; paras.push([exportLine(plain(l.text), dir), false, dir]); }
     if (i < done.length - 1) paras.push(["", false]);
   });
   download(docx(paras), fileName() + ".docx");
