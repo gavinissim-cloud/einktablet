@@ -210,6 +210,7 @@ export async function choicesOf(page, i, word) {
 export async function allReady(page, stats, n = 1) {
   await settled(page, n);
   const t0 = Date.now();
-  while (stats.options < n && Date.now() - t0 < 60000) await page.waitForTimeout(200);
+  // the background steps after each reading (word check, then choices for the highlighted words) are over
+  await page.waitForFunction((n) => (window.__autoOptionsDone || 0) >= n, n, { timeout: 60000 }).catch(() => {});
   await settled(page, n);
 }

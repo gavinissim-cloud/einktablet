@@ -57,6 +57,8 @@ h2 { font-size: 17px; margin: 0 0 10px; }
 .popover { position: absolute; z-index: 5; display: flex; flex-wrap: wrap; max-width: 100%; box-sizing: border-box; gap: 6px; padding: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
 .popover button { padding: 3px 12px; font-size: 19px; background: var(--card); color: var(--ink); border-color: var(--line); }
 .popover button.keep { color: #1a7f37; font-weight: 700; }
+.popover .choices-box { display: contents; }
+.popover .waiting { align-self: center; color: var(--muted); padding: 0 6px; }
 .popover .review-help { flex-basis: 100%; font-size: 12px; color: var(--muted); }
 .popover .word-field { font: 19px "Segoe UI", Arial, sans-serif; padding: 3px 8px; border: 1px solid var(--accent); border-radius: 8px; width: 9em; min-width: 0; }
 .choices { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 15px; color: var(--warn-ink); }
@@ -1833,7 +1835,8 @@ async function runJob({ docId, pageId }) {
     // The page is ready to edit; the word check adds its highlights in the background.
     checkWords(docId, pageId, readId)
       .catch((e) => { console.warn("Word check failed:", e); return true; })
-      .then((current) => current !== false && autoWordOptions() && fetchWordOptions(docId, pageId))
+      .then((current) => current !== false && autoWordOptions() && fetchWordOptions(docId, pageId, { onlyFlagged: true }))
+      .finally(() => { window.__autoOptionsDone = (window.__autoOptionsDone || 0) + 1; }) // (for the tests: the background steps of a reading are over)
       .catch((e) => console.warn("Word options failed:", e));
   } catch (e) {
     console.error(e);
@@ -2541,16 +2544,36 @@ const OPTIONS_SCHEMA = {
  * readings of every word on the page (each word read alone), shown when a word is
  * clicked. Optional and in the background, so normal reading stays fast.
  */
-async function fetchWordOptions(docId, pageId) {
+/** What Gemini is asked for the choices of `n` word pictures. */
+function optionsPrompt(n) {
+  return forMixed(`Below are ${n} images, each ONE handwritten Hebrew word cut out of a page, in random order. For each image, give the 5 readings that its pen strokes most look like, most likely first: go letter by letter and consider the letters each stroke could be (handwriting look-alikes such as ד/ר/ך, ה/ח/ת, ו/ז/י/ן, ב/כ/פ, ס/ם, ג/נ, ט/מ, ע/צ/א), and marks like ״ ׳. Judge only by what the handwriting looks like, never by what would make sense. Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them. Each reading different. Answer with one entry per numbered image, using the number written just before it ("Image 1:" …); example lines shown earlier get no entry.`, ["each ONE handwritten Hebrew word", "each ONE handwritten word (Hebrew or English)"], ["and marks like ״ ׳.", "and marks like ״ ׳; in an English word: a/o/u, e/c, i/l/t, n/h/r/u/v, m/rn, d/cl, g/q/y, b/h/k. Keep each word in its own script: never translate or transliterate."], ["Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them.", "Prefer real Hebrew or Aramaic words or abbreviations, or real English words, when the strokes allow them."]);
+}
+/**
+ * Gemini's 5 readings of one word's picture, asked when the word is clicked and it has none yet
+ * (choices are prepared ahead only for highlighted words). The same picture and the same request
+ * as when they are prepared for the whole page. Returns the readings, or [].
+ */
+async function optionsForWord(page, line, index, count, text) {
+  const spot = await wordSpot(page, line, index, count, text);
+  if (!spot?.box) return [];
+  const bitmap = await pageBitmap(page);
+  const writer = state.doc?.writerId ? await getOne("writers", state.doc.writerId) : null;
+  const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
+  const parts = [...known, { text: optionsPrompt(1) }, { text: "Image 1:" }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, spot.box, 240), 0.92)) } }];
+  const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING);
+  const r = (res.words || []).find((x) => Number(x.image) === 1) || (res.words || [])[0];
+  return Array.isArray(r?.options) ? r.options.filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map(hebMarksIn).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5) : [];
+}
+async function fetchWordOptions(docId, pageId, opts = {}) {
   let cleared = false;
   try {
-    cleared = await fetchWordOptionsOnce(docId, pageId);
+    cleared = await fetchWordOptionsOnce(docId, pageId, opts);
   } finally {
     // Never left showing "getting word options…" (that also hides the button to try again).
     if (!cleared) await updatePage(docId, pageId, { optionsProgress: null }, { quiet: true }).catch(() => {});
   }
 }
-async function fetchWordOptionsOnce(docId, pageId) {
+async function fetchWordOptionsOnce(docId, pageId, { onlyFlagged = false } = {}) {
   const doc = await getOne("docs", docId);
   const page = doc?.pages.find((p) => p.id === pageId);
   if (!page || page.status !== "done") return true;
@@ -2561,9 +2584,21 @@ async function fetchWordOptionsOnce(docId, pageId) {
   const items = [], perLine = page.lines.map((l, i) => {
     if (l.top == null) return null;
     let words = null; try { words = segmentWords(bitmap, l); } catch {}
-    (words || []).forEach((box, pos) => items.push({ line: i, pos, box }));
-    return words ? words.map(() => null) : null;
+    if (!words) return null;
+    let send = words.map(() => true);
+    if (onlyFlagged) {
+      // Prepared ahead only for the highlighted words (the ones to check); any other word gets its
+      // choices when it is clicked. Where pictures and words don't match one for one, the whole line.
+      const flagged = new Set((l.unclear || []).filter((u) => l.text.split(/\s+/).includes(u)));
+      if (!flagged.size) return words.map(() => null);
+      let tokens = l.text.split(/\s+/).filter(Boolean);
+      if (MIXED) tokens = placeOrder(tokens, lineDirOn(page.lines, l)).map((k) => tokens[k]);
+      if (tokens.length === words.length) send = tokens.map((t) => flagged.has(t));
+    }
+    words.forEach((box, pos) => { if (send[pos]) items.push({ line: i, pos, box }); });
+    return words.map(() => null);
   });
+  if (onlyFlagged && !items.length) return true; // nothing highlighted: nothing to prepare (and nothing was shown)
   const total = items.length;
   let done = 0, finished = false, writes = Promise.resolve();
   // Progress is written one after another, and never after the end (it would leave "getting…" showing).
@@ -2572,7 +2607,7 @@ async function fetchWordOptionsOnce(docId, pageId) {
   const batches = [];
   for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
   await Promise.all(batches.map(async (batch) => {
-    const parts = [...known, { text: forMixed(`Below are ${batch.length} images, each ONE handwritten Hebrew word cut out of a page, in random order. For each image, give the 5 readings that its pen strokes most look like, most likely first: go letter by letter and consider the letters each stroke could be (handwriting look-alikes such as ד/ר/ך, ה/ח/ת, ו/ז/י/ן, ב/כ/פ, ס/ם, ג/נ, ט/מ, ע/צ/א), and marks like ״ ׳. Judge only by what the handwriting looks like, never by what would make sense. Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them. Each reading different. Answer with one entry per numbered image, using the number written just before it ("Image 1:" …); example lines shown earlier get no entry.`, ["each ONE handwritten Hebrew word", "each ONE handwritten word (Hebrew or English)"], ["and marks like ״ ׳.", "and marks like ״ ׳; in an English word: a/o/u, e/c, i/l/t, n/h/r/u/v, m/rn, d/cl, g/q/y, b/h/k. Keep each word in its own script: never translate or transliterate."], ["Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them.", "Prefer real Hebrew or Aramaic words or abbreviations, or real English words, when the strokes allow them."]) }];
+    const parts = [...known, { text: optionsPrompt(batch.length) }];
     try {
       for (const [k, it] of batch.entries()) {
         parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)) } });
@@ -2717,20 +2752,37 @@ async function openWordMenu(page, line, row, img, at, { review = false } = {}) {
     // Checking word after word: on to the next highlighted one.
     if (review) reviewFrom(fresh, at.index + (replacement === null ? 1 : replacement.split(/\s+/).filter(Boolean).length));
   };
-  const opts = optionsFor(line, word);
-  for (const o of opts) {
-    const b = document.createElement("button");
-    b.className = "alt"; b.textContent = o.text || "✕"; if (MIXED) b.dir = "auto"; b.title = o.text ? `Use «${o.text}» (${o.why})` : `Remove «${word}»`;
-    b.onmousedown = (e) => e.preventDefault(); // keep the caret where it is
-    b.onclick = (e) => { e.stopPropagation(); settle(o.text); };
-    pop.append(b);
-  }
-  if (flagged || !opts.length) {
-    const keep = document.createElement("button");
-    keep.className = "keep"; keep.textContent = "✓"; keep.title = `«${word}» is right`;
-    keep.onmousedown = (e) => e.preventDefault();
-    keep.onclick = (e) => { e.stopPropagation(); settle(null); };
-    pop.append(keep);
+  // The choices (and ✓), drawn again when Gemini's readings of the word arrive.
+  const choices = document.createElement("span"); choices.className = "choices-box";
+  const fill = (waiting) => {
+    const opts = optionsFor(line, word);
+    choices.replaceChildren();
+    for (const o of opts) {
+      const b = document.createElement("button");
+      b.className = "alt"; b.textContent = o.text || "✕"; if (MIXED) b.dir = "auto"; b.title = o.text ? `Use «${o.text}» (${o.why})` : `Remove «${word}»`;
+      b.onmousedown = (e) => e.preventDefault(); // keep the caret where it is
+      b.onclick = (e) => { e.stopPropagation(); settle(o.text); };
+      choices.append(b);
+    }
+    if (flagged || !opts.length) {
+      const keep = document.createElement("button");
+      keep.className = "keep"; keep.textContent = "✓"; keep.title = `«${word}» is right`;
+      keep.onmousedown = (e) => e.preventDefault();
+      keep.onclick = (e) => { e.stopPropagation(); settle(null); };
+      choices.append(keep);
+    }
+    if (waiting) { const w = document.createElement("span"); w.className = "waiting"; w.textContent = "…"; w.title = "Gemini is reading this word's picture"; choices.append(w); }
+  };
+  // No readings from Gemini for this word yet: asked now (one small request), shown when they come.
+  const ask = !line.options?.[word] && !!getKey();
+  fill(ask);
+  pop.append(choices);
+  if (ask) {
+    optionsForWord(page, line, at.index, count, text).then((got) => {
+      line.options = { ...(line.options || {}), [word]: got };
+      scheduleSave(page);
+      if (pop.isConnected) fill(false);
+    }).catch((e) => { console.warn("Couldn't get this word's choices:", e); if (pop.isConnected) fill(false); });
   }
   // Or type the word itself: a box for this one word, so the caret never has to find its way
   // between right-to-left and left-to-right letters in the line.
@@ -3026,7 +3078,7 @@ $("#settingsBtn").onclick = async () => {
     <p><b>Reading</b></p>
     <p><label><input type="radio" name="readMode" value="fast"> <b>Fast</b> (recommended): every line read at once with Gemini Flash; a page takes seconds.</label></p>
     <p><label><input type="radio" name="readMode" value="careful"> <b>Most careful</b>: the strongest Pro model, thinking deeply; slower and costs more, for very hard pages.</label></p>
-    <p><label><input type="checkbox" id="autoOptions"> Prepare word choices automatically: after a page is read, Gemini gives its 5 best readings of every word (in the background; costs a little more per page)</label></p>
+    <p><label><input type="checkbox" id="autoOptions"> Prepare word choices ahead for the highlighted words: after a page is read, Gemini gives its 5 best readings of each highlighted word in the background (any other word gets them when you click it; "More word options" prepares them for every word)</label></p>
     <details><summary class="muted">Choose a specific model (advanced)</summary>
     <p><select id="modelPick" style="width:100%"><option>Loading the models your key can use…</option></select></p></details>
     <p class="muted">Gemini key (saved only in this browser). Paste a new one to replace it, or leave empty to keep it.</p>
