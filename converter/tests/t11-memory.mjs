@@ -50,13 +50,13 @@ await page.waitForTimeout(800);
 check("one click fixes it", (await ed(4).innerText()) === "הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.", await ed(4).innerText());
 f = await fixesOf();
 check("remembered twice now", f?.count === 2, JSON.stringify(f));
-// 3. a new page by the same writer, corrected twice so far: offered, not changed by itself
+// 3. a new page by the same writer: offered, not changed by itself
 await page.setInputFiles("#fileInput", `${S}/e2e/p1.png`);
 await page.waitForFunction(() => document.querySelectorAll(".page-head").length === 2);
 await allReady(page, stats, 2);
 const card2 = page.locator("#pages > .card").nth(1);
 const second = await card2.locator(".line-edit").nth(4).innerText();
-check("next page: not changed by itself after 2 corrections", second === "הקגס אינו מובן: דצורת הקגס היא ד״ר ת״ת.", second);
+check("next page: not changed by itself", second === "הקגס אינו מובן: דצורת הקגס היא ד״ר ת״ת.", second);
 const marks2 = await card2.locator(".row").nth(4).locator("mark").allTextContents();
 check("…highlighted", marks2.includes("הקגס"), JSON.stringify(marks2));
 const opts3 = await clickWord(card2.locator(".line-edit").nth(4), 0);
@@ -70,16 +70,19 @@ await page.locator("#docTitle").click(); // leave the line
 await page.waitForTimeout(1500);
 f = await fixesOf();
 check("typing the correction is remembered too", f?.count === 4, JSON.stringify(f));
-// 5. a third page: now applied by itself, and Gemini sees the corrected word
+// 5. a third page: still only suggested, and Gemini sees the corrected word
 const before = stats.raw.length;
 await page.setInputFiles("#fileInput", `${S}/e2e/p2.png`);
 await page.waitForFunction(() => document.querySelectorAll(".page-head").length === 3);
 await allReady(page, stats, 3);
 const card3 = page.locator("#pages > .card").nth(2);
 const third = await card3.locator(".line-edit").nth(4).innerText();
-check("after 3+ corrections: applied by itself", third === "הקנס אינו מובן: דצורת הקנס היא ד״ר ת״ת.", third);
+check("even after 4 corrections: never changed by itself", third === "הקגס אינו מובן: דצורת הקגס היא ד״ר ת״ת.", third);
 const marks = await card3.locator(".row").nth(4).locator("mark").allTextContents();
-check("…and highlighted, so it can be checked", marks.includes("הקנס"), JSON.stringify(marks));
+check("…highlighted", marks.includes("הקגס"), JSON.stringify(marks));
+const opts4 = await clickWord(card3.locator(".line-edit").nth(4), 4);
+check("…with the correction as the first choice", opts4[0] === "הקנס", JSON.stringify(opts4));
+await page.keyboard.press("Escape");
 const lineReq = stats.raw.slice(before).find((r) => r.kind === "lines");
 check("Gemini is shown this writer's corrected words", lineReq && /How this writer writes words/.test(lineReq.raw) && /הקגס → הקנס/.test(lineReq.raw), lineReq ? "" : "no line request");
 // the person's page shows what is remembered, and it survives a backup and restore
@@ -87,7 +90,7 @@ await page.click("#backHome");
 await page.locator("#writerList a", { hasText: "Rivka" }).click();
 await page.waitForSelector("#writerView:not([hidden])");
 const view = await page.textContent("#writerView");
-check("the person's page lists the remembered correction", /הקגס → הקנס/.test(view) && /applied by itself/.test(view), view.slice(0, 300));
+check("the person's page lists the remembered correction", /הקגס → הקנס/.test(view) && /suggested first/.test(view), view.slice(0, 300));
 await page.click("#writerBack");
 const [dl] = await Promise.all([page.waitForEvent("download"), page.click("#backupBtn")]);
 await dl.saveAs(`${S}/e2e/memory-backup.json`);

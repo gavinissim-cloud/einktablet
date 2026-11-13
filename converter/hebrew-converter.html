@@ -1586,12 +1586,11 @@ async function showWriter(id) {
   const fixes = Object.entries(writerMemory(w).fixes).sort((a, b) => b[1].count - a[1].count || (b[1].at || "").localeCompare(a[1].at || ""));
   if (fixes.length) {
     const head = document.createElement("div"); head.className = "pad"; head.style.borderTop = "1px solid var(--line)";
-    head.innerHTML = `<b>Remembered corrections</b> <span class="muted">— offered as the first choice wherever the misreading comes up again (highlighted); after the same correction ${AUTO_FIX_COUNT} times it is applied by itself on ${esc(w.name)}'s next pages (still highlighted, so you can check it).</span>`;
+    head.innerHTML = `<b>Remembered corrections</b> <span class="muted">— wherever the misreading comes up again in ${esc(w.name)}'s pages it is highlighted, with the correction as the first choice. Nothing is changed by itself.</span>`;
     list.append(head);
     for (const [from, f] of fixes) {
       const row = document.createElement("div"); row.className = "example";
-      const auto = f.count >= AUTO_FIX_COUNT;
-      row.innerHTML = `<div class="he"><span class="muted">${esc(from)}</span> → <b>${esc(f.to)}</b></div><div class="muted">${auto ? "applied by itself" : "offered first"} · corrected ${f.count}×</div>`;
+      row.innerHTML = `<div class="he"><span class="muted">${esc(from)}</span> → <b>${esc(f.to)}</b></div><div class="muted">suggested first · corrected ${f.count}×</div>`;
       const b = document.createElement("button"); b.className = "secondary"; b.textContent = "Forget";
       b.onclick = async () => { await modify("writers", id, (x) => { if (x.memory?.fixes) delete x.memory.fixes[from]; }); showWriter(id); };
       row.append(b); list.append(row);
@@ -2002,14 +2001,12 @@ function isCommonWord(w) {
 }
 // Every word a person corrects is remembered for that writer (writer.memory): which misreading
 // becomes which word, the writer's own words, and a picture of the corrected word. The same
-// misreading is fixed elsewhere in the document at once, future pages get it automatically, and
+// misreading elsewhere in the document and on future pages is highlighted with it as the first choice, and
 // Gemini is shown the writer's corrected words to learn their letters.
 const MAX_WORD_EXAMPLES = 300;
 function writerMemory(w) { return w?.memory || { fixes: {}, vocab: {} }; }
 /** The remembered correction of `word` (own keys only: a word like "constructor" is not a fix). */
 function fixOf(memory, word) { return memory?.fixes && Object.hasOwn(memory.fixes, word) ? memory.fixes[word] : undefined; }
-/** A correction is applied by itself on new pages only once the person made it this often. */
-const AUTO_FIX_COUNT = 3;
 /** The person corrected `from` to `to` (word number `index` of the line, after the change). */
 async function rememberCorrection(page, line, index, from, to) {
   if (!from || !to || from === to || /\s/.test(to)) return;
@@ -2065,24 +2062,17 @@ function applyMemory(l, writer) {
   if (!Object.keys(memory.fixes).length) return l;
   const tokens = l.text.split(/\s+/).filter(Boolean);
   const unclear = new Set(l.unclear), alts = [...(l.alts || [])];
-  let changed = false;
-  tokens.forEach((t, i) => {
+  tokens.forEach((t) => {
     const p = wordParts(t) || { pre: "", core: t, post: "" };
     const f = fixOf(memory, t) || fixOf(memory, p.core);
     if (!f || f.to === t) return;
     const to = fixOf(memory, t) ? f.to : p.pre + f.to + p.post;
     if (to === t) return;
-    if (f.count >= AUTO_FIX_COUNT) {
-      // Corrected the same way several times: fixed by itself, highlighted.
-      tokens[i] = to; changed = true; unclear.add(to);
-      alts.push({ word: to, alt: t, memory: true });
-    } else {
-      unclear.add(t);
-      alts.push({ word: t, alt: to, memory: true });
-    }
+    // Never changed by itself: highlighted, with the correction as the first choice.
+    unclear.add(t);
+    if (!alts.some((x) => x.word === t && x.alt === to)) alts.push({ word: t, alt: to, memory: true });
   });
-  if (changed) l.text = tokens.join(" ");
-  l.unclear = [...unclear].filter((u) => l.text.split(/\s+/).includes(u));
+  l.unclear = [...unclear].filter((u) => tokens.includes(u));
   l.alts = alts;
   return l;
 }
