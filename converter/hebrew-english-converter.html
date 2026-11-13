@@ -1145,8 +1145,38 @@ function lineDir(text) {
   const m = String(text).match(/[\u05d0-\u05eaA-Za-z]/);
   return m && /[A-Za-z]/.test(m[0]) ? "ltr" : "rtl";
 }
-function visualOrder(words) {
-  const { rtl, cls } = wordDirections(words);
+/**
+ * Hebrew + English: which way a line was written ("rtl" or "ltr"), from the handwriting and the
+ * page around it, not from its first letter (an English line may well start with a Hebrew quote).
+ * A line in one language only goes that language's way. A line with both: if it starts at one
+ * margin of the page and ends short of the other, it was written from the margin it starts at;
+ * otherwise (it fills the width) it goes the way of the page's main language.
+ */
+function lineDirOn(lines, line) {
+  const text = line?.text || "";
+  const h = (text.match(/[\u05d0-\u05ea]/g) || []).length, l = (text.match(/[A-Za-z]/g) || []).length;
+  if (!h && !l) return pageDir(lines);
+  if (!l) return "rtl";
+  if (!h) return "ltr";
+  const boxed = (lines || []).filter((x) => x.left != null && x.right != null && x.right > x.left);
+  if (line.left != null && boxed.length >= 2) {
+    const L = Math.min(...boxed.map((x) => x.left)), R = Math.max(...boxed.map((x) => x.right)), width = R - L;
+    if (width > 0) {
+      const gapL = (line.left - L) / width, gapR = (R - line.right) / width;
+      if (gapR > 0.12 && gapL < 0.05) return "ltr";
+      if (gapL > 0.12 && gapR < 0.05) return "rtl";
+    }
+  }
+  return pageDir(lines);
+}
+/** The page's main language: "ltr" when it has more English letters than Hebrew ones. */
+function pageDir(lines) {
+  let h = 0, l = 0;
+  for (const x of lines || []) { const t = x.text || ""; h += (t.match(/[\u05d0-\u05ea]/g) || []).length; l += (t.match(/[A-Za-z]/g) || []).length; }
+  return l > h ? "ltr" : "rtl";
+}
+function visualOrder(words, dir) {
+  const { rtl, cls } = wordDirections(words, dir);
   // Levels: right-to-left runs odd, left-to-right even, above the line's own level.
   const levels = cls.map((c) => (rtl ? (c === "R" ? 1 : 2) : c === "L" ? 0 : 1));
   // Order from left to right: reverse every run at each level from the highest down to 1.
@@ -1162,10 +1192,10 @@ function visualOrder(words) {
   }
   return order.reverse(); // right to left
 }
-/** Whether a line runs right to left (its first letter is Hebrew), and each word's resolved direction ("R" or "L"). */
-function wordDirections(words) {
+/** Whether a line runs right to left (as given, or else by its first letter), and each word's resolved direction ("R" or "L"). */
+function wordDirections(words, dir) {
   const first = words.find((t) => hasHebrew(t) || hasLatin(t));
-  const rtl = !first || hasHebrew(first);
+  const rtl = dir ? dir === "rtl" : !first || hasHebrew(first);
   const base = rtl ? "R" : "L";
   // Each word's direction: R (Hebrew), L (English), D (number), N (neither).
   let cls = words.map((t) => (hasHebrew(t) ? "R" : hasLatin(t) ? "L" : /\d/.test(t) ? "D" : "N"));
@@ -1989,7 +2019,7 @@ async function renderPage(page) {
     const imgs = await crops(page, draft);
     draft.forEach((l, i) => {
       const row = document.createElement("div"); row.className = "row draft-row"; row.dir = "rtl";
-      row.innerHTML = `<img alt=""><div class="draft-text" dir="${MIXED ? lineDir(l.text || "") : "rtl"}" lang="he"></div>`;
+      row.innerHTML = `<img alt=""><div class="draft-text" dir="${MIXED ? lineDirOn(draft, l) : "rtl"}" lang="he"></div>`;
       if (imgs[i]) row.querySelector("img").src = imgs[i]; else row.querySelector("img").remove();
       const t = row.querySelector(".draft-text");
       if (l.done) {
@@ -2012,10 +2042,13 @@ async function renderPage(page) {
     page.lines.forEach((line, i) => body.append(lineRow(page, line, imgs[i])));
   } else if (page.status === "done") {
     const d = document.createElement("div"); d.className = "doc"; d.dir = MIXED ? "auto" : "rtl"; d.lang = "he"; d.contentEditable = "true"; d.spellcheck = false;
-    d.innerHTML = page.lines.map((l) => highlight(l.text, l.unclear)).join("\n");
+    // Hebrew + English: each line starts with an invisible direction mark (the way it was
+    // written, as in the line-by-line view); the marks are never saved.
+    const mark = (l) => (MIXED ? (lineDirOn(page.lines, l) === "ltr" ? "\u200e" : "\u200f") : "");
+    d.innerHTML = page.lines.map((l) => mark(l) + highlight(l.text, l.unclear)).join("\n");
     const original = page.lines.map((l) => ({ ...l }));
     d.oninput = () => {
-      const texts = d.innerText.replace(/\n$/, "").split("\n");
+      const texts = d.innerText.replace(/\n$/, "").split("\n").map((t) => (MIXED ? t.replace(/[\u200e\u200f]/g, "") : t));
       page.lines = matchLines(original, texts);
       scheduleSave(page);
     };
@@ -2083,7 +2116,7 @@ function lineRow(page, line, img) {
   const ed = document.createElement("div");
   // The line keeps one direction while it is edited (it doesn't flip when a letter of the other
   // language is typed first): Hebrew right to left; in Hebrew + English, the direction of its first letter.
-  ed.className = "line-edit"; ed.lang = "he"; ed.dir = MIXED ? lineDir(line.text) : "rtl"; ed.spellcheck = false;
+  ed.className = "line-edit"; ed.lang = "he"; ed.dir = MIXED ? lineDirOn(page.lines, line) : "rtl"; ed.spellcheck = false;
   ed.dataset.key = line.top + "," + line.left;
   try { ed.contentEditable = "plaintext-only"; } catch { ed.contentEditable = "true"; }
   if (ed.contentEditable !== "plaintext-only") ed.contentEditable = "true";
@@ -2194,7 +2227,7 @@ async function wordSpot(page, line, index, count, text) {
   let words = text.split(/\s+/).filter(Boolean), at = index;
   if (MIXED) {
     // The word pictures stand right to left on the page; English words in reading order don't.
-    const order = visualOrder(words);
+    const order = visualOrder(words, lineDirOn(page.lines, { ...line, text }));
     words = order.map((i) => words[i]); at = order.indexOf(index);
   }
   const box = matchWordToBoxes(boxes, words, at);
@@ -2418,7 +2451,7 @@ async function fetchWordOptionsOnce(docId, pageId) {
     const segs = perLine[i];
     if (!segs) return;
     let tokens = l.text.split(/\s+/).filter(Boolean);
-    if (MIXED) tokens = visualOrder(tokens).map((i) => tokens[i]); // in the pictures' order (right to left on the page)
+    if (MIXED) tokens = visualOrder(tokens, lineDirOn(page.lines, l)).map((i) => tokens[i]); // in the pictures' order (right to left on the page)
     const map = {};
     const first = segs.map((o) => o?.[0] || "");
     if (segs.length === tokens.length) tokens.forEach((t, k) => { if (segs[k]?.length) map[t] = segs[k]; });
@@ -2745,13 +2778,13 @@ function zip(files) {
 function docx(paragraphs) {
   const x = (s) => s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const run = (t, bold, rtl) => `<w:r><w:rPr>${rtl ? "<w:rtl/>" : ""}${bold ? "<w:b/><w:bCs/>" : ""}<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="26"/><w:szCs w:val="26"/></w:rPr><w:t xml:space="preserve">${x(t)}</w:t></w:r>`;
-  const p = (t, bold) => {
+  const p = (t, bold, dir) => {
     if (!MIXED) return `<w:p><w:pPr><w:bidi/></w:pPr>${run(t, bold, true)}</w:p>`;
     // Hebrew + English: a right-to-left paragraph when the line starts in Hebrew, and each
     // stretch of Hebrew or English words in its own run, marked with its direction.
     const pieces = t.split(/(\s+)/).filter((x) => x !== "");
     const words = pieces.filter((x) => /\S/.test(x));
-    const { rtl, cls } = wordDirections(words);
+    const { rtl, cls } = wordDirections(words, dir);
     let k = 0, prev = null;
     const dirs = pieces.map((x) => (/\S/.test(x) ? (prev = cls[k++]) : null));
     dirs.forEach((d, i) => { if (d === null) { const next = dirs.slice(i + 1).find((y) => y !== null); dirs[i] = (i && dirs[i - 1]) === next ? next : rtl ? "R" : "L"; } });
@@ -2760,7 +2793,7 @@ function docx(paragraphs) {
     if (cur) out += run(cur, bold, curDir === "R");
     return `<w:p>${rtl ? "<w:pPr><w:bidi/></w:pPr>" : ""}${out || run("", bold, rtl)}</w:p>`;
   };
-  const body = paragraphs.map(([t, b]) => p(t, b)).join("");
+  const body = paragraphs.map(([t, b, dir]) => p(t, b, dir)).join("");
   return zip([
     ["[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'],
     ["_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'],
@@ -2877,7 +2910,7 @@ $("#exportWord").onclick = () => {
   const done = state.doc.pages.filter((p) => p.status === "done");
   done.forEach((p, i) => {
     if (done.length > 1) paras.push([p.name, true]);
-    for (const l of p.lines) paras.push([plain(l.text), false]);
+    for (const l of p.lines) paras.push([plain(l.text), false, MIXED ? lineDirOn(p.lines, l) : "rtl"]);
     if (i < done.length - 1) paras.push(["", false]);
   });
   download(docx(paras), fileName() + ".docx");

@@ -6,7 +6,7 @@ import { start, tagCrops, installFake, allReady, checker, dbDump } from "./harne
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 const [S, FILE] = process.argv.slice(2);
-const { browser, ctx, page, errors } = await start(FILE);
+let { browser, ctx, page, errors } = await start(FILE);
 const { check, done } = checker();
 
 const MIXED_TRUTH = [
@@ -18,27 +18,37 @@ const MIXED_TRUTH = [
   "ר׳ יוחנן said: קשה לי לומר!",
 ];
 const W = 2000, H = 1500;
-const truth = await page.evaluate(({ lines, W, H }) => {
+// Lay a page out the way it is written: each line in its direction ("auto": that of its first
+// letter), by the browser's own text layout; returns the true words with their places.
+const layOut = (lines) => page.evaluate(({ lines, W, H }) => {
   const c = document.createElement("canvas"); c.width = W; c.height = H;
   const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, W, H);
   x.fillStyle = "#123"; x.font = "56px DejaVu Sans"; x.textBaseline = "alphabetic"; x.textAlign = "left";
   const out = [];
-  lines.forEach((text, li) => {
-    // The browser lays the line out: each line in the direction of its first letter.
+  lines.forEach((line, li) => {
+    const { text, dir = "auto", size = 56 } = typeof line === "string" ? { text: line } : line;
+    x.font = `${size}px DejaVu Sans`;
     const div = document.createElement("div");
-    div.dir = "auto";
-    div.style.cssText = "position:absolute;left:100px;top:0;width:1800px;font:56px DejaVu Sans;white-space:pre;word-spacing:40px;unicode-bidi:plaintext;text-align:start";
+    div.dir = dir;
+    div.style.cssText = `position:absolute;left:100px;top:0;width:1800px;font:${size}px DejaVu Sans;white-space:pre;word-spacing:${Math.round(size * 0.7)}px;unicode-bidi:plaintext;text-align:start`;
+    if (dir !== "auto") div.style.unicodeBidi = "isolate";
     div.innerHTML = text.split(" ").map((w) => `<span>${w.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</span>`).join(" ");
     document.body.append(div);
     const base = 170 + li * 210, top = base - 70, bottom = base + 25;
     const box = div.getBoundingClientRect();
+    // Every character drawn exactly where the browser put it (a word's marks may stand apart from
+    // its letters in mixed text); a word's place is where its letters are.
     const words = [...div.querySelectorAll("span")].map((s) => {
-      const r = s.getBoundingClientRect();
-      const left = 100 + (r.left - box.left);
-      x.direction = /[א-ת]/.test(s.textContent) ? "rtl" : "ltr";
-      x.textAlign = "left";
-      x.fillText(s.textContent, left, base);
-      return { text: s.textContent, left: (left / W) * 1000, right: ((left + r.width) / W) * 1000 };
+      const node = s.firstChild, t = node.textContent;
+      let L = Infinity, R = -Infinity;
+      // each run of letters drawn whole (in its own direction) where the browser put the run; each mark on its own
+      for (const m of t.matchAll(/[\u05d0-\u05ea]+|[A-Za-z0-9]+|[^\u05d0-\u05eaA-Za-z0-9]/g)) {
+        const rg = document.createRange(); rg.setStart(node, m.index); rg.setEnd(node, m.index + m[0].length);
+        const r = rg.getBoundingClientRect(), left = 100 + (r.left - box.left);
+        x.direction = /[\u05d0-\u05ea]/.test(m[0]) ? "rtl" : "ltr"; x.textAlign = "left"; x.fillText(m[0], left, base);
+        if (/[\u05d0-\u05eaA-Za-z0-9]/.test(m[0])) { L = Math.min(L, left); R = Math.max(R, left + r.width); }
+      }
+      return { text: t, left: (L / W) * 1000, right: (R / W) * 1000 };
     });
     div.remove();
     const l = Math.min(...words.map((w) => w.left)), r = Math.max(...words.map((w) => w.right));
@@ -46,7 +56,8 @@ const truth = await page.evaluate(({ lines, W, H }) => {
   });
   window.__png = c.toDataURL("image/png");
   return out;
-}, { lines: MIXED_TRUTH, W, H });
+}, { lines, W, H });
+const truth = await layOut(MIXED_TRUTH);
 fs.writeFileSync(`${S}/e2e/mixed.png`, Buffer.from((await page.evaluate(() => window.__png)).split(",")[1], "base64"));
 // the layout itself: English words of a Hebrew line stand left to right, and the other way round
 const pos = (li, w) => truth[li].words.find((x) => x.text === w);
@@ -231,6 +242,81 @@ await heb.setInputFiles("#restoreInput", `${S}/e2e/mixed-backup.json`);
 await heb.waitForTimeout(500);
 check("a Hebrew + English backup is refused by the Hebrew-only converter", /Hebrew \+ English converter/.test(await heb.textContent(".dialog p").catch(() => "")));
 await heb.close();
+// An English page whose lines fill the width, one of them starting with a Hebrew quote: written
+// left to right like the rest of the page, so it must show and be matched left to right too
+// (not as a Hebrew line because its first letter is Hebrew).
+const PAGE2 = [
+  "The Gemara asks why only the last one is חייב and not the others",
+  "\"דבקה קסמין בהו תגר\" and the חידוש is כוחו כגופו so we learn",
+  "from here that all who sit on the bench share in the damage.",
+];
+const truth2 = await layOut(PAGE2.map((text) => ({ text, dir: "ltr", size: 44 })));
+fs.writeFileSync(`${S}/e2e/mixed2.png`, Buffer.from((await page.evaluate(() => window.__png)).split(",")[1], "base64"));
+{ const q = truth2[1].words.slice(0, 4), and = truth2[1].words.find((w) => w.text === "and");
+  check("test page 2: the Hebrew quote stands at the left start of its line, before «and»", Math.min(...q.map((w) => w.left)) < 100 && q.every((w) => w.right < and.left)); }
+await browser.close();
+// (a fresh browser: a new person's first page)
+({ browser, ctx, page, errors } = await start(FILE));
+await tagCrops(page);
+const stats2 = await installFake(page, truth2);
+await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
+await page.setInputFiles("#fileInput", `${S}/e2e/mixed2.png`);
+await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Page2"); await page.click(".dialog button[type=submit]");
+await allReady(page, stats2);
+await page.waitForFunction(() => /\d+ lines/.test(document.querySelector(".page-head .state")?.textContent || "") && !/checking|getting/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 60000 });
+const eds2 = page.locator(".row .line-edit");
+check("page 2 read", JSON.stringify(await eds2.allInnerTexts()) === JSON.stringify(PAGE2), JSON.stringify(await eds2.allInnerTexts()));
+check("the line starting with a Hebrew quote shows left to right, like its page", (await eds2.nth(1).getAttribute("dir")) === "ltr" && (await eds2.nth(0).getAttribute("dir")) === "ltr");
+// the whole quote (a right-to-left stretch) stands at the left start, "and the" after it on the right
+const quoteAt = await eds2.nth(1).evaluate((el) => {
+  const t = el.textContent, q = t.indexOf("\" and"), node = el.firstChild, b = el.getBoundingClientRect();
+  const r = document.createRange(); r.setStart(node, 0); r.setEnd(node, q + 1);
+  const r2 = document.createRange(); r2.setStart(node, q + 2); r2.setEnd(node, q + 5);
+  return { quoteLeft: Math.round(r.getBoundingClientRect().left - b.left), quoteRight: Math.round(r.getBoundingClientRect().right - b.left), andLeft: Math.round(r2.getBoundingClientRect().left - b.left) };
+});
+check("…with the quote at its left start, and the English after it", quoteAt.quoteLeft < 30 && quoteAt.andLeft > quoteAt.quoteRight, JSON.stringify(quoteAt));
+const lines2 = await page.evaluate(() => state.doc.pages[0].lines.map((l) => ({ top: l.top, bottom: l.bottom, left: l.left, right: l.right })));
+let ok2 = 0; const bad2 = [];
+const words2 = PAGE2[1].split(" ");
+for (let wi = 0; wi < words2.length; wi++) {
+  await page.keyboard.press("Escape");
+  const ed = eds2.nth(1); await ed.scrollIntoViewIfNeeded();
+  const at = await ed.evaluate((el, wi) => {
+    const m = [...el.textContent.matchAll(/\S+/g)][wi]; const mid = m.index + Math.floor(m[0].length / 2);
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT); let pos = 0;
+    for (let n = w.nextNode(); n; n = w.nextNode()) { if (mid < pos + n.textContent.length) { const r = document.createRange(); r.setStart(n, mid - pos); r.setEnd(n, mid - pos + 1); const b = r.getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 }; } pos += n.textContent.length; }
+  }, wi);
+  await page.mouse.click(at.x, at.y);
+  await page.waitForTimeout(300);
+  const spot = await page.locator(".row").nth(1).locator(".word-box").evaluate((b) => (b.hidden ? null : { right: parseFloat(b.style.right), width: parseFloat(b.style.width) }), null, { timeout: 2000 }).catch(() => null);
+  const tw = truth2[1].words[wi], L = lines2[1];
+  const h = ((L.bottom - L.top) / 1000) * H, x0 = Math.max(0, (L.left / 1000) * W - h * 0.05), x1 = Math.min(W, (L.right / 1000) * W + h * 0.05);
+  const trueMid = 100 * (1 - (((tw.left + tw.right) / 2 / 1000) * W - x0) / (x1 - x0));
+  if (spot && trueMid >= spot.right - 1 && trueMid <= spot.right + spot.width + 1) ok2++; else bad2.push(`${words2[wi]}: ${JSON.stringify(spot)} true ${trueMid.toFixed(1)}`);
+}
+check(`…and clicking each of its words marks that word in the picture (${ok2}/${words2.length})`, ok2 === words2.length, bad2.join("; "));
+await page.keyboard.press("Escape");
+await page.click("#viewDoc"); await page.waitForSelector(".doc");
+const docLine = await page.locator(".doc").evaluate((d) => {
+  // where the quote of the second line stands in the document view
+  const t = d.firstChild.nodeType === 3 ? null : null;
+  const walker = document.createTreeWalker(d, NodeFilter.SHOW_TEXT); let found = null;
+  for (let n = walker.nextNode(); n && !found; n = walker.nextNode()) { const i = n.textContent.indexOf("\"דבקה"), j = n.textContent.indexOf("\" and"); if (i >= 0) { const r = document.createRange(); r.setStart(n, i); r.setEnd(n, j + 1); found = Math.round(r.getBoundingClientRect().left - d.getBoundingClientRect().left); } }
+  return found;
+});
+check("document view: that line stands left to right too (the quote on the left)", docLine !== null && docLine < 50, String(docLine));
+// editing in the document view keeps the text clean (the direction marks are never saved)
+await page.locator(".doc").evaluate((d) => { d.append(""); d.dispatchEvent(new Event("input")); });
+await page.waitForTimeout(1200);
+const saved2 = (await dbDump(page)).docs[0].pages[0].lines.map((l) => l.text);
+check("…and its direction marks are never saved", JSON.stringify(saved2) === JSON.stringify(PAGE2), JSON.stringify(saved2));
+await page.click("#viewLines");
+const [dl2] = await Promise.all([page.waitForEvent("download"), page.click("#exportWord")]);
+await dl2.saveAs(`${S}/e2e/mixed2.docx`);
+const xml2 = execFileSync("unzip", ["-p", `${S}/e2e/mixed2.docx`, "word/document.xml"]).toString();
+const q = [...xml2.matchAll(/<w:p>(.*?)<\/w:p>/g)].find((m) => m[1].includes("דבקה"));
+check("Word: that line is a left-to-right paragraph, the quote marked right to left", q && !q[1].includes("<w:bidi/>") && /<w:rtl\/>[^]*?דבקה/.test(q[1]), q ? q[1].slice(0, 300) : "missing");
+
 check("no page errors", errors.length === 0, errors.join("\n"));
 await browser.close();
 process.exit(done() ? 0 : 1);
