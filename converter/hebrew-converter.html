@@ -47,16 +47,17 @@ h2 { font-size: 17px; margin: 0 0 10px; }
 .row img { display: block; max-width: 100%; max-height: 130px; border-radius: 4px; cursor: zoom-in; background: #fff; }
 .pic { position: relative; width: fit-content; max-width: 100%; }
 .word-box { position: absolute; top: 0; bottom: 0; border: 3px solid var(--accent); border-radius: 6px; background: color-mix(in srgb, var(--accent) 12%, transparent); pointer-events: none; }
-.line-edit { margin-top: 6px; font: 21px/1.7 "Segoe UI", Arial, sans-serif; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; background: var(--card); color: var(--ink); min-height: 1.7em; white-space: pre-wrap; unicode-bidi: plaintext; text-align: right; outline: none; }
+.line-edit { margin-top: 6px; font: 21px/1.7 "Segoe UI", Arial, sans-serif; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; background: var(--card); color: var(--ink); min-height: 1.7em; white-space: pre-wrap; unicode-bidi: isolate; text-align: start; outline: none; }
 .line-edit:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent); }
 .line-edit mark { padding: 0 2px; }
 .hint { margin-top: 4px; font-size: 12px; color: var(--muted); text-align: right; }
 .line-edit mark { cursor: pointer; }
 .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 20; display: flex; gap: 12px; align-items: center; padding: 10px 16px; background: var(--ink); color: var(--card); border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.25); font-size: 14px; max-width: calc(100% - 32px); }
 .toast button { background: transparent; color: var(--card); border-color: var(--card); padding: 3px 10px; }
-.popover { position: absolute; z-index: 5; display: flex; gap: 6px; padding: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
+.popover { position: absolute; z-index: 5; display: flex; flex-wrap: wrap; max-width: 100%; box-sizing: border-box; gap: 6px; padding: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
 .popover button { padding: 3px 12px; font-size: 19px; background: var(--card); color: var(--ink); border-color: var(--line); }
 .popover button.keep { color: #1a7f37; font-weight: 700; }
+.popover .word-field { font: 19px "Segoe UI", Arial, sans-serif; padding: 3px 8px; border: 1px solid var(--accent); border-radius: 8px; width: 9em; min-width: 0; }
 .choices { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; font-size: 15px; color: var(--warn-ink); }
 .choice-group { display: inline-flex; gap: 4px; align-items: center; }
 .choice-group mark { font-size: 17px; padding: 0 4px; }
@@ -84,7 +85,7 @@ mark { background: var(--warn-bg); color: inherit; border-radius: 3px; }
 .he { direction: rtl; font-size: 17px; }
 /* Hebrew + English: each line (and each line of the document view) runs in the direction of
    its first letter: right to left for Hebrew, left to right for English. */
-body.mixed .line-edit, body.mixed .draft-text, body.mixed .doc, body.mixed .he, body.mixed .popover button { unicode-bidi: plaintext; text-align: start; }
+body.mixed .doc, body.mixed .he, body.mixed .popover button { unicode-bidi: plaintext; text-align: start; }
 [hidden] { display: none !important; }
 @media (max-width: 700px) { .row { grid-template-columns: 1fr; } .flag { grid-column: 1; } .example { grid-template-columns: 1fr; } }
 </style>
@@ -1139,6 +1140,11 @@ function suggestEnglish(w, max = 5, prefer = null) {
  * words without letters go with their neighbours when both sides agree, else with the line.
  * (The Unicode bidirectional algorithm, word by word.)
  */
+/** "rtl" or "ltr": the direction of a line's first Hebrew or English letter (right to left if none). */
+function lineDir(text) {
+  const m = String(text).match(/[\u05d0-\u05eaA-Za-z]/);
+  return m && /[A-Za-z]/.test(m[0]) ? "ltr" : "rtl";
+}
 function visualOrder(words) {
   const { rtl, cls } = wordDirections(words);
   // Levels: right-to-left runs odd, left-to-right even, above the line's own level.
@@ -1983,7 +1989,7 @@ async function renderPage(page) {
     const imgs = await crops(page, draft);
     draft.forEach((l, i) => {
       const row = document.createElement("div"); row.className = "row draft-row"; row.dir = "rtl";
-      row.innerHTML = `<img alt=""><div class="draft-text" dir="${MIXED ? "auto" : "rtl"}" lang="he"></div>`;
+      row.innerHTML = `<img alt=""><div class="draft-text" dir="${MIXED ? lineDir(l.text || "") : "rtl"}" lang="he"></div>`;
       if (imgs[i]) row.querySelector("img").src = imgs[i]; else row.querySelector("img").remove();
       const t = row.querySelector(".draft-text");
       if (l.done) {
@@ -2075,7 +2081,9 @@ function lineRow(page, line, img) {
     row.append(wrap);
   }
   const ed = document.createElement("div");
-  ed.className = "line-edit"; ed.lang = "he"; ed.dir = MIXED ? "auto" : "rtl"; ed.spellcheck = false;
+  // The line keeps one direction while it is edited (it doesn't flip when a letter of the other
+  // language is typed first): Hebrew right to left; in Hebrew + English, the direction of its first letter.
+  ed.className = "line-edit"; ed.lang = "he"; ed.dir = MIXED ? lineDir(line.text) : "rtl"; ed.spellcheck = false;
   ed.dataset.key = line.top + "," + line.left;
   try { ed.contentEditable = "plaintext-only"; } catch { ed.contentEditable = "true"; }
   if (ed.contentEditable !== "plaintext-only") ed.contentEditable = "true";
@@ -2107,9 +2115,11 @@ function lineRow(page, line, img) {
     line.alts = (line.alts || []).filter((a) => findTokens(line.text, a.word) >= 0);
     return true;
   };
-  ed.onblur = () => {
+  ed.onblur = (e) => {
     // Switching to another window isn't leaving the line: the person comes back to it.
     if (!document.hasFocus() || document.activeElement === ed) return;
+    // Nor is typing the word in its menu's box (the menu commits it).
+    if (e?.relatedTarget?.closest?.(".popover") && row.contains(e.relatedTarget)) return;
     if (!ed._commit()) return;
     // Redrawn after the focus has moved on (fresh highlights and choices).
     setTimeout(() => { if (row.isConnected) row.replaceWith(lineRow(page, line, img)); }, 0);
@@ -2515,6 +2525,24 @@ async function openWordMenu(page, line, row, img, at) {
     keep.onclick = (e) => { e.stopPropagation(); settle(null); };
     pop.append(keep);
   }
+  // Or type the word itself: a box for this one word, so the caret never has to find its way
+  // between right-to-left and left-to-right letters in the line.
+  const field = document.createElement("input");
+  field.className = "word-field"; field.value = word; field.spellcheck = false;
+  field.dir = MIXED ? lineDir(word) : "rtl"; field.lang = "he";
+  field.title = "Type the word and press Enter";
+  field.oninput = () => { if (MIXED) field.dir = lineDir(field.value || word); };
+  field.onkeydown = (e) => {
+    e.stopPropagation();
+    if (e.key === "Escape") { closeWordMenu(); ed.focus(); return; }
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    const v = field.value.replace(/\s+/g, " ").trim();
+    if (!v) return;
+    settle(v === word ? null : v);
+  };
+  field.onmousedown = (e) => e.stopPropagation();
+  pop.append(field);
   // Position: under the word.
   const r = document.createRange();
   const walker = document.createTreeWalker(ed, NodeFilter.SHOW_TEXT);
@@ -2530,9 +2558,15 @@ async function openWordMenu(page, line, row, img, at) {
   let rect = ed.getBoundingClientRect();
   if (startNode && endNode) { r.setStart(startNode, startOff); r.setEnd(endNode, endOff); rect = r.getBoundingClientRect(); }
   pop.style.top = `${rect.bottom - base.top + 4}px`;
-  pop.style.right = `${Math.max(0, base.right - rect.right)}px`;
+  // Under the word, its right edge at the word's right edge, but kept inside the row (a word near
+  // the left edge would push it off the screen or squeeze it): measured at full width first.
+  pop.style.right = "0px";
   row.append(pop);
+  const room = row.clientWidth, w = Math.min(Math.ceil(pop.getBoundingClientRect().width) + 1, room);
+  pop.style.width = `${w}px`;
+  pop.style.right = `${Math.max(0, Math.min(base.right - rect.right, room - w))}px`;
   const close = (e) => {
+    if (e.type === "keydown" && pop.contains(e.target)) return; // typing in the menu's word box
     const typing = e.type === "input" || (e.type === "keydown" && (e.key === "Escape" || e.key.length === 1 || e.key === "Backspace" || e.key === "Delete"));
     if (typing || (e.type === "mousedown" && !pop.contains(e.target) && !ed.contains(e.target))) closeWordMenu();
   };

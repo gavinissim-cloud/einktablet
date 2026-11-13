@@ -155,6 +155,42 @@ await page.keyboard.press("Backspace");
 await page.locator("#docTitle").click();
 await page.waitForTimeout(800);
 
+// Typing an English word at the start of a Hebrew line: the line keeps its direction while it is
+// edited (it doesn't jump to left to right), and the words keep their places.
+const before2 = await ed2.innerText();
+await ed2.evaluate((el) => { const r = document.createRange(); r.setStart(el.firstChild, 0); r.collapse(true); el.focus(); getSelection().removeAllRanges(); getSelection().addRange(r); });
+await page.keyboard.type("Hi ");
+const look = await ed2.evaluate((el) => { const r = document.createRange(); r.selectNodeContents(el); const t = r.getBoundingClientRect(), b = el.getBoundingClientRect(); return { dir: getComputedStyle(el).direction, right: Math.round(b.right - t.right) }; });
+check("typing English first in a Hebrew line doesn't flip it to left to right", look.dir === "rtl" && look.right < 30 && (await ed2.innerText()) === "Hi " + before2, JSON.stringify(look) + " " + (await ed2.innerText()));
+for (let i = 0; i < 3; i++) await page.keyboard.press("Backspace");
+check("…and deleting it again leaves the line as it was", (await ed2.innerText()) === before2, await ed2.innerText());
+await page.locator("#docTitle").click();
+await page.waitForTimeout(600);
+
+// Typing a word in the menu's own box (no caret between Hebrew and English letters).
+const typeWord = async (li, find, newWord) => {
+  const ed = eds.nth(li);
+  await ed.scrollIntoViewIfNeeded();
+  const r = await ed.evaluate((el, find) => { const i = el.textContent.indexOf(find) + 1; const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT); let pos = 0; for (let n = w.nextNode(); n; n = w.nextNode()) { if (i < pos + n.textContent.length) { const r = document.createRange(); r.setStart(n, i - pos); r.setEnd(n, i - pos + 1); const b = r.getBoundingClientRect(); return { x: b.x + b.width / 2, y: b.y + b.height / 2 }; } pos += n.textContent.length; } }, find);
+  await page.mouse.click(r.x, r.y);
+  await page.waitForSelector(".popover .word-field");
+  const field = page.locator(".popover .word-field");
+  const shown = await field.inputValue();
+  await field.click(); await field.fill(newWord); await field.press("Enter");
+  await page.waitForTimeout(500);
+  return shown;
+};
+let shown = await typeWord(2, "York", "Yorkshire");
+check("the word box shows the clicked English word", shown === "York", shown);
+check("typing in it replaces exactly that word", (await eds.nth(2).innerText()) === "היום נלמד על New Yorkshire ועל ההיסטוריה שלה.", await eds.nth(2).innerText());
+shown = await typeWord(3, "עליכם", "עליכן");
+check("…and a Hebrew word inside an English line", shown === "עליכם" && (await eds.nth(3).innerText()) === "The words שלום עליכן mean peace be with you.", shown + " / " + (await eds.nth(3).innerText()));
+shown = await typeWord(4, "families", "people");
+check("…and an English word between numbers in a Hebrew line", (await eds.nth(4).innerText()) === "בשנת 1990 עברו 25 people לעיר החדשה.", await eds.nth(4).innerText());
+await page.waitForTimeout(800);
+const mem = (await dbDump(page)).writers.find((w) => w.name === "Mixed")?.memory?.fixes || {};
+check("words typed in the box are remembered as corrections", mem.York?.to === "Yorkshire" && mem["עליכם"]?.to === "עליכן", JSON.stringify(mem));
+
 // Document view: each line in its own direction.
 await page.click("#viewDoc"); await page.waitForSelector(".doc");
 const docDir = await page.locator(".doc").evaluate((d) => getComputedStyle(d).unicodeBidi);
@@ -168,11 +204,12 @@ await dl.saveAs(`${S}/e2e/mixed.docx`);
 const xml = execFileSync("unzip", ["-p", `${S}/e2e/mixed.docx`, "word/document.xml"]).toString();
 const paras = [...xml.matchAll(/<w:p>(.*?)<\/w:p>/g)].map((m) => ({ bidi: m[1].includes("<w:bidi/>"), runs: [...m[1].matchAll(/<w:r>(.*?)<\/w:r>/g)].map((r) => ({ rtl: r[1].includes("<w:rtl/>"), t: (r[1].match(/<w:t[^>]*>(.*?)<\/w:t>/) || [])[1] })) }));
 const para = (text) => paras.find((p) => p.runs.map((r) => r.t).join("") === text.replace(/&/g, "&amp;"));
-const p1 = para(MIXED_TRUTH[1]), p2 = para(MIXED_TRUTH[2]), p3 = para(MIXED_TRUTH[3]);
-check("Word: every line is there, in reading order", MIXED_TRUTH.every((t) => para(t)), JSON.stringify(paras.map((p) => p.runs.map((r) => r.t).join(""))));
+const p1 = para(MIXED_TRUTH[1]), p2 = para("היום נלמד על New Yorkshire ועל ההיסטוריה שלה."), p3 = para("The words שלום עליכן mean peace be with you.");
+const FINAL = [MIXED_TRUTH[0], MIXED_TRUTH[1], "היום נלמד על New Yorkshire ועל ההיסטוריה שלה.", "The words שלום עליכן mean peace be with you.", "בשנת 1990 עברו 25 people לעיר החדשה.", MIXED_TRUTH[5]];
+check("Word: every line is there, in reading order", FINAL.every((t) => para(t)), JSON.stringify(paras.map((p) => p.runs.map((r) => r.t).join(""))));
 check("Word: an English line is a left-to-right paragraph", p1 && !p1.bidi && p1.runs.every((r) => !r.rtl));
-check("Word: a Hebrew line with «New York» is right to left, with «New York» marked left to right", p2 && p2.bidi && p2.runs.some((r) => !r.rtl && r.t.includes("New York")) && p2.runs.filter((r) => r.rtl).map((r) => r.t).join("|").includes("היום"), JSON.stringify(p2));
-check("Word: an English line with «שלום עליכם» is left to right, with the Hebrew marked right to left", p3 && !p3.bidi && p3.runs.some((r) => r.rtl && r.t.includes("שלום עליכם")), JSON.stringify(p3));
+check("Word: a Hebrew line with «New York» is right to left, with «New York» marked left to right", p2 && p2.bidi && p2.runs.some((r) => !r.rtl && r.t.includes("New Yorkshire")) && p2.runs.filter((r) => r.rtl).map((r) => r.t).join("|").includes("היום"), JSON.stringify(p2));
+check("Word: an English line with «שלום עליכם» is left to right, with the Hebrew marked right to left", p3 && !p3.bidi && p3.runs.some((r) => r.rtl && r.t.includes("שלום עליכן")), JSON.stringify(p3));
 
 // Fully separate from the Hebrew-only converter: its own storage, settings and key.
 const db = await dbDump(page);

@@ -66,6 +66,19 @@ check("at most 5 choices", opts2.filter((o) => o !== "✓").length <= 5, JSON.st
 check("options requested in the background once", stats.options >= 1, JSON.stringify(stats));
 const db = await dbDump(page);
 check("options saved", Object.keys(db.docs[0].pages[0].lines[0].options || {}).length >= 5, JSON.stringify(db.docs[0].pages[0].lines[0].options));
+// Typing a word in the menu's own box replaces exactly that word.
+await page.keyboard.press("Escape");
+await clickWord(1);
+const field = page.locator(".popover .word-field");
+check("the menu has a box with the clicked word", (await field.inputValue()) === (await ed.innerText()).split(" ")[1] && (await field.getAttribute("dir")) === "rtl");
+const words0 = (await ed.innerText()).split(" ");
+await field.click(); await field.fill("הסיפור"); await field.press("Enter");
+await page.waitForTimeout(500);
+check("typing in it and pressing Enter replaces exactly that word", (await ed.innerText()) === [words0[0], "הסיפור", ...words0.slice(2)].join(" "), await ed.innerText());
+await clickWord(1);
+await page.locator(".popover .word-field").press("Escape");
+check("Escape closes the menu without changing anything", (await page.locator(".popover").count()) === 0 && (await ed.innerText()).split(" ")[1] === "הסיפור");
+
 // The marked spot when the ink groups don't match the words one to one (right to left, page units).
 const spots = await page.evaluate(() => {
   const B = (r, l) => ({ right: r, left: l });
