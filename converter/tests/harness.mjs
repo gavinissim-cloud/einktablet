@@ -106,7 +106,7 @@ export async function installFake(page, truth, opts = {}) {
     const body = route.request().postDataJSON();
     const parts = body.contents[0].parts;
     const raw = JSON.stringify(parts.filter((p) => p.text));
-    const kind = raw.includes("readings that its pen strokes most look like") ? "options" : raw.includes("ONE handwritten Hebrew word") ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
+    const kind = raw.includes("readings that its pen strokes most look like") ? "options" : /ONE handwritten (Hebrew )?word/.test(raw) ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
     const n = ++stats[kind];
     (stats.raw ||= []).push({ kind, raw });
     if (opts.delay) await new Promise((r) => setTimeout(r, opts.delay));

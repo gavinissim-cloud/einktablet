@@ -82,6 +82,9 @@ mark { background: var(--warn-bg); color: inherit; border-radius: 3px; }
 .example { display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: center; padding: 8px 14px; border-top: 1px solid var(--line); }
 .example img { max-width: 100%; max-height: 90px; background: #fff; }
 .he { direction: rtl; font-size: 17px; }
+/* Hebrew + English: each line (and each line of the document view) runs in the direction of
+   its first letter: right to left for Hebrew, left to right for English. */
+body.mixed .line-edit, body.mixed .draft-text, body.mixed .doc, body.mixed .he, body.mixed .popover button { unicode-bidi: plaintext; text-align: start; }
 [hidden] { display: none !important; }
 @media (max-width: 700px) { .row { grid-template-columns: 1fr; } .flag { grid-column: 1; } .example { grid-template-columns: 1fr; } }
 </style>
@@ -158,21 +161,45 @@ mark { background: var(--warn-bg); color: inherit; border-radius: 3px; }
 <script>
 "use strict";
 
+// Hebrew only (this file), or Hebrew + English (hebrew-english-converter.html, made from this
+// file by tools/build_mixed.py). The two are fully separate: their own documents, people,
+// corrections, settings and key, and in Hebrew-only nothing of the English handling runs.
+const MIXED = false;
+const APP_ID = MIXED ? "hebrew-english-converter" : "hebrew-converter";
+const OTHER_APP_ID = MIXED ? "hebrew-converter" : "hebrew-english-converter";
+const LS = {
+  getItem: (k) => localStorage.getItem((MIXED ? "he-en:" : "") + k),
+  setItem: (k, v) => localStorage.setItem((MIXED ? "he-en:" : "") + k, v),
+  removeItem: (k) => localStorage.removeItem((MIXED ? "he-en:" : "") + k),
+};
+
+/** In Hebrew + English, a text with some of its words changed (each must be there); in Hebrew only, the text as it is. */
+function forMixed(text, ...pairs) {
+  if (!MIXED) return text;
+  for (const [from, to] of pairs) {
+    if (!text.includes(from)) throw new Error("forMixed: not found: " + from);
+    text = text.replace(from, to);
+  }
+  return text;
+}
+
+if (MIXED) document.body.classList.add("mixed");
+
 // ---------- Settings ----------
 const DEFAULT_MODEL = "gemini-flash-latest";
 const AUTO = "auto";
 let autoModel = null; // the best model this key can use, found once per session
-function chosenModel() { try { return localStorage.getItem("gemini_model") || AUTO; } catch { return AUTO; } }
+function chosenModel() { try { return LS.getItem("gemini_model") || AUTO; } catch { return AUTO; } }
 // "fast": Gemini Flash with light thinking, every line read at once (seconds a page).
 // "careful": the strongest Pro model with deep thinking (slower, for very hard pages).
-function readMode() { try { return localStorage.getItem("read_mode") === "careful" ? "careful" : "fast"; } catch { return "fast"; } }
-function setReadMode(m) { try { localStorage.setItem("read_mode", m); } catch {} }
+function readMode() { try { return LS.getItem("read_mode") === "careful" ? "careful" : "fast"; } catch { return "fast"; } }
+function setReadMode(m) { try { LS.setItem("read_mode", m); } catch {} }
 // Gemini's 5 readings of every word, prepared in the background after a page is read.
-function autoWordOptions() { try { return localStorage.getItem("auto_options") !== "off"; } catch { return true; } }
+function autoWordOptions() { try { return LS.getItem("auto_options") !== "off"; } catch { return true; } }
 try {
-  if (localStorage.getItem("settings_version") !== "2") {
-    localStorage.removeItem("gemini_model"); // earlier versions chose the slow model by default
-    localStorage.setItem("settings_version", "2");
+  if (LS.getItem("settings_version") !== "2") {
+    LS.removeItem("gemini_model"); // earlier versions chose the slow model by default
+    LS.setItem("settings_version", "2");
   }
 } catch {}
 function getModel() {
@@ -195,7 +222,7 @@ async function pickBestModel() {
     autoModel = DEFAULT_MODEL;
   }
 }
-function setModel(m) { try { localStorage.setItem("gemini_model", m); } catch {} }
+function setModel(m) { try { LS.setItem("gemini_model", m); } catch {} }
 const THINKING = "HIGH";
 const EXAMPLES = 24;          // learned lines shown to Gemini per request
 const IMAGE_EDGE = 2400;      // Gemini scales images down itself; bigger only makes requests slower
@@ -203,7 +230,7 @@ const STORE_EDGE = 3000;      // page images kept for the line pictures
 const TIMEOUT_MS = 8 * 60 * 1000;
 const CONCURRENCY = 3;
 
-const INSTRUCTIONS = "You are an expert reader of handwritten modern Hebrew (עברית מודרנית), including cursive script (כתב יד רהוט), print-style block letters, and mixed styles, from neat to very messy, written by children, adults and the elderly, on lined, blank or squared paper, in pen or pencil, scanned or photographed at an angle.\n\nYour job is an exact, faithful transcription of the handwriting on the page — character for character, line for line, as the writer wrote it. Accuracy matters more than anything else: look closely at every word.\n\nNEVER INVENT TEXT. Write only letters you actually see on the page. Never replace a word with a different word that \"makes more sense\", never complete a sentence, never rephrase, never fill a hard-to-read spot with a likely-sounding word. A transcription that says what the writer probably meant, instead of what is written, is wrong. When a word is hard to read, write the letters you can make out as best you can and list that word under \"unclear\" — the reader will check every unclear word, so marking a word unclear is always better than guessing.\n\nReading method:\n- Work through the page line by line, top to bottom, each line right to left. A \"line\" is one physical line of handwriting as it appears on the page; never merge two handwritten lines or split one. Printed ruled lines of the paper are not text.\n- Read every word completely, from its first letter to its last. Do not stop at a word's recognizable start, guess its ending, or drop small words, prefixes (ו ה ב כ ל מ ש) and suffixes.\n- Letters that look alike in handwriting (ו/ז/י/ן, ד/ר/ך, ה/ח/ת, ב/כ/פ, ג/נ, ט/מ, ס/ם, ע/צ/א, ק/ף, and the final forms ך ם ן ף ץ): decide from the pen strokes. Context may only break a tie between two letters that the strokes genuinely allow; it never justifies a word whose letters are not on the page. If the strokes don't settle it, pick the likelier letter and mark the word unclear.\n- Do NOT correct the writer's spelling, grammar or word choice, and do not complete words that are not written.\n- Skip text that the writer clearly crossed out. Include text inserted above a line at the place it is inserted.\n- Keep niqqud only if the writer actually wrote it. Numbers and Latin-script words stay exactly as written.\n\nPunctuation and symbols — reproduce every mark the writer made, using these characters:\n- Gershayim (two short strokes in an acronym, e.g. ד״ר, צה״ל, בס״ד) → ״ ; geresh (ג׳, צ׳, מס׳) → ׳\n- A short line or two lines written ABOVE letters (the handwritten way to mark an abbreviation or a number in letters) → mark them with ״ before the last letter (or ׳ after a single letter).\n- Maqaf → ־ ; dashes between phrases → – ; parentheses, brackets, quotation marks, colons, semicolons, commas, periods, question and exclamation marks, slashes, percent → exactly as written. Write parentheses in reading order: \"(\" comes before the words it encloses.\n\nFor each line give: text; top, bottom, left, right — the line's bounding box as integers from 0 to 1000 relative to the page image's height (top/bottom) and width (left/right), generous enough for ascenders, descenders and marks above letters; unclear — every word of this line you are not fully sure of, letter by letter (copied exactly from your text); empty only when you are certain of every letter.";
+const INSTRUCTIONS = forMixed("You are an expert reader of handwritten modern Hebrew (עברית מודרנית), including cursive script (כתב יד רהוט), print-style block letters, and mixed styles, from neat to very messy, written by children, adults and the elderly, on lined, blank or squared paper, in pen or pencil, scanned or photographed at an angle.\n\nYour job is an exact, faithful transcription of the handwriting on the page — character for character, line for line, as the writer wrote it. Accuracy matters more than anything else: look closely at every word.\n\nNEVER INVENT TEXT. Write only letters you actually see on the page. Never replace a word with a different word that \"makes more sense\", never complete a sentence, never rephrase, never fill a hard-to-read spot with a likely-sounding word. A transcription that says what the writer probably meant, instead of what is written, is wrong. When a word is hard to read, write the letters you can make out as best you can and list that word under \"unclear\" — the reader will check every unclear word, so marking a word unclear is always better than guessing.\n\nReading method:\n- Work through the page line by line, top to bottom, each line right to left. A \"line\" is one physical line of handwriting as it appears on the page; never merge two handwritten lines or split one. Printed ruled lines of the paper are not text.\n- Read every word completely, from its first letter to its last. Do not stop at a word's recognizable start, guess its ending, or drop small words, prefixes (ו ה ב כ ל מ ש) and suffixes.\n- Letters that look alike in handwriting (ו/ז/י/ן, ד/ר/ך, ה/ח/ת, ב/כ/פ, ג/נ, ט/מ, ס/ם, ע/צ/א, ק/ף, and the final forms ך ם ן ף ץ): decide from the pen strokes. Context may only break a tie between two letters that the strokes genuinely allow; it never justifies a word whose letters are not on the page. If the strokes don't settle it, pick the likelier letter and mark the word unclear.\n- Do NOT correct the writer's spelling, grammar or word choice, and do not complete words that are not written.\n- Skip text that the writer clearly crossed out. Include text inserted above a line at the place it is inserted.\n- Keep niqqud only if the writer actually wrote it. Numbers and Latin-script words stay exactly as written.\n\nPunctuation and symbols — reproduce every mark the writer made, using these characters:\n- Gershayim (two short strokes in an acronym, e.g. ד״ר, צה״ל, בס״ד) → ״ ; geresh (ג׳, צ׳, מס׳) → ׳\n- A short line or two lines written ABOVE letters (the handwritten way to mark an abbreviation or a number in letters) → mark them with ״ before the last letter (or ׳ after a single letter).\n- Maqaf → ־ ; dashes between phrases → – ; parentheses, brackets, quotation marks, colons, semicolons, commas, periods, question and exclamation marks, slashes, percent → exactly as written. Write parentheses in reading order: \"(\" comes before the words it encloses.\n\nFor each line give: text; top, bottom, left, right — the line's bounding box as integers from 0 to 1000 relative to the page image's height (top/bottom) and width (left/right), generous enough for ascenders, descenders and marks above letters; unclear — every word of this line you are not fully sure of, letter by letter (copied exactly from your text); empty only when you are certain of every letter.", ["handwritten modern Hebrew (עברית מודרנית)", "handwritten Hebrew (עברית) and English"], ["each line right to left.", "each line in reading order (Hebrew right to left, English left to right)."]);
 
 const LINE_SCHEMA = {
   type: "object",
@@ -227,14 +254,14 @@ const $ = (s) => document.querySelector(s);
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-function getKey() { try { return localStorage.getItem("gemini_key") || ""; } catch { return ""; } }
-function setKey(k) { try { localStorage.setItem("gemini_key", k); } catch {} }
+function getKey() { try { return LS.getItem("gemini_key") || ""; } catch { return ""; } }
+function setKey(k) { try { LS.setItem("gemini_key", k); } catch {} }
 
 // ---------- Storage (IndexedDB, in this browser only) ----------
 let dbp;
 function db() {
   dbp ??= new Promise((resolve, reject) => {
-    const req = indexedDB.open("hebrew-converter", 1);
+    const req = indexedDB.open(APP_ID, 1);
     req.onupgradeneeded = () => {
       req.result.createObjectStore("docs", { keyPath: "id" });
       req.result.createObjectStore("writers", { keyPath: "id" });
@@ -647,6 +674,12 @@ async function streamOnceWith(body, signal, alive) {
 
 /** One request: retried when Google is busy, given up after TIMEOUT_MS. */
 // Added to the instructions: Gemini tends to "improve" what people write.
+// Hebrew + English only: how to write pages in both languages.
+const MIXED_RULES = MIXED ? `
+
+PAGES IN HEBREW AND ENGLISH. These pages mix Hebrew and English: some lines are all Hebrew, some all English, some have both. Write every word in the script it is written in, letter for letter. Never translate and never transliterate: an English word stays in Latin letters, a Hebrew word in Hebrew letters, exactly as written.
+Write each line's text in logical order, the way it would be typed on a keyboard: the words in the order they are read. A Hebrew line is read right to left; an English phrase inside it is read left to right, so its words are written in their left-to-right order (for example a Hebrew line with "New York" in it is typed with "New" before "York"). An English line is read left to right; a Hebrew phrase inside it is read right to left. Never reverse the letters of a word.
+English: keep capital and small letters, spelling, apostrophes, numbers and punctuation exactly as written; do not correct spelling or grammar. English letters that look alike in handwriting (a/o/u, e/c, i/l/t, n/h/r/u/v, m/rn, d/cl, g/q/y, b/h/k, s/5, o/0, l/1): decide from the strokes. Don't read English letters as Hebrew ones or Hebrew letters as English ones (ו and l, ס and o, ן and l, ר and r look alike).` : "";
 const EXACT_RULES = `KEEP THE WRITER'S EXACT WORDS, SPELLING AND GRAMMAR. Never add or remove a letter to make a word "correct": if the writer wrote הסטוריה, write הסטוריה, not היסטוריה; if they wrote אמא, don't write אימא; if they used the wrong gender, tense or preposition, or left a word out, keep it exactly that way. Never add, drop, reorder or replace words, and never add punctuation the writer didn't write. Read each word from its own letters, not from what the sentence suggests. The texts are often Torah or Gemara study notes mixing Hebrew and Aramaic (for example דבלא, היגיע, מזונותיה, דצורת, ממילא, ואי); their spellings and words are correct as written. Never turn them into everyday modern Hebrew.
 
 WHEN YOU CAN'T READ A LETTER, WRITE □ IN ITS PLACE. For example, if you can read מז and נותיה but not the letter between them, write מז□נותיה. If you can't read a whole word, write one □ for each letter you think it has, or just □□□. A □ is always right; a guessed letter or word is always wrong. Never fill a hard-to-read spot with a word that fits the sentence. (Use □ only for unreadable letters; a question mark the writer wrote is written as ?.)
@@ -691,7 +724,7 @@ async function askJsonNow(parts, schema, thinking) {
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const generationConfig = { responseMimeType: "application/json", responseJsonSchema: schema };
   if (thinking !== "off" && !thinkingRejected.has(getModel())) generationConfig.thinkingConfig = { thinkingLevel: thinking, includeThoughts: true };
-  const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS + "\n\n" + EXACT_RULES + abbrevPrompt() }] }, contents: [{ role: "user", parts }], generationConfig };
+  const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS + "\n\n" + EXACT_RULES + abbrevPrompt() + MIXED_RULES }] }, contents: [{ role: "user", parts }], generationConfig };
   try {
     for (let attempt = 0; ; attempt++) {
       try {
@@ -851,10 +884,13 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
     const h = line.bottom - line.top;
     const loose = { ...line, top: Math.max(0, line.top - h * 0.15), bottom: Math.min(1000, line.bottom + h * 0.15) };
     // Latin words and numbers read left to right; cutting them into right-to-left pictures would reverse them.
-    if (/[A-Za-z]/.test(line.text) || (line.text.match(/\d+/g) || []).length > 1) return null;
+    // (Hebrew + English: an all-English line is cut into pictures left to right; a line with both is read whole.)
+    const english = MIXED && hasLatin(line.text) && !hasHebrew(line.text);
+    if (!english && (/[A-Za-z]/.test(line.text) || (line.text.match(/\d+/g) || []).length > 1)) return null;
     let words = null;
     try { words = segmentWords(bitmap, loose); } catch (e) { console.warn("Couldn't split a line into words:", e); }
     if (!words) return null;
+    if (english) words.reverse();
     words.forEach((box, pos) => items.push({ line: i, pos, box }));
     return words.length;
   });
@@ -866,7 +902,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
   let done = 0, answered = 0;
   onWords(0, items.length);
   const readBatch = async (batch) => {
-    const parts = [...known, { text: `Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.` }];
+    const parts = [...known, { text: forMixed(`Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.`, ["ONE handwritten Hebrew word", "ONE handwritten word, Hebrew or English"], ["letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation.", "letter by letter in the word's own script, never translated or transliterated: a Hebrew word right to left, with its final letters (ך ם ן ף ץ) and gershayim/geresh (״ ׳); an English word left to right, with its capital letters as written; and its punctuation."]) }];
     for (const [k, it] of batch.entries()) {
       const crop = cropLine(bitmap, it.box, 240);
       parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
@@ -938,9 +974,23 @@ async function loadLexicon() {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   const text = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+  if (MIXED) english = await loadWordList("lexicon-en").catch((e) => { console.warn("English word list not loaded:", e); return new Map(); });
   lexicon = new Map();
   text.split("\n").forEach((w, i) => lexicon.set(w, i));
   return lexicon;
+}
+// Hebrew + English only: the 100,000 most common English words (lower case), most common first.
+let english = new Map();
+async function loadWordList(id) {
+  const el = document.getElementById(id);
+  if (!el) return new Map();
+  const bin = atob(el.textContent.trim());
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const text = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+  const m = new Map();
+  text.split("\n").forEach((w, i) => m.set(w, i));
+  return m;
 }
 // ---------- Abbreviations (ראשי תיבות) ----------
 // The word list holds every abbreviation used in Sefaria's library (tens of thousands:
@@ -1018,10 +1068,115 @@ function wordParts(w) {
 function isKnownWord(w) {
   if (w.includes("□")) return true; // already flagged as unreadable
   const p = wordParts(w);
-  if (!p) return true; // no Hebrew letters
+  if (!p) return MIXED ? isKnownEnglish(w) : true; // no Hebrew letters
   return p.core.split(/[\u05be\-–/]/).filter(Boolean).every((part) =>
     lexicon.has(part) || lexicon.has(part.replace(/["']$/, "")));
 }
+// ---------- English words (Hebrew + English only) ----------
+const hasHebrew = (t) => /[\u05d0-\u05ea]/.test(t);
+const hasLatin = (t) => /[A-Za-z]/.test(t);
+/** An English word split into leading punctuation, the word, trailing punctuation (null if it has Hebrew or no Latin letters). */
+function englishParts(w) {
+  if (hasHebrew(w)) return null;
+  const m = w.replace(/\u2019/g, "'").match(/^([^A-Za-z]*)([A-Za-z](?:.*[A-Za-z])?)([^A-Za-z]*)$/);
+  return m ? { pre: m[1], core: m[2], post: m[3] } : null;
+}
+function isKnownEnglish(w) {
+  const p = englishParts(w);
+  if (!p || !english.size) return true; // no English word in it (a number, a mark), or no list
+  return p.core.split(/[-\u2013/]/).filter(Boolean).every((part) => {
+    if (/\d/.test(part)) return true;
+    const x = part.toLowerCase();
+    return english.has(x) || english.has(x.replace(/'s$/, "")) || english.has(x.replace(/'$/, ""));
+  });
+}
+// Letters (and letter pairs) that look alike in English handwriting.
+const EN_LOOKALIKE = ["aou", "ec", "ilt", "hn", "nu", "uv", "rv", "nr", "gqy", "bh", "hk", "fl", "jy", "ae", "ij", "sz"];
+const EN_PAIRS = [["rn", "m"], ["cl", "d"], ["li", "h"], ["vv", "w"], ["ri", "n"], ["nn", "m"], ["iu", "w"], ["ci", "a"]];
+const enLooksLike = (() => {
+  const m = new Map();
+  for (const g of EN_LOOKALIKE) for (const a of g) for (const b of g) if (a !== b) { if (!m.has(a)) m.set(a, new Set()); m.get(a).add(b); }
+  return m;
+})();
+/** Real English words the handwriting could also be read as (look-alike letters), most alike and common first, in the word's own capitals. */
+function suggestEnglish(w, max = 5, prefer = null) {
+  const p = englishParts(w);
+  if (!p || !english.size || /[-\u2013/\d]/.test(p.core)) return [];
+  const core = p.core.toLowerCase();
+  const found = new Map();
+  const consider = (c, score) => {
+    if (!c || c === core) return;
+    if (english.has(c) || prefer?.has(c)) {
+      const sc = score + (prefer?.has(c) ? -2 : 0) + Math.log10(2 + (english.get(c) ?? 0)) / 4;
+      if (!found.has(c) || found.get(c) > sc) found.set(c, sc);
+    }
+  };
+  const swaps = (word, score, depth) => {
+    for (let i = 0; i < word.length; i++) for (const b of enLooksLike.get(word[i]) || []) {
+      const c = word.slice(0, i) + b + word.slice(i + 1);
+      consider(c, score);
+      if (depth > 1 && word.length >= 4) swaps(c, score + 1, depth - 1);
+    }
+    for (const [a, b] of EN_PAIRS) for (const [x, y] of [[a, b], [b, a]]) {
+      for (let i = word.indexOf(x); i >= 0; i = word.indexOf(x, i + 1)) consider(word.slice(0, i) + y + word.slice(i + x.length), score + 0.25);
+    }
+  };
+  swaps(core, 0, 2);
+  for (let i = 0; i <= core.length; i++) for (const v of "ile") {
+    consider(core.slice(0, i) + v + core.slice(i), 0.5); // a thin letter the reading missed
+    if (core[i] === v) consider(core.slice(0, i) + core.slice(i + 1), 0.5); // or added
+  }
+  const caps = (c) => (p.core.length > 1 && p.core === p.core.toUpperCase() ? c.toUpperCase() : p.core[0] !== p.core[0].toLowerCase() ? c[0].toUpperCase() + c.slice(1) : c);
+  return [...found].sort((a, b) => a[1] - b[1]).slice(0, max).map(([c]) => p.pre + caps(c) + p.post);
+}
+
+/**
+ * Hebrew + English only: the order in which a line's words stand on the page, from right to
+ * left (the order of the word pictures), as indices into the words in reading order. A line's
+ * direction is that of its first letter (as the browser shows it): in a Hebrew line an English
+ * phrase stands left to right, so its words are reversed in right-to-left order; in an English
+ * line the same goes for a Hebrew phrase. Numbers go with the letters before them; marks and
+ * words without letters go with their neighbours when both sides agree, else with the line.
+ * (The Unicode bidirectional algorithm, word by word.)
+ */
+function visualOrder(words) {
+  const { rtl, cls } = wordDirections(words);
+  // Levels: right-to-left runs odd, left-to-right even, above the line's own level.
+  const levels = cls.map((c) => (rtl ? (c === "R" ? 1 : 2) : c === "L" ? 0 : 1));
+  // Order from left to right: reverse every run at each level from the highest down to 1.
+  let order = words.map((_, i) => i);
+  const max = Math.max(0, ...levels);
+  for (let lv = max; lv >= 1; lv--) {
+    for (let i = 0; i < order.length;) {
+      if (levels[order[i]] < lv) { i++; continue; }
+      let j = i; while (j < order.length && levels[order[j]] >= lv) j++;
+      order = [...order.slice(0, i), ...order.slice(i, j).reverse(), ...order.slice(j)];
+      i = j;
+    }
+  }
+  return order.reverse(); // right to left
+}
+/** Whether a line runs right to left (its first letter is Hebrew), and each word's resolved direction ("R" or "L"). */
+function wordDirections(words) {
+  const first = words.find((t) => hasHebrew(t) || hasLatin(t));
+  const rtl = !first || hasHebrew(first);
+  const base = rtl ? "R" : "L";
+  // Each word's direction: R (Hebrew), L (English), D (number), N (neither).
+  let cls = words.map((t) => (hasHebrew(t) ? "R" : hasLatin(t) ? "L" : /\d/.test(t) ? "D" : "N"));
+  // A number takes the direction of the last letter before it (the line's, if none).
+  let last = base;
+  cls = cls.map((c) => { if (c === "R" || c === "L") { last = c; return c; } return c === "D" ? last : c; });
+  // Marks: the direction on both sides when they agree, else the line's.
+  cls = cls.map((c, i) => {
+    if (c !== "N") return c;
+    let a = base, b = base;
+    for (let j = i - 1; j >= 0; j--) if (cls[j] !== "N") { a = cls[j]; break; }
+    for (let j = i + 1; j < cls.length; j++) if (cls[j] !== "N") { b = cls[j]; break; }
+    return a === b ? a : base;
+  });
+  return { rtl, cls };
+}
+
 /** Real words one letter away (a letter added, dropped, swapped or changed), most common first. */
 // Letters that look alike in Hebrew handwriting (print and cursive): a misreading usually swaps one
 // for another of the same group, adds or drops a ו or י, or confuses a final letter.
@@ -1038,6 +1193,7 @@ const toFinal = { כ: "ך", מ: "ם", נ: "ן", פ: "ף", צ: "ץ" };
  * then by how common the word is. Used for the choices of a word.
  */
 function suggestVisual(w, max = 5, prefer = null) {
+  if (MIXED && englishParts(w)) return suggestEnglish(w, max, prefer);
   const p = wordParts(w);
   if (!p || /[\u05be\-–/]/.test(p.core) || !lexicon?.size) return [];
   const core = p.core.replace(/["']/g, ""), marks = p.core !== core;
@@ -1135,7 +1291,7 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
   });
   for (let b = 0; b < asks.length; b += 20) {
     const batch = asks.slice(b, b + 20);
-    const parts = [{ text: `Each image below shows one handwritten Hebrew word, with a few candidate spellings. For each image, look only at the letters drawn and answer with the candidate whose letters match the handwriting EXACTLY, letter for letter. If none matches exactly (for example the writer spelled it differently), answer "none". Do not pick a candidate because it is a more common or more correct word.` }];
+    const parts = [{ text: forMixed(`Each image below shows one handwritten Hebrew word, with a few candidate spellings. For each image, look only at the letters drawn and answer with the candidate whose letters match the handwriting EXACTLY, letter for letter. If none matches exactly (for example the writer spelled it differently), answer "none". Do not pick a candidate because it is a more common or more correct word.`, ["one handwritten Hebrew word", "one handwritten word (Hebrew or English)"]) }];
     for (const [k, a] of batch.entries()) {
       parts.push({ text: `Image ${k + 1}, candidates: ${a.candidates.map((c) => `«${c}»`).join(", ")}` });
       parts.push({ inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, a.box, 240), 0.92)) } });
@@ -1172,7 +1328,7 @@ async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thi
   for (let i = 0; i < order.length; i += group) batches.push(order.slice(i, i + group));
   let failures = 0;
   await Promise.all(batches.map(async (batch) => {
-    const parts = [...known, { text: `Below are ${batch.length} images, each one handwritten line cut out of a page, in random order (they do not form a text together). For each image, transcribe exactly the letters written on the main line in the middle of the image, letter by letter and word by word, right to left. Ignore cut-off bits of the lines above or below it. Do not guess from meaning: a word you can't read fully goes in "unclear" with the letters you can see. Keep the writer's spelling and grammar exactly, even when wrong. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.` }];
+    const parts = [...known, { text: forMixed(`Below are ${batch.length} images, each one handwritten line cut out of a page, in random order (they do not form a text together). For each image, transcribe exactly the letters written on the main line in the middle of the image, letter by letter and word by word, right to left. Ignore cut-off bits of the lines above or below it. Do not guess from meaning: a word you can't read fully goes in "unclear" with the letters you can see. Keep the writer's spelling and grammar exactly, even when wrong. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.`, ["letter by letter and word by word, right to left.", "letter by letter and word by word, in reading order (Hebrew right to left, English left to right; see the rules for pages in Hebrew and English)."]) }];
     for (const [k, idx] of batch.entries()) {
       const box = lines[idx];
       // A little extra height, since line boxes are approximate.
@@ -1827,7 +1983,7 @@ async function renderPage(page) {
     const imgs = await crops(page, draft);
     draft.forEach((l, i) => {
       const row = document.createElement("div"); row.className = "row draft-row"; row.dir = "rtl";
-      row.innerHTML = `<img alt=""><div class="draft-text" dir="rtl" lang="he"></div>`;
+      row.innerHTML = `<img alt=""><div class="draft-text" dir="${MIXED ? "auto" : "rtl"}" lang="he"></div>`;
       if (imgs[i]) row.querySelector("img").src = imgs[i]; else row.querySelector("img").remove();
       const t = row.querySelector(".draft-text");
       if (l.done) {
@@ -1849,7 +2005,7 @@ async function renderPage(page) {
     const imgs = await crops(page, page.lines);
     page.lines.forEach((line, i) => body.append(lineRow(page, line, imgs[i])));
   } else if (page.status === "done") {
-    const d = document.createElement("div"); d.className = "doc"; d.dir = "rtl"; d.lang = "he"; d.contentEditable = "true"; d.spellcheck = false;
+    const d = document.createElement("div"); d.className = "doc"; d.dir = MIXED ? "auto" : "rtl"; d.lang = "he"; d.contentEditable = "true"; d.spellcheck = false;
     d.innerHTML = page.lines.map((l) => highlight(l.text, l.unclear)).join("\n");
     const original = page.lines.map((l) => ({ ...l }));
     d.oninput = () => {
@@ -1919,7 +2075,7 @@ function lineRow(page, line, img) {
     row.append(wrap);
   }
   const ed = document.createElement("div");
-  ed.className = "line-edit"; ed.lang = "he"; ed.dir = "rtl"; ed.spellcheck = false;
+  ed.className = "line-edit"; ed.lang = "he"; ed.dir = MIXED ? "auto" : "rtl"; ed.spellcheck = false;
   ed.dataset.key = line.top + "," + line.left;
   try { ed.contentEditable = "plaintext-only"; } catch { ed.contentEditable = "true"; }
   if (ed.contentEditable !== "plaintext-only") ed.contentEditable = "true";
@@ -2025,7 +2181,13 @@ async function wordSpot(page, line, index, count, text) {
   const W = bitmap.width, H = bitmap.height, h = ((line.bottom - line.top) / 1000) * H;
   const x0 = Math.max(0, (line.left / 1000) * W - h * 0.05), x1 = Math.min(W, (line.right / 1000) * W + h * 0.05);
   const span = x1 - x0;
-  const box = matchWordToBoxes(boxes, text.split(/\s+/).filter(Boolean), index);
+  let words = text.split(/\s+/).filter(Boolean), at = index;
+  if (MIXED) {
+    // The word pictures stand right to left on the page; English words in reading order don't.
+    const order = visualOrder(words);
+    words = order.map((i) => words[i]); at = order.indexOf(index);
+  }
+  const box = matchWordToBoxes(boxes, words, at);
   if (!box) return null;
   return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span, box };
 }
@@ -2227,7 +2389,7 @@ async function fetchWordOptionsOnce(docId, pageId) {
   const batches = [];
   for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
   await Promise.all(batches.map(async (batch) => {
-    const parts = [...known, { text: `Below are ${batch.length} images, each ONE handwritten Hebrew word cut out of a page, in random order. For each image, give the 5 readings that its pen strokes most look like, most likely first: go letter by letter and consider the letters each stroke could be (handwriting look-alikes such as ד/ר/ך, ה/ח/ת, ו/ז/י/ן, ב/כ/פ, ס/ם, ג/נ, ט/מ, ע/צ/א), and marks like ״ ׳. Judge only by what the handwriting looks like, never by what would make sense. Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them. Each reading different. Answer with one entry per numbered image, using the number written just before it ("Image 1:" …); example lines shown earlier get no entry.` }];
+    const parts = [...known, { text: forMixed(`Below are ${batch.length} images, each ONE handwritten Hebrew word cut out of a page, in random order. For each image, give the 5 readings that its pen strokes most look like, most likely first: go letter by letter and consider the letters each stroke could be (handwriting look-alikes such as ד/ר/ך, ה/ח/ת, ו/ז/י/ן, ב/כ/פ, ס/ם, ג/נ, ט/מ, ע/צ/א), and marks like ״ ׳. Judge only by what the handwriting looks like, never by what would make sense. Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them. Each reading different. Answer with one entry per numbered image, using the number written just before it ("Image 1:" …); example lines shown earlier get no entry.`, ["each ONE handwritten Hebrew word", "each ONE handwritten word (Hebrew or English)"], ["and marks like ״ ׳.", "and marks like ״ ׳; in an English word: a/o/u, e/c, i/l/t, n/h/r/u/v, m/rn, d/cl, g/q/y, b/h/k. Keep each word in its own script: never translate or transliterate."], ["Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them.", "Prefer real Hebrew or Aramaic words or abbreviations, or real English words, when the strokes allow them."]) }];
     try {
       for (const [k, it] of batch.entries()) {
         parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)) } });
@@ -2245,7 +2407,9 @@ async function fetchWordOptionsOnce(docId, pageId) {
   page.lines.forEach((l, i) => {
     const segs = perLine[i];
     if (!segs) return;
-    const tokens = l.text.split(/\s+/).filter(Boolean), map = {};
+    let tokens = l.text.split(/\s+/).filter(Boolean);
+    if (MIXED) tokens = visualOrder(tokens).map((i) => tokens[i]); // in the pictures' order (right to left on the page)
+    const map = {};
     const first = segs.map((o) => o?.[0] || "");
     if (segs.length === tokens.length) tokens.forEach((t, k) => { if (segs[k]?.length) map[t] = segs[k]; });
     else {
@@ -2277,7 +2441,10 @@ function preferredWords(except) {
   const now = Date.now();
   if (!preferCache || preferCache.doc !== state.doc || preferCache.writer !== state.writer || now - preferCache.at > 3000) {
     const set = new Set(Object.keys(writerMemory(state.writer).vocab));
-    for (const p of state.doc?.pages || []) for (const l of p.lines || []) for (const t of l.text.split(/\s+/)) { const c = wordParts(t)?.core; if (c) set.add(c); }
+    for (const p of state.doc?.pages || []) for (const l of p.lines || []) for (const t of l.text.split(/\s+/)) {
+      const c = wordParts(t)?.core || (MIXED ? englishParts(t)?.core.toLowerCase() : null);
+      if (c) set.add(c);
+    }
     preferCache = { doc: state.doc, writer: state.writer, at: now, set };
   }
   const out = new Set(preferCache.set); out.delete(except);
@@ -2336,7 +2503,7 @@ async function openWordMenu(page, line, row, img, at) {
   const opts = optionsFor(line, word);
   for (const o of opts) {
     const b = document.createElement("button");
-    b.className = "alt"; b.textContent = o.text || "✕"; b.title = o.text ? `Use «${o.text}» (${o.why})` : `Remove «${word}»`;
+    b.className = "alt"; b.textContent = o.text || "✕"; if (MIXED) b.dir = "auto"; b.title = o.text ? `Use «${o.text}» (${o.why})` : `Remove «${word}»`;
     b.onmousedown = (e) => e.preventDefault(); // keep the caret where it is
     b.onclick = (e) => { e.stopPropagation(); settle(o.text); };
     pop.append(b);
@@ -2543,7 +2710,22 @@ function zip(files) {
 }
 function docx(paragraphs) {
   const x = (s) => s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  const p = (t, bold) => `<w:p><w:pPr><w:bidi/></w:pPr><w:r><w:rPr><w:rtl/>${bold ? "<w:b/><w:bCs/>" : ""}<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="26"/><w:szCs w:val="26"/></w:rPr><w:t xml:space="preserve">${x(t)}</w:t></w:r></w:p>`;
+  const run = (t, bold, rtl) => `<w:r><w:rPr>${rtl ? "<w:rtl/>" : ""}${bold ? "<w:b/><w:bCs/>" : ""}<w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="26"/><w:szCs w:val="26"/></w:rPr><w:t xml:space="preserve">${x(t)}</w:t></w:r>`;
+  const p = (t, bold) => {
+    if (!MIXED) return `<w:p><w:pPr><w:bidi/></w:pPr>${run(t, bold, true)}</w:p>`;
+    // Hebrew + English: a right-to-left paragraph when the line starts in Hebrew, and each
+    // stretch of Hebrew or English words in its own run, marked with its direction.
+    const pieces = t.split(/(\s+)/).filter((x) => x !== "");
+    const words = pieces.filter((x) => /\S/.test(x));
+    const { rtl, cls } = wordDirections(words);
+    let k = 0, prev = null;
+    const dirs = pieces.map((x) => (/\S/.test(x) ? (prev = cls[k++]) : null));
+    dirs.forEach((d, i) => { if (d === null) { const next = dirs.slice(i + 1).find((y) => y !== null); dirs[i] = (i && dirs[i - 1]) === next ? next : rtl ? "R" : "L"; } });
+    let out = "", cur = "", curDir = null;
+    pieces.forEach((x, i) => { if (dirs[i] !== curDir && cur) { out += run(cur, bold, curDir === "R"); cur = ""; } curDir = dirs[i]; cur += x; });
+    if (cur) out += run(cur, bold, curDir === "R");
+    return `<w:p>${rtl ? "<w:pPr><w:bidi/></w:pPr>" : ""}${out || run("", bold, rtl)}</w:p>`;
+  };
   const body = paragraphs.map(([t, b]) => p(t, b)).join("");
   return zip([
     ["[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>'],
@@ -2619,7 +2801,7 @@ $("#settingsBtn").onclick = async () => {
     const k = wrap.querySelector("#keyNew").value.trim();
     if (k) setKey(k);
     setReadMode(wrap.querySelector("input[name=readMode]:checked")?.value || "fast");
-    try { localStorage.setItem("auto_options", wrap.querySelector("#autoOptions").checked ? "on" : "off"); } catch {}
+    try { LS.setItem("auto_options", wrap.querySelector("#autoOptions").checked ? "on" : "off"); } catch {}
     if (pick.value && !pick.value.startsWith("Loading")) { setModel(pick.value); autoModel = null; }
     wrap.remove();
     pickBestModel().then(() => notify(`Saved. Pages will be read ${readMode() === "careful" ? "carefully" : "fast"}, with ${getModel()}.`));
@@ -2695,15 +2877,15 @@ $("#backupBtn").onclick = async () => {
     const docs = await getAll("docs"), writers = await getAll("writers");
     for (const d of docs) for (const p of d.pages) p.image = await toDataUrl(p.image);
     for (const w of writers) for (const e of [...(w.examples || []), ...(w.wordExamples || [])]) e.crop = await toDataUrl(e.crop);
-    const data = { app: "hebrew-converter", version: 1, savedAt: new Date().toISOString(), docs, writers };
+    const savedAt = new Date().toISOString();
     // Written piece by piece, so a large backup doesn't need one huge text in memory.
-    const parts = ['{"app":"hebrew-converter","version":1,"savedAt":', JSON.stringify(data.savedAt), ',"docs":['];
+    const parts = [`{"app":"${APP_ID}","version":1,"savedAt":`, JSON.stringify(savedAt), ',"docs":['];
     docs.forEach((d, i) => parts.push((i ? "," : "") + JSON.stringify(d)));
     parts.push('],"writers":[');
     writers.forEach((w, i) => parts.push((i ? "," : "") + JSON.stringify(w)));
     parts.push("]}");
-    download(new Blob(parts, { type: "application/json" }), `hebrew-converter-backup-${new Date().toISOString().slice(0, 10)}.json`);
-    try { localStorage.setItem("last_backup", new Date().toISOString()); } catch {}
+    download(new Blob(parts, { type: "application/json" }), `${APP_ID}-backup-${new Date().toISOString().slice(0, 10)}.json`);
+    try { LS.setItem("last_backup", new Date().toISOString()); } catch {}
     showBackupNote();
   } catch (e) {
     console.error(e);
@@ -2719,7 +2901,8 @@ $("#restoreInput").onchange = async () => {
   if (!file) return;
   let data;
   try { data = JSON.parse(await file.text()); } catch { return notify("That file isn't a converter backup."); }
-  if (data?.app !== "hebrew-converter") return notify("That file isn't a converter backup.");
+  if (data?.app === OTHER_APP_ID) return notify(MIXED ? "That is a backup of the Hebrew-only converter. Restore it there: the two are kept separate." : "That is a backup of the Hebrew + English converter. Restore it there: the two are kept separate.");
+  if (data?.app !== APP_ID) return notify("That file isn't a converter backup.");
   if (!Array.isArray(data.docs) || !Array.isArray(data.writers)) return notify("That backup file is damaged.");
   if (!(await dialog(`Restore ${data.docs.length} documents and ${data.writers.length} people from this backup? A document or person that is in the backup and also here is replaced by the backup's version; everything else here is kept.`, { ok: "Restore", cancel: "Cancel" }))) return;
   let restored = 0;
@@ -2744,7 +2927,7 @@ $("#restoreInput").onchange = async () => {
 };
 function showBackupNote() {
   let last = null;
-  try { last = localStorage.getItem("last_backup"); } catch {}
+  try { last = LS.getItem("last_backup"); } catch {}
   $("#backupNote").textContent = last ? `Last backup: ${new Date(last).toLocaleString()}.` : "No backup made yet.";
 }
 

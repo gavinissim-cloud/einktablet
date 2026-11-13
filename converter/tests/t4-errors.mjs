@@ -7,7 +7,7 @@ async function run(name, fakeOpts, extra = {}) {
   const truth = await makePage(page, `${S}/e2e/page.png`);
   await tagCrops(page);
   const stats = await installFake(page, truth, fakeOpts);
-  if (extra.careful) await page.evaluate(() => localStorage.setItem("read_mode", "careful"));
+  if (extra.careful) await page.evaluate(() => LS.setItem("read_mode", "careful"));
   if (extra.before) await extra.before(page, truth);
   await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
   await page.setInputFiles("#fileInput", `${S}/e2e/page.png`);
