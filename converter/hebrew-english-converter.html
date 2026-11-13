@@ -921,7 +921,13 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
       answered++;
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
-        if (!it || typeof r.text !== "string" || !r.text.trim()) continue; // missing or empty: that line is read whole instead
+        if (!it || typeof r.text !== "string") continue; // missing: that line is read whole instead
+        if (!r.text.trim()) {
+          // Empty: in Hebrew a line with a word missing is read whole instead; in a line with
+          // English (matched by place) it is a picture of a mark or a speck, and the rest is still checked.
+          if (MIXED && hasLatin(lines[it.line].text)) { texts[it.line][it.pos] = ""; sure[it.line][it.pos] = true; }
+          continue;
+        }
         texts[it.line][it.pos] = (MIXED ? noForeign(r.text) : r.text).trim().replace(/\s+/g, " ");
         sure[it.line][it.pos] = r.sure !== false;
       }
@@ -1675,14 +1681,30 @@ async function checkWordsOnce(docId, pageId, readId) {
  * moved out of its place. Returns the line in reading order.
  */
 function mergeByPlace(line, e, dir, real) {
-  const rd = line.ai.split(/\s+/).filter(Boolean);
+  let rd = line.ai.split(/\s+/).filter(Boolean);
   if (!rd.length) return null;
-  const order = placeOrder(rd, dir); // order[v] = index of the word standing at place v (right to left)
-  const rdV = order.map((i) => rd[i]);
   // Each picture's words, right to left (an English picture of two words reads left to right).
   const litV = e.pics.flatMap((t) => { const w = String(t || "").split(/\s+/).filter(Boolean); return hasLatin(t) && !hasHebrew(t) ? w.reverse() : w; })
     .filter((t) => /[\u05d0-\u05eaA-Za-z0-9□]/.test(t)); // a picture of a mark alone: its mark is in the line's word
   const key = (t) => t.replace(/[^\u05d0-\u05eaA-Za-z0-9□]/g, "");
+  const agree = (words) => alignWords(litV.map(key), placeOrder(words, dir).map((i) => key(words[i]))).filter((x) => x.same).length;
+  if (dir === "ltr") {
+    // A Hebrew phrase in a line written left to right: Gemini may have typed it in Hebrew order
+    // although the writer put it down the other way round (or the other way about). The pictures
+    // show where each word really stands: each run of Hebrew words is turned around when that
+    // matches them better.
+    for (let i = 0; i < rd.length;) {
+      if (!hasHebrew(rd[i])) { i++; continue; }
+      let j = i; while (j < rd.length && hasHebrew(rd[j])) j++;
+      if (j - i >= 2) {
+        const flipped = flipRun(rd, i, j);
+        if (agree(flipped) > agree(rd)) rd = flipped;
+      }
+      i = j;
+    }
+  }
+  const order = placeOrder(rd, dir); // order[v] = index of the word standing at place v (right to left)
+  const rdV = order.map((i) => rd[i]);
   const parts = alignWords(litV.map(key), rdV.map(key));
   // Readings that hardly agree mean the line was cut up wrongly: keep the line reading.
   if (parts.filter((x) => x.same).length < rdV.length * 0.4) return null;
@@ -1719,6 +1741,20 @@ function mergeByPlace(line, e, dir, real) {
   for (const w of e.unsure) for (const t of words) if (key(t) === key(w) && !real(t)) flagged.add(t);
   for (const w of words) if (w.includes("□")) flagged.add(w);
   return { text: words.join(" "), flagged, alts };
+}
+
+/**
+ * Words i..j-1 turned around, as a phrase typed in Hebrew order becomes the order it stands in
+ * from left to right (and back): its marks go with it, the mark it ends with to the new start
+ * and the one it starts with to the new end («דף ו:» -> «:ו דף», «"יותר נאה"» -> «"נאה יותר"»).
+ */
+function flipRun(words, i, j) {
+  const run = words.slice(i, j);
+  const pre = run[0].match(/^[^\u05d0-\u05eaA-Za-z0-9□]*/)[0], post = run.at(-1).match(/[^\u05d0-\u05eaA-Za-z0-9□]*$/)[0];
+  run[0] = run[0].slice(pre.length); run[run.length - 1] = run.at(-1).slice(0, run.at(-1).length - post.length);
+  run.reverse();
+  run[0] = post + run[0]; run[run.length - 1] += pre;
+  return [...words.slice(0, i), ...run, ...words.slice(j)];
 }
 
 /** Align two word lists: [{a: [...], b: [...]}], equal stretches have a and b the same. */

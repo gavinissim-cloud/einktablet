@@ -265,6 +265,7 @@ const PAGE2 = [
   "handedly broke it. The ד״ה asks מה הדין if the bench",
   "more נסב - ע״י. The תוס׳ ד״ה on :ו דף asks that",
   "we could have said a different חידוש here.",
+  "The פרישה writes \"נאה יותר\" that",
 ];
 const truth2 = await layOut(PAGE2.map((text) => ({ text, dir: "ltr", wordByWord: true, size: 48 })));
 fs.writeFileSync(`${S}/e2e/mixed2.png`, Buffer.from((await page.evaluate(() => window.__png)).split(",")[1], "base64"));
@@ -273,9 +274,12 @@ await browser.close();
 // (a fresh browser: a new person's first page)
 ({ browser, ctx, page, errors } = await start(FILE));
 await tagCrops(page);
-const madeUp2 = (t) => t.replace("תוס׳", "The").replace("חידוש", "חידושים");
+// …and Gemini types Hebrew phrases in Hebrew order although the writer put them down the other
+// way round («"נאה יותר"» on the page, «"יותר נאה"» typed; «:ו דף» typed «דף ו:»), reads «פרישה» as
+// «שילה», and answers nothing for the picture of the dash.
+const madeUp2 = (t) => t.replace("תוס׳", "The").replace("חידוש", "חידושים").replace("\"נאה יותר\"", "\"יותר נאה\"").replace(":ו דף", "דף ו:").replace("פרישה", "שילה");
 const armenian = (t) => t.replace(/ד״ה/g, "ՀՋ").replace("מה הדין", "մnu הדין");
-const stats2 = await installFake(page, truth2, { lineText: (t, n) => (n === 1 ? armenian(madeUp2(t)) : madeUp2(t).replace(/ד״ה/g, "מ״ה")) });
+const stats2 = await installFake(page, truth2, { lineText: (t, n) => (n === 1 ? armenian(madeUp2(t)) : madeUp2(t).replace(/ד״ה/g, "מ״ה")), wordText: (t) => (t === "-" ? "" : t) });
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", `${S}/e2e/mixed2.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Page2"); await page.click(".dialog button[type=submit]");
@@ -284,7 +288,8 @@ const eds2 = page.locator(".row .line-edit");
 if (process.env.SHOT) await page.locator("#pages > .card").first().screenshot({ path: process.env.SHOT + "/page2-lines.png" }); // to look at
 const texts2 = await eds2.allInnerTexts();
 check("no letters of another alphabet anywhere (those lines were read again)", texts2.every((t) => !/[\u0530-\u058f\u0370-\u03ff\u0400-\u04ff]/.test(t)) && stats2.lines >= 2, JSON.stringify(texts2) + " " + stats2.lines);
-check("«The» for «תוס׳», «מ״ה» for «ד״ה» and the made-up «חידושים» are put back as each word's picture says", JSON.stringify(texts2) === JSON.stringify(PAGE2), JSON.stringify(texts2));
+check("«The» for «תוס׳», «מ״ה» for «ד״ה», «שילה» for «פרישה» and the made-up «חידושים» are put back as each word's picture says", JSON.stringify(texts2) === JSON.stringify(PAGE2), JSON.stringify(texts2));
+check("Hebrew phrases typed in Hebrew order are turned to the order they stand on the page («\"נאה יותר\"», «:ו דף»)", texts2[3]?.includes("\"נאה יותר\"") && texts2[1]?.includes(":ו דף"), JSON.stringify(texts2));
 check("…highlighted", ["תוס׳", "ד״ה"].every((w) => texts2[1] && 1) && (await marksOf(page, 1)).includes("תוס׳"), JSON.stringify(await marksOf(page, 1)));
 check("lines written left to right are shown left to right", (await eds2.evaluateAll((els) => els.every((e) => e.dir === "ltr"))));
 // On screen every word stands where it stands on the page: in the written order, left to right.
