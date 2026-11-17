@@ -2348,6 +2348,26 @@ function lineRow(page, line, img) {
     }
     line.text = ed.textContent.replace(/\n/g, " "); typed = true; scheduleSave(page);
   };
+  // While the line is edited, the word the cursor is in is outlined in the picture (as you type,
+  // move with the arrow keys or click), so you always see which handwritten word you are on.
+  const markCaret = () => {
+    const box = row.querySelector(".word-box");
+    if (!box || document.activeElement !== ed) return;
+    const at = caretToken(ed), tok = (box._tok = (box._tok || 0) + 1);
+    if (!at) { box.hidden = true; return; }
+    const text = ed.textContent.replace(/\n/g, " "), count = text.split(/\s+/).filter(Boolean).length;
+    wordSpot(page, line, at.index, count, text).then((spot) => {
+      if (box._tok !== tok || !box.isConnected || document.activeElement !== ed) return;
+      if (!spot) { box.hidden = true; return; }
+      box.style.right = `${(1 - spot.right) * 100}%`; box.style.width = `${(spot.right - spot.left) * 100}%`; box.hidden = false;
+    }).catch(() => {});
+  };
+  // After the other handlers of the same key or click (closing the word menu hides the outline).
+  for (const ev of ["input", "keyup", "mouseup", "focus"]) ed.addEventListener(ev, () => setTimeout(markCaret, 0));
+  ed.addEventListener("blur", () => {
+    const box = row.querySelector(".word-box");
+    if (box && !document.querySelector(".popover")) { box._tok = (box._tok || 0) + 1; box.hidden = true; }
+  });
   ed.onkeydown = (e) => {
     if (e.key !== "Enter") return;
     e.preventDefault(); // one box per handwritten line: Enter goes to the next line

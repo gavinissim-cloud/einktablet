@@ -42,11 +42,14 @@ for (const [run, mode] of MODES.split(",").entries()) {
     await page.waitForTimeout(1000);
     const label = await page.locator(".page-head .state").first().textContent();
     const lines = await page.locator(".row .line-edit").evaluateAll((e) => e.map((x) => x.innerText));
+    // The line reading as it was before the word-by-word check changed anything.
+    const before = await page.evaluate(() => (state.doc?.pages?.[0]?.lines || []).map((l) => l.ai || ""));
     const got = norm(lines.join(" ")), want = norm(g.lines.join(" "));
     const r = { run, mode, page: n, legibility: g.legibility, seconds: Math.round((Date.now() - t0) / 1000), cents: +(label.match(/cost about ([\d.]+)¢/)?.[1] || NaN),
-      chars: want.length, charErrors: lev(got, want), words: words(want).length, wordErrors: wordErrors(words(got), words(want)), label, text: lines };
+      chars: want.length, charErrors: lev(got, want), words: words(want).length, wordErrors: wordErrors(words(got), words(want)),
+      wordErrorsBeforeCheck: wordErrors(words(before.join(" ")), words(want)), label, text: lines, before };
     results.push(r); fs.writeFileSync(OUT, JSON.stringify(results, null, 1));
-    console.log(`${mode} run ${run} page ${n}: ${(100 * r.charErrors / r.chars).toFixed(1)}% characters wrong, ${r.wordErrors}/${r.words} words wrong, ${r.cents}¢, ${r.seconds}s`);
+    console.log(`${mode} run ${run} page ${n}: ${(100 * r.charErrors / r.chars).toFixed(1)}% characters wrong, ${r.wordErrors}/${r.words} words wrong (${r.wordErrorsBeforeCheck} before the word check), ${r.cents}¢, ${r.seconds}s`);
     await page.goto("file://" + FILE); // home, a clean page list (the documents stay in the browser)
     if (process.env.DRY) await tagCrops(page);
   }
@@ -56,5 +59,5 @@ for (const [run, mode] of MODES.split(",").entries()) {
 // Summary per mode
 for (const mode of [...new Set(results.map((r) => r.mode))]) {
   const rs = results.filter((r) => r.mode === mode), sum = (k) => rs.reduce((s, r) => s + r[k], 0);
-  console.log(`${mode}: ${(100 * sum("charErrors") / sum("chars")).toFixed(2)}% characters wrong, ${(100 * sum("wordErrors") / sum("words")).toFixed(2)}% words wrong, ${(sum("cents") / rs.length).toFixed(1)}¢ a page on average (${rs.length} pages)`);
+  console.log(`${mode}: ${(100 * sum("charErrors") / sum("chars")).toFixed(2)}% characters wrong, ${(100 * sum("wordErrors") / sum("words")).toFixed(2)}% words wrong (${(100 * sum("wordErrorsBeforeCheck") / sum("words")).toFixed(2)}% before the word check), ${(sum("cents") / rs.length).toFixed(1)}¢ a page on average (${rs.length} pages)`);
 }
