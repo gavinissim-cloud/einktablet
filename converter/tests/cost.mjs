@@ -32,6 +32,7 @@ page.on("request", (r) => { if (r.method() === "POST" && r.url().includes("gener
 page.on("requestfinished", (r) => { const b = sent.get(r); if (b) b.doneAt = Date.now(); });
 const stats = await installFake(page, truth, { lineText: corruptLines });
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
+if (process.env.LEAN) await page.evaluate(() => localStorage.setItem("picture_quality", "lean"));
 await page.setInputFiles("#fileInput", `${S}/e2e/cost.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "Tester"); await page.click(".dialog button[type=submit]");
 await allReady(page, stats);

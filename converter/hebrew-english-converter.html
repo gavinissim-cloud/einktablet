@@ -677,6 +677,16 @@ async function streamOnceWith(body, signal, alive) {
   return { text, finish, usage };
 }
 
+// ---------- Picture quality ----------
+// "best" (the default): every picture at Google's default quality for pictures, its highest
+// (1,120 tokens each, however small the picture). "lean", for the accuracy test only (set
+// localStorage picture_quality=lean): the cut-out lines at medium quality (560 tokens) and the
+// single words at low (280), the writer's examples unchanged. Not offered in Settings until
+// the test shows it reads as well.
+function pictureQuality() { try { return LS.getItem("picture_quality") === "lean" ? "lean" : "best"; } catch { return "best"; } }
+const LEAN_LEVEL = { line: "MEDIA_RESOLUTION_MEDIUM", word: "MEDIA_RESOLUTION_LOW" };
+const picture = (data, kind) => ({ inlineData: { mimeType: "image/jpeg", data }, ...(pictureQuality() === "lean" ? { mediaResolution: { level: LEAN_LEVEL[kind] } } : {}) });
+
 // ---------- What each page costs ----------
 // Google's price per million tokens, in US dollars: input, and output (thinking is billed as
 // output). Input that Google already has cached from a recent request with the same beginning
@@ -943,7 +953,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
     const parts = [...known, { text: forMixed(`Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.`, ["ONE handwritten Hebrew word", "ONE handwritten word, Hebrew or English"], ["letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation.", "letter by letter in the word's own script, never translated or transliterated: a Hebrew word right to left, with its final letters (ך ם ן ף ץ) and gershayim/geresh (״ ׳); an English word left to right, with its capital letters as written; and its punctuation."]) }];
     for (const [k, it] of batch.entries()) {
       const crop = cropLine(bitmap, it.box, 240);
-      parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
+      parts.push({ text: `Image ${k + 1}:` }, picture(await blobBase64(await canvasBlob(crop, 0.92)), "word"));
     }
     // Once more if the answer left words out (a failed request was already retried inside askJson).
     for (let attempt = 0; attempt < 2; attempt++) try {
@@ -1413,7 +1423,7 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine, pageId = null) {
     const parts = [{ text: forMixed(`Each image below shows one handwritten Hebrew word, with a few candidate spellings. For each image, look only at the letters drawn and answer with the candidate whose letters match the handwriting EXACTLY, letter for letter. If none matches exactly (for example the writer spelled it differently), answer "none". Do not pick a candidate because it is a more common or more correct word.`, ["one handwritten Hebrew word", "one handwritten word (Hebrew or English)"]) }];
     for (const [k, a] of batch.entries()) {
       parts.push({ text: `Image ${k + 1}, candidates: ${a.candidates.map((c) => `«${c}»`).join(", ")}` });
-      parts.push({ inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, a.box, 240), 0.92)) } });
+      parts.push(picture(await blobBase64(await canvasBlob(cropLine(bitmap, a.box, 240), 0.92)), "word"));
     }
     try {
       const res = await askJson(parts, PICK_SCHEMA, WORD_THINKING, false, pageId);
@@ -1454,7 +1464,7 @@ async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thi
       const h = box.bottom - box.top;
       const loose = { ...box, top: Math.max(0, box.top - h * 0.15), bottom: Math.min(1000, box.bottom + h * 0.15) };
       const crop = cropLine(bitmap, loose, 320);
-      parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
+      parts.push({ text: `Image ${k + 1}:` }, picture(await blobBase64(await canvasBlob(crop, 0.92)), "line"));
     }
     try {
       const res = await askJson(parts, EXACT_SCHEMA, thinking, false, pageId);
@@ -2369,7 +2379,8 @@ function lineRow(page, line, img) {
   if (line.empty && !line.text) {
     const note = document.createElement("div"); note.className = "choices"; note.dir = "ltr";
     note.append("Nothing was read on this line. If there is writing in the picture, type it above.");
-    const rm = button("Remove line", "secondary", () => { page.lines = page.lines.filter((x) => x !== line); scheduleSave(page); renderPage(page); });
+    const rm = document.createElement("button"); rm.type = "button"; rm.className = "secondary"; rm.textContent = "Remove line";
+    rm.onclick = () => { page.lines = page.lines.filter((x) => x !== line); scheduleSave(page); renderPage(page); };
     note.append(rm); row.append(note);
   }
   const words = doubtful();
@@ -2590,7 +2601,7 @@ async function optionsForWord(page, line, index, count, text) {
   const bitmap = await pageBitmap(page);
   const writer = state.doc?.writerId ? await getOne("writers", state.doc.writerId) : null;
   const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
-  const parts = [...known, { text: optionsPrompt(1) }, { text: "Image 1:" }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, spot.box, 240), 0.92)) } }];
+  const parts = [...known, { text: optionsPrompt(1) }, { text: "Image 1:" }, picture(await blobBase64(await canvasBlob(cropLine(bitmap, spot.box, 240), 0.92)), "word")];
   const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, false, page.id);
   const r = (res.words || []).find((x) => Number(x.image) === 1) || (res.words || [])[0];
   return Array.isArray(r?.options) ? r.options.filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map(hebMarksIn).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5) : [];
@@ -2641,7 +2652,7 @@ async function fetchWordOptionsOnce(docId, pageId, { onlyFlagged = false } = {})
     const parts = [...known, { text: optionsPrompt(batch.length) }];
     try {
       for (const [k, it] of batch.entries()) {
-        parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)) } });
+        parts.push({ text: `Image ${k + 1}:` }, picture(await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)), "word"));
       }
       const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, true, pageId);
       for (const r of res.words || []) {
