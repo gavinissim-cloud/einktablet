@@ -28,6 +28,7 @@ function wordErrors(a, b) { // word-level edit distance
 const results = fs.existsSync(OUT) ? JSON.parse(fs.readFileSync(OUT, "utf8")) : [];
 for (const [run, mode] of MODES.split(",").entries()) {
   const { browser, page, errors } = await start(FILE);
+  if (process.env.RAWDIR) page.on("console", (m) => { if (m.type() === "warning" || m.type() === "error") console.log("    app: " + m.text().slice(0, 200)); });
   // Google's bill for each request, by what it was for (as the test's fake Gemini tells them apart).
   let bill = {};
   page.on("requestfinished", async (req) => {
@@ -40,12 +41,23 @@ for (const [run, mode] of MODES.split(",").entries()) {
     const b = (bill[kind] ||= { requests: 0, images: 0, prompt: 0, cached: 0, output: 0, thoughts: 0 });
     b.requests++; b.images += images;
     const status = (await req.response().catch(() => null))?.status();
+    if (process.env.RAWDIR && kind === "lines") {
+      const k = (globalThis.__raw = (globalThis.__raw || 0) + 1);
+      fs.writeFileSync(`${process.env.RAWDIR}/${k}-req.json`, req.postData() || "");
+      fs.writeFileSync(`${process.env.RAWDIR}/${k}-res.txt`, await (await req.response()).body());
+    }
+    if (kind === "lines" && process.env.LINELOG) {
+      let text = ""; try { for (const line of (await (await req.response()).text()).split(/\r?\n/)) if (line.startsWith("data:")) for (const p of JSON.parse(line.slice(5)).candidates?.[0]?.content?.parts || []) if (!p.thought && p.text) text += p.text; } catch {}
+      let got = "?"; try { got = JSON.parse(text).lines.map((l) => l.image + (l.text ? "" : "(empty)")).join(","); } catch (e) { got = "unreadable: " + text.slice(0, 80); }
+      console.log(`    line request: status ${status}, ${images} pictures, answered for: ${got}`);
+    }
     if (status !== 200) b[`status ${status}`] = (b[`status ${status}`] || 0) + 1; // refused (busy) requests aren't billed
     if (u) { b.prompt += u.promptTokenCount || 0; b.cached += u.cachedContentTokenCount || 0; b.output += u.candidatesTokenCount || 0; b.thoughts += u.thoughtsTokenCount || 0; }
   });
   if (process.env.DRY) { await tagCrops(page); await installFake(page, []); } // checks the test itself, no Gemini
   await page.fill("#keyInput", "proxy-injected"); await page.click("#keySave");
   await page.evaluate((m) => localStorage.setItem("picture_quality", m), mode);
+  if (process.env.MODEL) await page.evaluate((m) => localStorage.setItem("gemini_model", m), process.env.MODEL); // a chosen model instead of "latest"
   for (let n = from; n <= to; n++) {
     if (results.some((r) => r.run === run && r.mode === mode && r.page === n)) continue; // done in an earlier attempt
     const g = gold[n - 1], t0 = Date.now(); bill = {};
