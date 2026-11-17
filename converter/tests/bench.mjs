@@ -34,7 +34,7 @@ for (const [run, mode] of MODES.split(",").entries()) {
   page.on("requestfinished", async (req) => {
     if (req.method() !== "POST" || !req.url().includes("generativelanguage")) return;
     const raw = JSON.stringify((req.postDataJSON()?.contents?.[0]?.parts || []).filter((p) => p.text));
-    const kind = raw.includes("readings that its pen strokes most look like") ? "options" : /ONE handwritten (Hebrew )?word/.test(raw) ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
+    const kind = raw.includes("write exactly the letters drawn in it") ? "words" : raw.includes("readings that its pen strokes most look like") ? "options" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
     const images = (req.postDataJSON()?.contents?.[0]?.parts || []).filter((p) => p.inlineData).length;
     let u = null;
     try { for (const line of (await (await req.response()).text()).split(/\r?\n/)) if (line.startsWith("data:")) { const c = JSON.parse(line.slice(5)); if (c.usageMetadata) u = c.usageMetadata; } } catch {}

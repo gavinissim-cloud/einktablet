@@ -26,12 +26,12 @@ r = await run("bad key", { fail: () => ({ status: 400, message: "API key not val
 check("wrong key: clear message", /key isn't accepted/.test(r.state), r.state);
 
 r = await run("fast", { models: ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-pro"] });
-check("Fast (default) reads with Flash", r.stats.models.every((m) => m === "gemini-flash-latest") && /6 lines/.test(r.state), r.stats.models.join(","));
+check("Fast (default) reads with Flash 3.6", r.stats.models.every((m) => m === "gemini-3.6-flash") && /6 lines/.test(r.state), r.stats.models.join(","));
 r = await run("auto pro", { models: ["gemini-flash-latest", "gemini-pro-latest", "gemini-2.5-pro"] }, { careful: true });
 check("Most careful picks the best Pro model", r.stats.models[0] === "gemini-pro-latest" && /6 lines/.test(r.state), r.stats.models.join(","));
 
 r = await run("pro missing", { models: ["gemini-flash-latest", "gemini-pro-latest"], fail: (k, n, url) => (url.includes("pro") ? { status: 404, message: "models/gemini-pro-latest is not found" } : null) }, { careful: true });
-check("Pro not available: falls back to Flash and reads", /6 lines/.test(r.state) && r.stats.models.includes("gemini-flash-latest"), r.state + " " + r.stats.models.join(","));
+check("Pro not available: falls back to Flash and reads", /6 lines/.test(r.state) && r.stats.models.includes("gemini-3.6-flash"), r.state + " " + r.stats.models.join(","));
 
 r = await run("pro no allowance", { models: ["gemini-flash-latest", "gemini-pro-latest"], fail: (k, n, url) => (url.includes("pro") ? { status: 429, message: "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0, model: gemini-pro" } : null) }, { careful: true });
 check("Pro with no allowance: falls back to Flash", /6 lines/.test(r.state), r.state);

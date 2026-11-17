@@ -190,7 +190,12 @@ function forMixed(text, ...pairs) {
 if (MIXED) document.body.classList.add("mixed");
 
 // ---------- Settings ----------
-const DEFAULT_MODEL = "gemini-flash-latest";
+// Gemini Flash 3.6, not "latest": Flash 3.7 and 3.8 (what "gemini-flash-latest" became) stop most
+// answers to line and word pictures part-way (Google blocks them, reason "OTHER"); on the ivrit.ai
+// handwriting benchmark 3.6 read better overall (30.9% of words wrong against 39.1%), about a third
+// cheaper and several times faster. If Google retires it, "latest" is used instead.
+const DEFAULT_MODEL = "gemini-3.6-flash", LATEST_MODEL = "gemini-flash-latest";
+let fastModel = DEFAULT_MODEL;
 const AUTO = "auto";
 let autoModel = null; // the best model this key can use, found once per session
 function chosenModel() { try { return LS.getItem("gemini_model") || AUTO; } catch { return AUTO; } }
@@ -209,7 +214,7 @@ try {
 function getModel() {
   const m = chosenModel();
   if (m !== AUTO) return m;
-  return readMode() === "careful" ? autoModel || DEFAULT_MODEL : DEFAULT_MODEL;
+  return readMode() === "careful" ? autoModel || fastModel : fastModel;
 }
 // Fast: light thinking per line (seconds). Most careful: deep thinking (much slower).
 const lineThinking = () => (readMode() === "careful" ? "HIGH" : "LOW");
@@ -220,10 +225,10 @@ async function pickBestModel() {
     const models = (await listModels()).map((m) => m.id).filter((id) => /pro/i.test(id) && !/preview|exp|tts|vision|lite|customtools/i.test(id));
     const version = (id) => parseFloat((id.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || "0");
     models.sort((a, b) => (/latest/.test(b) - /latest/.test(a)) || version(b) - version(a));
-    autoModel = models[0] || DEFAULT_MODEL;
+    autoModel = models[0] || fastModel;
   } catch (e) {
-    console.warn("Couldn't list models, using", DEFAULT_MODEL, e);
-    autoModel = DEFAULT_MODEL;
+    console.warn("Couldn't list models, using", fastModel, e);
+    autoModel = fastModel;
   }
 }
 function setModel(m) { try { LS.setItem("gemini_model", m); } catch {} }
@@ -618,7 +623,7 @@ class ReadError extends Error {}
 // hanging): it is dropped and sent again, instead of holding up the whole page.
 // Deep thinking can be silent for longer before it starts answering.
 const STALL_MS = 40 * 1000, STALL_THINKING_MS = 150 * 1000;
-async function streamOnce(body, signal) {
+async function streamOnce(body, signal, model = getModel()) {
   const own = new AbortController();
   const stop = () => own.abort();
   signal.addEventListener("abort", stop, { once: true });
@@ -627,7 +632,7 @@ async function streamOnce(body, signal) {
   const alive = () => { clearTimeout(timer); timer = setTimeout(() => { stalled = true; own.abort(); }, wait); };
   alive();
   try {
-    return await streamOnceWith(body, own.signal, alive);
+    return await streamOnceWith(body, own.signal, alive, model);
   } catch (e) {
     if (stalled && !signal.aborted) throw Object.assign(new ReadError("Gemini stopped answering."), { status: 503, stalled: true });
     throw e;
@@ -636,8 +641,8 @@ async function streamOnce(body, signal) {
     signal.removeEventListener("abort", stop);
   }
 }
-async function streamOnceWith(body, signal, alive) {
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${getModel()}:streamGenerateContent?alt=sse`, {
+async function streamOnceWith(body, signal, alive, model = getModel()) {
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
     method: "POST", signal,
     headers: { "Content-Type": "application/json", "x-goog-api-key": getKey() },
     body: JSON.stringify(body),
@@ -650,13 +655,14 @@ async function streamOnceWith(body, signal, alive) {
   }
   const reader = res.body.getReader();
   const dec = new TextDecoder();
-  let buf = "", text = "", finish = null, usage = null;
+  let buf = "", text = "", finish = null, usage = null, blocked = null;
   const handle = (block) => {
     for (const line of block.split(/\r?\n/)) {
       if (!line.startsWith("data:")) continue;
       const chunk = JSON.parse(line.slice(5).trim());
       if (chunk.error) throw Object.assign(new ReadError(chunk.error.message || "Gemini error"), { status: chunk.error.code || 500 });
       if (chunk.usageMetadata) usage = chunk.usageMetadata; // what Google bills for this request (the last chunk has the totals)
+      if (chunk.promptFeedback?.blockReason) blocked = chunk.promptFeedback.blockReason; // Google stopped the answer part-way
       const cand = chunk.candidates?.[0];
       for (const p of cand?.content?.parts || []) if (typeof p.text === "string" && !p.thought) text += p.text;
       if (cand?.finishReason) finish = cand.finishReason;
@@ -674,6 +680,7 @@ async function streamOnceWith(body, signal, alive) {
     }
   }
   if (buf.trim()) handle(buf);
+  if (blocked) throw Object.assign(new ReadError(`Google blocked Gemini's answer (${blocked}).`), { blocked, usage });
   return { text, finish, usage };
 }
 
@@ -766,24 +773,38 @@ async function askJsonNow(parts, schema, thinking, pageId) {
   const generationConfig = { responseMimeType: "application/json", responseJsonSchema: schema };
   if (thinking !== "off" && !thinkingRejected.has(getModel())) generationConfig.thinkingConfig = { thinkingLevel: thinking, includeThoughts: true };
   const body = { systemInstruction: { parts: [{ text: INSTRUCTIONS + "\n\n" + EXACT_RULES + abbrevPrompt() + MIXED_RULES }] }, contents: [{ role: "user", parts }], generationConfig };
+  let model = getModel(), switched = false;
   try {
     for (let attempt = 0; ; attempt++) {
       try {
-        const model = getModel();
-        const { text, finish, usage } = await streamOnce(body, controller.signal);
+        const { text, finish, usage } = await streamOnce(body, controller.signal, model);
         addCost(pageId, model, usage);
         if (finish && !["STOP", "FINISH_REASON_UNSPECIFIED"].includes(finish)) throw new ReadError(`Gemini stopped: ${finish}`);
         if (!text) throw new ReadError("Gemini gave no answer.");
         return JSON.parse(text);
       } catch (e) {
         if (e.name === "AbortError") throw new ReadError("Gemini took too long. Try again, or try a clearer photo.");
-        if (e.status === 400 && generationConfig.thinkingConfig && /think/i.test(e.message)) { thinkingRejected.add(getModel()); delete generationConfig.thinkingConfig; continue; }
+        // Blocked part-way by Google: the same request is usually blocked again (and billed again),
+        // so it is sent once to the other Flash model instead, never over and over.
+        if (e.blocked) {
+          addCost(pageId, model, e.usage);
+          if (switched) throw e;
+          switched = true; model = model === "gemini-3.6-flash" ? "gemini-3.5-flash" : "gemini-3.6-flash";
+          console.warn(`Answer blocked by Google (${e.blocked}); asking ${model} instead`);
+          continue;
+        }
+        if (e.status === 400 && generationConfig.thinkingConfig && /think/i.test(e.message)) { thinkingRejected.add(model); delete generationConfig.thinkingConfig; continue; }
         // The automatically chosen model isn't available after all: use Flash.
         const noAllowance = e.status === 429 && /limit:\s*0\b/.test(e.message);
         const noModel = e.status === 404 || (e.status === 400 && /model\b.*\b(not found|not supported|does not exist|is not available)/i.test(e.message));
-        if ((noModel || noAllowance) && chosenModel() === AUTO && getModel() !== DEFAULT_MODEL) {
-          console.warn(`${getModel()} not available (${e.message}); using ${DEFAULT_MODEL}`);
-          autoModel = DEFAULT_MODEL; continue;
+        if ((noModel || noAllowance) && chosenModel() === AUTO && model !== fastModel) {
+          console.warn(`${model} not available (${e.message}); using ${fastModel}`);
+          autoModel = fastModel; model = fastModel; continue;
+        }
+        // Flash 3.6 retired by Google: "latest" from then on.
+        if (noModel && model === fastModel && fastModel !== LATEST_MODEL) {
+          console.warn(`${model} not available (${e.message}); using ${LATEST_MODEL}`);
+          fastModel = LATEST_MODEL; if (autoModel === DEFAULT_MODEL) autoModel = LATEST_MODEL; model = LATEST_MODEL; continue;
         }
         // Busy, a server error, a dropped connection, or a cut-off answer: try again, waiting longer each time.
         const network = e instanceof TypeError && !e.status;
@@ -914,11 +935,21 @@ const WORD_SCHEMA = {
   properties: {
     words: {
       type: "array",
-      items: { type: "object", properties: { image: { type: "integer" }, text: { type: "string" }, sure: { type: "boolean" } }, required: ["image", "text", "sure"] },
+      items: { type: "object", properties: { image: { type: "integer" }, text: { type: "string" }, sure: { type: "boolean" }, options: { type: "array", items: { type: "string" } } }, required: ["image", "text", "sure", "options"] },
     },
   },
   required: ["words"],
 };
+// The word's 5 choices are asked for in the same request as its reading: the same picture, read
+// on its own, is then sent (and paid for) once instead of twice. The same instructions as the
+// separate request for choices (optionsPrompt), which is still used for words without them.
+function optionsRule() {
+  return forMixed(` For each image also give "options": the 5 readings that its pen strokes most look like, most likely first: go letter by letter and consider the letters each stroke could be (handwriting look-alikes such as ד/ר/ך, ה/ח/ת, ו/ז/י/ן, ב/כ/פ, ס/ם, ג/נ, ט/מ, ע/צ/א), and marks like ״ ׳. Judge only by what the handwriting looks like, never by what would make sense. Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them. Each reading different.`, ["and marks like ״ ׳.", "and marks like ״ ׳; in an English word: a/o/u, e/c, i/l/t, n/h/r/u/v, m/rn, d/cl, g/q/y, b/h/k. Keep each word in its own script: never translate or transliterate."], ["Prefer real Hebrew or Aramaic words or abbreviations when the strokes allow them.", "Prefer real Hebrew or Aramaic words or abbreviations, or real English words, when the strokes allow them."]);
+}
+const cleanOptions = (list) => (Array.isArray(list) ? list : []).filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map(hebMarksIn).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5);
+// The choices that came with the word check, per page reading and line (by its box): one list per word picture.
+const checkOptions = new Map();
+const lineBoxKey = (l) => `${l.top},${l.bottom},${l.left},${l.right}`;
 
 /**
  * The word-by-word step: every word is cut out of the page and all the words
@@ -945,12 +976,13 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
   for (let i = items.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [items[i], items[j]] = [items[j], items[i]]; }
   const texts = lines.map((_, i) => (perLine[i] ? new Array(perLine[i]).fill(null) : null));
   const sure = lines.map((_, i) => (perLine[i] ? new Array(perLine[i]).fill(true) : null));
+  const options = lines.map((_, i) => (perLine[i] ? new Array(perLine[i]).fill(null) : null));
   const batches = [];
   for (let i = 0; i < items.length; i += WORD_BATCH) batches.push(items.slice(i, i + WORD_BATCH));
   let done = 0, answered = 0;
   onWords(0, items.length);
   const readBatch = async (batch) => {
-    const parts = [...known, { text: forMixed(`Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.`, ["ONE handwritten Hebrew word", "ONE handwritten word, Hebrew or English"], ["letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation.", "letter by letter in the word's own script, never translated or transliterated: a Hebrew word right to left, with its final letters (ך ם ן ף ץ) and gershayim/geresh (״ ׳); an English word left to right, with its capital letters as written; and its punctuation."]) }];
+    const parts = [...known, { text: forMixed(`Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.` + optionsRule(), ["ONE handwritten Hebrew word", "ONE handwritten word, Hebrew or English"], ["letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation.", "letter by letter in the word's own script, never translated or transliterated: a Hebrew word right to left, with its final letters (ך ם ן ף ץ) and gershayim/geresh (״ ׳); an English word left to right, with its capital letters as written; and its punctuation."]) }];
     for (const [k, it] of batch.entries()) {
       const crop = cropLine(bitmap, it.box, 240);
       parts.push({ text: `Image ${k + 1}:` }, picture(await blobBase64(await canvasBlob(crop, 0.92)), "word"));
@@ -962,6 +994,8 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
         if (!it || typeof r.text !== "string") continue; // missing: that line is read whole instead
+        const opts = cleanOptions(r.options);
+        if (opts.length) options[it.line][it.pos] = opts;
         if (!r.text.trim()) {
           // Empty: in Hebrew a line with a word missing is read whole instead; in a line with
           // English (matched by place) it is a picture of a mark or a speck, and the rest is still checked.
@@ -986,7 +1020,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
   }));
   // Not one answer: Gemini is failing right now, so step 2 is skipped (the page reading is kept).
   if (batches.length && !answered) throw new Error("the word-by-word step got no answers");
-  return lines.map((_, i) => {
+  const result = lines.map((_, i) => {
     if (!texts[i] || texts[i].some((t) => t === null)) return null; // a word is missing: don't trust this line's split
     const boxes = items.filter((it) => it.line === i).sort((a, b) => a.pos - b.pos).map((it) => it.box);
     // A picture may hold two words; each of its words counts as unsure.
@@ -995,6 +1029,8 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
     if (MIXED && hasLatin(lines[i].text)) return { pics: texts[i], text: texts[i].join(" "), unsure, segs }; // right to left, as on the page
     return { text: joinWords(texts[i]), unsure, segs };
   });
+  result.options = options; // per line, the choices for each word picture (in the pictures' order), or null
+  return result;
 }
 
 /**
@@ -1647,6 +1683,7 @@ async function checkWordsOnce(docId, pageId, readId) {
   }
   finished = true;
   await writes; // no progress may land after the result
+  if (byWord.options) checkOptions.set(pageId, { readId, byLine: new Map(lines.map((l, i) => [lineBoxKey(l), byWord.options[i]]).filter(([, o]) => o)) });
   // Wherever the two readings differ the word is highlighted, with the other reading one click away.
   // The word-by-word reading replaces a word only when it found a real word (in the word list):
   // when the line reading isn't one, or both are real words that differ (a word made up from the
@@ -2643,24 +2680,31 @@ async function fetchWordOptionsOnce(docId, pageId, { onlyFlagged = false } = {})
   const writer = doc.writerId ? await getOne("writers", doc.writerId) : null;
   const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
   const keyOf = (l) => `${l.top},${l.bottom},${l.left},${l.right}|${l.text}`;
+  const fromCheck = checkOptions.get(pageId), pre = fromCheck?.readId === page.readId ? fromCheck.byLine : null;
+  let givenAny = false;
   const items = [], perLine = page.lines.map((l, i) => {
     if (l.top == null) return null;
     let words = null; try { words = segmentWords(bitmap, l); } catch {}
     if (!words) return null;
     let send = words.map(() => true);
+    // Choices that came with the word check for this line's pictures (cut the same way) are used as
+    // they are; only pictures without them are asked for.
+    const given = pre?.get(lineBoxKey(l));
+    const have = given && given.length === words.length ? given : null;
+    if (have) givenAny = true;
     if (onlyFlagged) {
       // Prepared ahead only for the highlighted words (the ones to check); any other word gets its
       // choices when it is clicked. Where pictures and words don't match one for one, the whole line.
       const flagged = new Set((l.unclear || []).filter((u) => l.text.split(/\s+/).includes(u)));
-      if (!flagged.size) return words.map(() => null);
+      if (!flagged.size) return words.map((_, pos) => have?.[pos] || null);
       let tokens = l.text.split(/\s+/).filter(Boolean);
       if (MIXED) tokens = placeOrder(tokens, lineDirOn(page.lines, l)).map((k) => tokens[k]);
       if (tokens.length === words.length) send = tokens.map((t) => flagged.has(t));
     }
-    words.forEach((box, pos) => { if (send[pos]) items.push({ line: i, pos, box }); });
-    return words.map(() => null);
+    words.forEach((box, pos) => { if (send[pos] && !have?.[pos]?.length) items.push({ line: i, pos, box }); });
+    return words.map((_, pos) => have?.[pos] || null);
   });
-  if (onlyFlagged && !items.length) return true; // nothing highlighted: nothing to prepare (and nothing was shown)
+  if (onlyFlagged && !items.length && !givenAny) return true; // nothing highlighted: nothing to prepare (and nothing was shown)
   const total = items.length;
   let done = 0, finished = false, writes = Promise.resolve();
   // Progress is written one after another, and never after the end (it would leave "getting…" showing).

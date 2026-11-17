@@ -111,13 +111,19 @@ export async function installFake(page, truth, opts = {}) {
     const body = route.request().postDataJSON();
     const parts = body.contents[0].parts;
     const raw = JSON.stringify(parts.filter((p) => p.text));
-    const kind = raw.includes("readings that its pen strokes most look like") ? "options" : /ONE handwritten (Hebrew )?word/.test(raw) ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
+    const kind = raw.includes("write exactly the letters drawn in it") ? "words" : raw.includes("readings that its pen strokes most look like") ? "options" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
     const n = ++stats[kind];
     (stats.raw ||= []).push({ kind, raw });
     if (opts.delay) await new Promise((r) => setTimeout(r, opts.delay));
     if (opts.delayFor) { const d = opts.delayFor(kind, n); if (d === Infinity) return; await new Promise((r) => setTimeout(r, d)); } // Infinity: never answers
     const f = opts.fail?.(kind, n, url);
     if (f) return route.fulfill(err(f.status, f.message));
+    // Google stopping an answer part-way: half an answer, then a blocked prompt
+    if (opts.block?.(kind, n, url)) {
+      const half = { candidates: [{ content: { role: "model", parts: [{ text: '{"lines": [{"image": 1, "' }] } }], usageMetadata: { promptTokenCount: 5000, candidatesTokenCount: 12 } };
+      const stop = { promptFeedback: { blockReason: "OTHER" }, usageMetadata: { promptTokenCount: 5000, candidatesTokenCount: 12 } };
+      return route.fulfill({ status: 200, headers: { "content-type": "text/event-stream", "access-control-allow-origin": "*" }, body: `data: ${JSON.stringify(half)}\r\n\r\ndata: ${JSON.stringify(stop)}\r\n\r\n` });
+    }
     const boxes = await page.evaluate(() => window.__boxes).catch(() => null);
     if (!boxes) return route.abort().catch(() => {});
     const numbered = [];
@@ -130,7 +136,7 @@ export async function installFake(page, truth, opts = {}) {
         let text = wordsIn(truth, await boxOf(data)).join(" ");
         if (opts.emptyWord && text === opts.emptyWord) text = "";
         if (opts.wordText) text = opts.wordText(text);
-        words.push({ image: k, text, sure: true });
+        words.push({ image: k, text, sure: true, ...(opts.wordOptions ? { options: opts.optionsFor?.(text) || [text, text + "ה", "ו" + text] } : {}) });
       }
       return route.fulfill(sse({ words }));
     }
