@@ -53,12 +53,13 @@ for (const [run, mode] of MODES.split(",").entries()) {
     await page.setInputFiles("#fileInput", `${DIR}/pages/${g.file}`);
     await page.waitForSelector(".dialog input"); await page.fill(".dialog input", `Bench ${run} ${n}`); await page.click(".dialog button[type=submit]");
     await page.waitForFunction(() => /\d+ lines/.test(document.querySelector(".page-head .state")?.textContent || "") || /Error/.test(document.querySelector(".page-head .state")?.textContent || ""), null, { timeout: 15 * 60000 });
+    // The line reading as it is the moment the page is read, before the word-by-word check (which
+    // runs in the background for many seconds and then saves its result over it).
+    const before = await page.evaluate(async () => { const d = (await getAll("docs")).sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))[0]; return (d?.pages?.[0]?.lines || []).map((l) => l.text); });
     await page.waitForFunction(() => (window.__autoOptionsDone || 0) >= 1, null, { timeout: 15 * 60000 }).catch(() => {});
     await page.waitForTimeout(1000);
     const label = await page.locator(".page-head .state").first().textContent();
     const lines = await page.locator(".row .line-edit").evaluateAll((e) => e.map((x) => x.innerText));
-    // The line reading as it was before the word-by-word check changed anything.
-    const before = await page.evaluate(() => (state.doc?.pages?.[0]?.lines || []).map((l) => l.ai || ""));
     const got = norm(lines.join(" ")), want = norm(g.lines.join(" "));
     const r = { run, mode, page: n, legibility: g.legibility, seconds: Math.round((Date.now() - t0) / 1000), cents: +(label.match(/cost about ([\d.]+)¢/)?.[1] || NaN),
       chars: want.length, charErrors: lev(got, want), words: words(want).length, wordErrors: wordErrors(words(got), words(want)),
