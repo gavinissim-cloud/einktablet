@@ -35,9 +35,12 @@ for (const [run, mode] of MODES.split(",").entries()) {
     const raw = JSON.stringify((req.postDataJSON()?.contents?.[0]?.parts || []).filter((p) => p.text));
     const kind = raw.includes("readings that its pen strokes most look like") ? "options" : /ONE handwritten (Hebrew )?word/.test(raw) ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
     const images = (req.postDataJSON()?.contents?.[0]?.parts || []).filter((p) => p.inlineData).length;
-    let u = null; try { for (const m of (await (await req.response()).text()).matchAll(/"usageMetadata":\s*(\{[^}]*\})/g)) u = JSON.parse(m[1]); } catch {}
+    let u = null;
+    try { for (const line of (await (await req.response()).text()).split(/\r?\n/)) if (line.startsWith("data:")) { const c = JSON.parse(line.slice(5)); if (c.usageMetadata) u = c.usageMetadata; } } catch {}
     const b = (bill[kind] ||= { requests: 0, images: 0, prompt: 0, cached: 0, output: 0, thoughts: 0 });
     b.requests++; b.images += images;
+    const status = (await req.response().catch(() => null))?.status();
+    if (status !== 200) b[`status ${status}`] = (b[`status ${status}`] || 0) + 1; // refused (busy) requests aren't billed
     if (u) { b.prompt += u.promptTokenCount || 0; b.cached += u.cachedContentTokenCount || 0; b.output += u.candidatesTokenCount || 0; b.thoughts += u.thoughtsTokenCount || 0; }
   });
   if (process.env.DRY) { await tagCrops(page); await installFake(page, []); } // checks the test itself, no Gemini
@@ -61,7 +64,7 @@ for (const [run, mode] of MODES.split(",").entries()) {
       chars: want.length, charErrors: lev(got, want), words: words(want).length, wordErrors: wordErrors(words(got), words(want)),
       wordErrorsBeforeCheck: wordErrors(words(before.join(" ")), words(want)), label, text: lines, before, bill: JSON.parse(JSON.stringify(bill)) };
     results.push(r); fs.writeFileSync(OUT, JSON.stringify(results, null, 1));
-    console.log("  bill: " + Object.entries(r.bill).map(([k, b]) => `${k} ${b.requests} req, ${b.images} pictures, ${b.prompt} in (${b.cached} cached), ${b.output} out, ${b.thoughts} thinking`).join("; "));
+    console.log("  bill: " + Object.entries(r.bill).map(([k, b]) => `${k} ${b.requests} req, ${b.images} pictures, ${b.prompt} in (${b.cached} cached), ${b.output} out, ${b.thoughts} thinking` + Object.keys(b).filter((x) => x.startsWith("status")).map((x) => `, ${b[x]}× ${x}`).join("")).join("; "));
     console.log(`${mode} run ${run} page ${n}: ${(100 * r.charErrors / r.chars).toFixed(1)}% characters wrong, ${r.wordErrors}/${r.words} words wrong (${r.wordErrorsBeforeCheck} before the word check), ${r.cents}¢, ${r.seconds}s`);
     await page.goto("file://" + FILE); // home, a clean page list (the documents stay in the browser)
     if (process.env.DRY) await tagCrops(page);
