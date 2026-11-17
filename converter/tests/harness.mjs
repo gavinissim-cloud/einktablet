@@ -92,7 +92,7 @@ export function wordsIn(truth, box) {
 }
 
 export function sse(data) {
-  const chunk = { candidates: [{ content: { role: "model", parts: [{ text: "…", thought: true }, { text: JSON.stringify(data) }] }, finishReason: "STOP" }] };
+  const chunk = { candidates: [{ content: { role: "model", parts: [{ text: "…", thought: true }, { text: JSON.stringify(data) }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 10000, candidatesTokenCount: 200, thoughtsTokenCount: 300 } };
   return { status: 200, headers: { "content-type": "text/event-stream", "access-control-allow-origin": "*" }, body: `data: ${JSON.stringify(chunk)}\r\n\r\n` };
 }
 

@@ -650,12 +650,13 @@ async function streamOnceWith(body, signal, alive) {
   }
   const reader = res.body.getReader();
   const dec = new TextDecoder();
-  let buf = "", text = "", finish = null;
+  let buf = "", text = "", finish = null, usage = null;
   const handle = (block) => {
     for (const line of block.split(/\r?\n/)) {
       if (!line.startsWith("data:")) continue;
       const chunk = JSON.parse(line.slice(5).trim());
       if (chunk.error) throw Object.assign(new ReadError(chunk.error.message || "Gemini error"), { status: chunk.error.code || 500 });
+      if (chunk.usageMetadata) usage = chunk.usageMetadata; // what Google bills for this request (the last chunk has the totals)
       const cand = chunk.candidates?.[0];
       for (const p of cand?.content?.parts || []) if (typeof p.text === "string" && !p.thought) text += p.text;
       if (cand?.finishReason) finish = cand.finishReason;
@@ -673,8 +674,32 @@ async function streamOnceWith(body, signal, alive) {
     }
   }
   if (buf.trim()) handle(buf);
-  return { text, finish };
+  return { text, finish, usage };
 }
+
+// ---------- What each page costs ----------
+// Google's price per million tokens, in US dollars: input, and output (thinking is billed as
+// output). Input that Google already has cached from a recent request with the same beginning
+// (the instructions and the writer's examples) is billed at a tenth. Approximate: check your
+// Google billing for the exact amounts.
+const PRICES = [[/flash-lite/i, 0.30, 2.50], [/flash/i, 0.75, 3.75], [/./, 2.50, 15]];
+const CACHED_SHARE = 0.1;
+const pageCost = new Map(); // page id -> US cents spent on its reading, word check and word choices
+function requestCents(model, u) {
+  if (!u) return 0;
+  const [, inP, outP] = PRICES.find(([re]) => re.test(model));
+  const cached = u.cachedContentTokenCount || 0, prompt = u.promptTokenCount || 0;
+  const out = (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0);
+  return ((prompt - cached + cached * CACHED_SHARE) * inP + out * outP) / 1e4;
+}
+function addCost(pageId, model, usage) {
+  if (!pageId || !usage) return;
+  pageCost.set(pageId, (pageCost.get(pageId) || 0) + requestCents(model, usage));
+}
+const costLabel = (pageId) => {
+  const c = pageCost.get(pageId);
+  return c ? ` · cost about ${c < 0.1 ? "0.1" : c.toFixed(1)}¢` : "";
+};
 
 /** One request: retried when Google is busy, given up after TIMEOUT_MS. */
 // Added to the instructions: Gemini tends to "improve" what people write.
@@ -724,8 +749,8 @@ async function withSlot(fn, low = false) {
 let thinkingRejected = new Set(); // models that refused a thinking setting once
 
 /** One Gemini request returning JSON; retried when Google is busy, given up after TIMEOUT_MS. */
-function askJson(parts, schema, thinking = THINKING, low = false) { return withSlot(() => askJsonNow(parts, schema, thinking), low); }
-async function askJsonNow(parts, schema, thinking) {
+function askJson(parts, schema, thinking = THINKING, low = false, pageId = null) { return withSlot(() => askJsonNow(parts, schema, thinking, pageId), low); }
+async function askJsonNow(parts, schema, thinking, pageId) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   const generationConfig = { responseMimeType: "application/json", responseJsonSchema: schema };
@@ -734,7 +759,9 @@ async function askJsonNow(parts, schema, thinking) {
   try {
     for (let attempt = 0; ; attempt++) {
       try {
-        const { text, finish } = await streamOnce(body, controller.signal);
+        const model = getModel();
+        const { text, finish, usage } = await streamOnce(body, controller.signal);
+        addCost(pageId, model, usage);
         if (finish && !["STOP", "FINISH_REASON_UNSPECIFIED"].includes(finish)) throw new ReadError(`Gemini stopped: ${finish}`);
         if (!text) throw new ReadError("Gemini gave no answer.");
         return JSON.parse(text);
@@ -889,7 +916,7 @@ const WORD_SCHEMA = {
  * a sentence or topic to guess from. Returns per line {text, unsure: [words]},
  * or null for lines that couldn't be split into words.
  */
-async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = false) {
+async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = false, pageId = null) {
   const items = []; // {line, pos, box}
   const perLine = lines.map((line, i) => {
     const h = line.bottom - line.top;
@@ -920,7 +947,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
     }
     // Once more if the answer left words out (a failed request was already retried inside askJson).
     for (let attempt = 0; attempt < 2; attempt++) try {
-      const res = await askJson(parts, WORD_SCHEMA, WORD_THINKING, low);
+      const res = await askJson(parts, WORD_SCHEMA, WORD_THINKING, low, pageId);
       answered++;
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
@@ -1363,7 +1390,7 @@ function addLexiconFlags(l) {
   return l;
 }
 
-async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
+async function checkAgainstLexicon(bitmap, lines, segsPerLine, pageId = null) {
   await loadLexicon();
   if (!lexicon.size) return lines;
   const asks = [];
@@ -1389,7 +1416,7 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
       parts.push({ inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, a.box, 240), 0.92)) } });
     }
     try {
-      const res = await askJson(parts, PICK_SCHEMA, WORD_THINKING);
+      const res = await askJson(parts, PICK_SCHEMA, WORD_THINKING, false, pageId);
       for (const r of res.answers || []) {
         const a = batch[Number(r.image) - 1];
         const choice = String(r.choice || "").replace(/[«»]/g, "").trim();
@@ -1411,7 +1438,7 @@ async function checkAgainstLexicon(bitmap, lines, segsPerLine) {
  * "improve") the sentence. Returns the literal text per line (null where a
  * line could not be read).
  */
-async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thinking = THINKING, onLines = () => {}, extra = "" } = {}) {
+async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thinking = THINKING, onLines = () => {}, extra = "", pageId = null } = {}) {
   const order = lines.map((_, i) => i);
   for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
   const out = new Array(lines.length).fill(null);
@@ -1430,7 +1457,7 @@ async function readLinesExactly(bitmap, lines, known, { group = EXACT_BATCH, thi
       parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(crop, 0.92)) } });
     }
     try {
-      const res = await askJson(parts, EXACT_SCHEMA, thinking);
+      const res = await askJson(parts, EXACT_SCHEMA, thinking, false, pageId);
       for (const idx of batch) out.answered.add(idx);
       for (const r of res.lines || []) {
         const idx = batch[Number(r.image) - 1];
@@ -1522,7 +1549,7 @@ async function readPage(doc, page, onStep) {
   if (boxes?.length) {
     onStep(1, boxes.map((b) => ({ ...b, text: "", unclear: [] })));
     const read = await readLinesExactly(bitmap, boxes, known, {
-      group: LINE_GROUP, thinking: lineThinking(),
+      group: LINE_GROUP, thinking: lineThinking(), pageId: page.id,
       onLines: (out) => onStep(1, boxes.map((b, i) => ({ ...b, text: MIXED ? hebMarksIn(noForeign(out[i]?.text ?? "")) : out[i]?.text ?? "", unclear: out[i]?.unclear || [], done: !!out[i], ...(out[i]?.dir ? { dir: out[i].dir } : {}) }))),
     }).catch((e) => {
       if (/key isn't accepted/.test(e.message)) throw e; // reading the whole page wouldn't help
@@ -1532,14 +1559,14 @@ async function readPage(doc, page, onStep) {
     // Lines whose group failed are tried once more, on their own.
     const missing = read ? read.map((r, i) => (r ? null : i)).filter((i) => i !== null) : [];
     if (missing.length) {
-      const again = await readLinesExactly(bitmap, missing.map((i) => boxes[i]), known, { group: 1, thinking: lineThinking() }).catch(() => []);
+      const again = await readLinesExactly(bitmap, missing.map((i) => boxes[i]), known, { group: 1, thinking: lineThinking(), pageId: page.id }).catch(() => []);
       // A line still without an entry although Gemini answered for it has nothing readable on it.
       missing.forEach((i, k) => { if (again[k]) read[i] = again[k]; else if (again.answered?.has(k)) read[i] = { text: "", unclear: [] }; });
     }
     // Hebrew + English: a line with letters of another alphabet is read once more on its own.
     const foreign = MIXED && read ? read.map((r, i) => (r && hasForeign(r.text) ? i : null)).filter((i) => i !== null) : [];
     if (foreign.length) {
-      const again = await readLinesExactly(bitmap, foreign.map((i) => boxes[i]), known, { group: 1, thinking: lineThinking(), extra: FOREIGN_REMINDER }).catch(() => []);
+      const again = await readLinesExactly(bitmap, foreign.map((i) => boxes[i]), known, { group: 1, thinking: lineThinking(), extra: FOREIGN_REMINDER, pageId: page.id }).catch(() => []);
       foreign.forEach((i, k) => { if (again[k] && !hasForeign(again[k].text)) read[i] = again[k]; });
     }
     if (read && read.every(Boolean)) {
@@ -1553,11 +1580,11 @@ async function readPage(doc, page, onStep) {
   if (!lines) {
     const small = await canvasBlob(toCanvas(bitmap, IMAGE_EDGE), 0.9);
     const pagePart = { inlineData: { mimeType: "image/jpeg", data: await blobBase64(small) }, mediaResolution: { level: "MEDIA_RESOLUTION_HIGH" } };
-    lines = cleanLines((await askJson([...known, pagePart, { text: "Transcribe all the handwriting on this page." }], LINE_SCHEMA, lineThinking())).lines || []);
+    lines = cleanLines((await askJson([...known, pagePart, { text: "Transcribe all the handwriting on this page." }], LINE_SCHEMA, lineThinking(), false, page.id)).lines || []);
   }
   try {
     lines = lines.map((l) => applyMemory(fixAbbreviations({ ...l, alts: l.alts || [] }), writer));
-    lines = await checkAgainstLexicon(bitmap, lines, null);
+    lines = await checkAgainstLexicon(bitmap, lines, null, page.id);
   } catch (e) {
     console.error("Word-list check failed:", e);
   }
@@ -1602,7 +1629,7 @@ async function checkWordsOnce(docId, pageId, readId) {
   try {
     byWord = await readWordsExactly(bitmap, lines, known, (done, total) => {
       if (done < total) writes = writes.then(() => (finished ? null : updateSameRead(docId, pageId, readId, { checking: { done, total } }))).catch(() => {});
-    }, true);
+    }, true, pageId);
   } catch (e) {
     console.warn("The word check couldn't run:", e);
     finished = true; await writes;
@@ -1829,6 +1856,7 @@ async function runJob({ docId, pageId }) {
   if (!page) return;
   try {
     const readId = uid(), started = Date.now();
+    pageCost.delete(pageId); // a new reading: counted from zero
     await updatePage(docId, pageId, { status: "working", step: 0, draft: null, words: null, checking: null, error: null, readId, readSeconds: null });
     const lines = await readPage(doc, page, (step, draft) => updatePage(docId, pageId, { step, ...(draft ? { draft } : {}) }));
     await updatePage(docId, pageId, { status: "done", lines, draft: null, step: 0, checking: { done: 0, total: 0 }, readSeconds: Math.round((Date.now() - started) / 1000) });
@@ -2079,7 +2107,7 @@ function fillLabel(st, page) {
   if (page.status === "done") {
     const n = page.lines.filter((l) => l.unclear.length || (l.empty && !l.text)).length;
     const c = page.checking;
-    st.innerHTML = esc(`${page.lines.length} lines${page.readSeconds != null ? ` · read in ${page.readSeconds} s` : ""}${n ? ` · ${n} to check` : ""}`)
+    st.innerHTML = esc(`${page.lines.length} lines${page.readSeconds != null ? ` · read in ${page.readSeconds} s` : ""}${n ? ` · ${n} to check` : ""}${costLabel(page.id)}`)
       + (c ? ` · <span class="spinner"></span>checking every word${c.total ? ` (${c.done} of ${c.total})` : ""}…` : "")
       + (page.optionsProgress ? ` · <span class="spinner"></span>getting word options (${page.optionsProgress.done} of ${page.optionsProgress.total})…` : "");
   }
@@ -2563,7 +2591,7 @@ async function optionsForWord(page, line, index, count, text) {
   const writer = state.doc?.writerId ? await getOne("writers", state.doc.writerId) : null;
   const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
   const parts = [...known, { text: optionsPrompt(1) }, { text: "Image 1:" }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, spot.box, 240), 0.92)) } }];
-  const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING);
+  const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, false, page.id);
   const r = (res.words || []).find((x) => Number(x.image) === 1) || (res.words || [])[0];
   return Array.isArray(r?.options) ? r.options.filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map(hebMarksIn).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5) : [];
 }
@@ -2615,7 +2643,7 @@ async function fetchWordOptionsOnce(docId, pageId, { onlyFlagged = false } = {})
       for (const [k, it] of batch.entries()) {
         parts.push({ text: `Image ${k + 1}:` }, { inlineData: { mimeType: "image/jpeg", data: await blobBase64(await canvasBlob(cropLine(bitmap, it.box, 240), 0.92)) } });
       }
-      const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, true);
+      const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, true, pageId);
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
         if (it && Array.isArray(r.options)) perLine[it.line][it.pos] = r.options.filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map(hebMarksIn).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5);
