@@ -28,12 +28,24 @@ function wordErrors(a, b) { // word-level edit distance
 const results = fs.existsSync(OUT) ? JSON.parse(fs.readFileSync(OUT, "utf8")) : [];
 for (const [run, mode] of MODES.split(",").entries()) {
   const { browser, page, errors } = await start(FILE);
+  // Google's bill for each request, by what it was for (as the test's fake Gemini tells them apart).
+  let bill = {};
+  page.on("requestfinished", async (req) => {
+    if (req.method() !== "POST" || !req.url().includes("generativelanguage")) return;
+    const raw = JSON.stringify((req.postDataJSON()?.contents?.[0]?.parts || []).filter((p) => p.text));
+    const kind = raw.includes("readings that its pen strokes most look like") ? "options" : /ONE handwritten (Hebrew )?word/.test(raw) ? "words" : raw.includes("candidate spellings") ? "pick" : raw.includes("each one handwritten line cut out of a page") ? "lines" : "page";
+    const images = (req.postDataJSON()?.contents?.[0]?.parts || []).filter((p) => p.inlineData).length;
+    let u = null; try { for (const m of (await (await req.response()).text()).matchAll(/"usageMetadata":\s*(\{[^}]*\})/g)) u = JSON.parse(m[1]); } catch {}
+    const b = (bill[kind] ||= { requests: 0, images: 0, prompt: 0, cached: 0, output: 0, thoughts: 0 });
+    b.requests++; b.images += images;
+    if (u) { b.prompt += u.promptTokenCount || 0; b.cached += u.cachedContentTokenCount || 0; b.output += u.candidatesTokenCount || 0; b.thoughts += u.thoughtsTokenCount || 0; }
+  });
   if (process.env.DRY) { await tagCrops(page); await installFake(page, []); } // checks the test itself, no Gemini
   await page.fill("#keyInput", "proxy-injected"); await page.click("#keySave");
   await page.evaluate((m) => localStorage.setItem("picture_quality", m), mode);
   for (let n = from; n <= to; n++) {
     if (results.some((r) => r.run === run && r.mode === mode && r.page === n)) continue; // done in an earlier attempt
-    const g = gold[n - 1], t0 = Date.now();
+    const g = gold[n - 1], t0 = Date.now(); bill = {};
     await page.evaluate(() => { window.__autoOptionsDone = 0; });
     await page.setInputFiles("#fileInput", `${DIR}/pages/${g.file}`);
     await page.waitForSelector(".dialog input"); await page.fill(".dialog input", `Bench ${run} ${n}`); await page.click(".dialog button[type=submit]");
@@ -47,8 +59,9 @@ for (const [run, mode] of MODES.split(",").entries()) {
     const got = norm(lines.join(" ")), want = norm(g.lines.join(" "));
     const r = { run, mode, page: n, legibility: g.legibility, seconds: Math.round((Date.now() - t0) / 1000), cents: +(label.match(/cost about ([\d.]+)¢/)?.[1] || NaN),
       chars: want.length, charErrors: lev(got, want), words: words(want).length, wordErrors: wordErrors(words(got), words(want)),
-      wordErrorsBeforeCheck: wordErrors(words(before.join(" ")), words(want)), label, text: lines, before };
+      wordErrorsBeforeCheck: wordErrors(words(before.join(" ")), words(want)), label, text: lines, before, bill: JSON.parse(JSON.stringify(bill)) };
     results.push(r); fs.writeFileSync(OUT, JSON.stringify(results, null, 1));
+    console.log("  bill: " + Object.entries(r.bill).map(([k, b]) => `${k} ${b.requests} req, ${b.images} pictures, ${b.prompt} in (${b.cached} cached), ${b.output} out, ${b.thoughts} thinking`).join("; "));
     console.log(`${mode} run ${run} page ${n}: ${(100 * r.charErrors / r.chars).toFixed(1)}% characters wrong, ${r.wordErrors}/${r.words} words wrong (${r.wordErrorsBeforeCheck} before the word check), ${r.cents}¢, ${r.seconds}s`);
     await page.goto("file://" + FILE); // home, a clean page list (the documents stay in the browser)
     if (process.env.DRY) await tagCrops(page);
