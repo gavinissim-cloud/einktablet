@@ -2550,9 +2550,75 @@ async function wordSpot(page, line, index, count, text) {
     const order = placeOrder(words, lineDirOn(page.lines, { ...line, text }));
     words = order.map((i) => words[i]); at = order.indexOf(index);
   }
-  const box = matchWordToBoxes(boxes, words, at);
+  // Groups of ink one for one with the words: the word's own group. Otherwise (groups joined by the
+  // paper's printed lines, words written close together, letters far apart) the word's place is
+  // estimated by how wide each word is written and each border moved to the nearest gap in the ink.
+  const box = boxes.length === words.length ? boxes[at] : spotByShare(bitmap, line, words, at) || matchWordToBoxes(boxes, words, at);
   if (!box) return null;
   return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span, box };
+}
+
+/**
+ * Where word `index` of `words` (right to left) is in the line, without relying on the gaps found
+ * between words: the line's ink is shared out by how wide each word is written, and each border
+ * between two words is moved to the emptiest column of ink near it (the printed lines of the paper,
+ * long thin strokes across, don't count as ink). Returns a box in page coordinates (0–1000), or null.
+ */
+function spotByShare(bitmap, line, words, index) {
+  const W = bitmap.width, H = bitmap.height;
+  const x0 = (line.left / 1000) * W, x1 = (line.right / 1000) * W, y0 = (line.top / 1000) * H, y1 = (line.bottom / 1000) * H;
+  if (y1 - y0 < 8 || x1 - x0 < 8 || !words.length) return null;
+  const ch = 80, scale = ch / (y1 - y0), cw = Math.round((x1 - x0) * scale);
+  if (cw < 10 || cw > 8000) return null;
+  const c = document.createElement("canvas"); c.width = cw; c.height = ch;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bitmap, x0, y0, x1 - x0, y1 - y0, 0, 0, cw, ch);
+  const px = ctx.getImageData(0, 0, cw, ch).data, gray = new Uint8Array(cw * ch);
+  for (let i = 0; i < cw * ch; i++) gray[i] = (px[i * 4] * 299 + px[i * 4 + 1] * 587 + px[i * 4 + 2] * 114) / 1000;
+  const sorted = Array.from(gray).sort((a, b) => a - b);
+  const dark = sorted[Math.floor(sorted.length * 0.01)], paper = sorted[Math.floor(sorted.length * 0.5)];
+  const thr = dark + (paper - dark) * 0.5; // only clearly dark ink (not the paper's lines or the other side showing through)
+  const ink = new Uint8Array(cw * ch);
+  for (let i = 0; i < cw * ch; i++) ink[i] = gray[i] < thr ? 1 : 0;
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw;) { // a long thin stroke across is a printed line
+    if (!ink[y * cw + x]) { x++; continue; }
+    const s = x; while (x < cw && ink[y * cw + x]) x++;
+    if (x - s > ch * 1.5) for (let k = s; k < x; k++) ink[y * cw + k] = 0;
+  }
+  const col = new Array(cw).fill(0);
+  for (let x = 0; x < cw; x++) for (let y = 0; y < ch; y++) col[x] += ink[y * cw + x];
+  let l = 0, r = cw - 1;
+  while (l < cw && col[l] < 2) l++;
+  while (r > l && col[r] < 2) r--;
+  if (r - l < 10) return null;
+  const ww = words.map(writtenWidth), tot = ww.reduce((a, b) => a + b, 0);
+  // The gaps in the ink (columns with almost none), with their widths: a space between words is
+  // usually wider than one between letters.
+  const gaps = [];
+  for (let x = l; x <= r;) {
+    if (col[x] > 1) { x++; continue; }
+    const s = x; while (x <= r && col[x] <= 1) x++;
+    gaps.push({ mid: (s + x - 1) / 2, width: x - s });
+  }
+  const borders = [r]; let acc = 0; // right to left
+  for (let k = 0; k < words.length - 1; k++) {
+    acc += ww[k];
+    const guess = r - (acc / tot) * (r - l), reach = ((r - l) / words.length) * 0.5;
+    const least = borders.at(-1) - (ww[k] / tot) * (r - l) * 0.4; // a word is never squeezed to almost nothing
+    // the widest gap near the guess (wider counts more, farther counts less); none: the guess
+    let best = Math.min(guess, least), score = -Infinity;
+    for (const g of gaps) {
+      const d = Math.abs(g.mid - guess);
+      if (d > reach || g.mid > least) continue;
+      const v = g.width * (1 - 0.6 * (d / reach));
+      if (v > score) { score = v; best = g.mid; }
+    }
+    borders.push(Math.min(borders.at(-1) - 1, Math.round(best)));
+  }
+  borders.push(l);
+  const right = borders[index], left = borders[index + 1];
+  const toPage = (v) => line.left + (v / scale / W) * 1000;
+  return { top: line.top, bottom: line.bottom, left: toPage(left), right: toPage(right) };
 }
 
 /** How wide a written word is, roughly, in letters (marks and narrow letters count less). */
@@ -2590,10 +2656,12 @@ function matchWordToBoxes(boxes, words, index) {
     }
   }
   if (cost[n][m] === INF) {
-    // Can't be matched within limits: by position along the line.
-    const before = ww.slice(0, index).reduce((a, b) => a + b, 0) + ww[index] / 2;
-    const xr = boxes[0].right, xl = boxes.at(-1).left, at = xr - (before / wTot) * (xr - xl);
-    return boxes.reduce((best, b) => (Math.abs((b.left + b.right) / 2 - at) < Math.abs((best.left + best.right) / 2 - at) ? b : best));
+    // Can't be matched within limits (the line's ink in far fewer groups than words, as on lined
+    // paper): the word's own share of the ink, by how wide it is written, right to left. (It used to
+    // be the nearest whole group, often the whole line.)
+    const s = ww.slice(0, index).reduce((a, b) => a + b, 0) / wTot, e = s + ww[index] / wTot;
+    const xr = boxes[0].right, xl = boxes.at(-1).left;
+    return { ...boxes[0], right: xr - s * (xr - xl), left: xr - e * (xr - xl) };
   }
   for (let i = n, j = m; i > 0 || j > 0;) {
     const [pi, pj] = from[i][j];
