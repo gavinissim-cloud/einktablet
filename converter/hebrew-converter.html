@@ -852,6 +852,7 @@ const WORD_EXAMPLES = 8; // the writer's corrected lines shown with each word re
 // Reading one isolated word needs little thinking; deep thinking is mostly
 // reasoning about meaning, which is what this step is meant to avoid.
 const WORD_THINKING = "LOW";
+const CHECK_KEEP = 0.8; // the word check changes a line only when it keeps at least this share of its words (see onlySuggest)
 
 /**
  * Split one handwritten line into words by the blank space between them.
@@ -1734,12 +1735,48 @@ async function checkWordsOnce(docId, pageId, readId) {
     for (const w of words) if (w.includes("□")) flagged.add(w);
     return { text: words.join(" "), flagged, alts };
   };
+  // The check changes a line only when it keeps most of it (CHECK_KEEP of its words), or when the line
+  // was clearly cut right (see cutRight). Where it would
+  // change more, the line was almost always cut into the wrong pieces, and on real handwriting its
+  // changes there broke more correct words than they fixed (on the ivrit.ai benchmark: 162 broken,
+  // 92 fixed; where it kept 80% or more: 18 broken, 90 fixed). There the line stays as read, and
+  // every word where the two readings differ is highlighted, with the check's reading among its choices.
+  const onlySuggest = (line, e, merged) => {
+    const rd = line.ai.split(/\s+/).filter(Boolean), out = merged.text.split(/\s+/).filter(Boolean);
+    if (!rd.length) return merged;
+    const kept = alignWords(out, rd).filter((x) => x.same).reduce((n, x) => n + x.b.length, 0);
+    // …or when the line was cut right: about one picture per word of the reading (one more or less:
+    // a word made up or left out), and almost every picture read as a real word (a picture of half a
+    // word, or of two, seldom is one). Then the check is trusted even where it changes much (a
+    // sentence made up from the meaning).
+    const pics = (e.pics || e.segs?.map((x) => x.text) || []).filter((t) => t != null);
+    const realPics = pics.filter((t) => t.split(/\s+/).filter(Boolean).every((w) => real(w))).length;
+    const cutRight = pics.length && Math.abs(pics.length - rd.length) <= 1 && realPics >= pics.length * 0.8;
+    if (kept >= rd.length * CHECK_KEEP || cutRight) return merged;
+    const flagged = new Set(), alts = [];
+    if (e.pics) { // a line with English, its pictures in their order on the page: only highlighted
+      const has = new Set(out);
+      for (const w of rd) if (!has.has(w) || w.includes("□")) flagged.add(w);
+      return { text: line.ai, flagged, alts };
+    }
+    const lit = e.text.split(/\s+/).filter(Boolean);
+    for (const part of alignWords(lit, rd)) {
+      if (part.same || !part.b.length) continue;
+      part.b.forEach((w) => flagged.add(w));
+      const litPhrase = part.a.join(" ");
+      if (part.a.length === part.b.length) part.b.forEach((w, k) => { if (part.a[k] !== w) alts.push({ word: w, alt: part.a[k], check: true }); });
+      else if (part.b.length <= 2 && part.a.length && part.a.length <= 2) alts.push({ word: part.b.join(" "), alt: litPhrase, check: true });
+    }
+    for (const w of rd) if (w.includes("□")) flagged.add(w);
+    return { text: line.ai, flagged, alts };
+  };
   // Results are matched to lines by box and first reading, not by number (lines may have been added or removed).
   const keyOf = (l) => `${l.top},${l.bottom},${l.left},${l.right}|${l.ai}`;
   const results = new Map();
   lines.forEach((line, i) => {
     if (!byWord[i]?.text) return;
-    results.set(keyOf(line), byWord[i].pics ? mergeByPlace(line, byWord[i], lineDirOn(lines, line), real) : mergeFor(line, byWord[i]));
+    const merged = byWord[i].pics ? mergeByPlace(line, byWord[i], lineDirOn(lines, line), real) : mergeFor(line, byWord[i]);
+    results.set(keyOf(line), merged && onlySuggest(line, byWord[i], merged));
   });
   const apply = (l, r) => {
     if (!r || l.text !== l.ai) return false; // edited by the person: leave it
