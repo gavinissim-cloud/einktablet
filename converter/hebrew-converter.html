@@ -982,17 +982,22 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
   let done = 0, answered = 0;
   onWords(0, items.length);
   const readBatch = async (batch) => {
-    const parts = [...known, { text: forMixed(`Below are ${batch.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.` + optionsRule(), ["ONE handwritten Hebrew word", "ONE handwritten word, Hebrew or English"], ["letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation.", "letter by letter in the word's own script, never translated or transliterated: a Hebrew word right to left, with its final letters (ך ם ן ף ץ) and gershayim/geresh (״ ׳); an English word left to right, with its capital letters as written; and its punctuation."]) }];
-    for (const [k, it] of batch.entries()) {
+    const partsFor = async (list) => {
+    const parts = [...known, { text: forMixed(`Below are ${list.length} images. Each shows ONE handwritten Hebrew word (sometimes with a punctuation mark, sometimes two words), cut out of a page; they are in random order and do not form a text. For each image, write exactly the letters drawn in it, letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation. Ignore cut-off strokes at the image's edges that belong to neighbouring words or lines. There is no sentence to help you: never guess a word from meaning. Copy every punctuation mark in the image too: . , : ; ? ! ( ) [ ] quotation marks, ״ ׳ ־ – /, attached to the word as written. If you can't make out a letter, write □ in its place (a □ is always better than a guess); if a letter is merely uncertain, write your best reading and set "sure" to false. Answer with one entry per numbered image, using the number written just before it ("Image 1:", "Image 2:" …); any example lines shown earlier are not numbered images and get no entry.` + optionsRule(), ["ONE handwritten Hebrew word", "ONE handwritten word, Hebrew or English"], ["letter by letter, right to left, including final letters (ך ם ן ף ץ), gershayim/geresh (״ ׳) and punctuation.", "letter by letter in the word's own script, never translated or transliterated: a Hebrew word right to left, with its final letters (ך ם ן ף ץ) and gershayim/geresh (״ ׳); an English word left to right, with its capital letters as written; and its punctuation."]) }];
+    for (const [k, it] of list.entries()) {
       const crop = cropLine(bitmap, it.box, 240);
       parts.push({ text: `Image ${k + 1}:` }, picture(await blobBase64(await canvasBlob(crop, 0.92)), "word"));
     }
-    // Once more if the answer left words out (a failed request was already retried inside askJson).
+    return parts;
+    };
+    // Once more if the answer left words out (a failed request was already retried inside askJson):
+    // only the words left out are sent again, in the same way, not the whole batch.
+    let ask = batch;
     for (let attempt = 0; attempt < 2; attempt++) try {
-      const res = await askJson(parts, WORD_SCHEMA, WORD_THINKING, low, pageId);
+      const res = await askJson(await partsFor(ask), WORD_SCHEMA, WORD_THINKING, low, pageId);
       answered++;
       for (const r of res.words || []) {
-        const it = batch[Number(r.image) - 1];
+        const it = ask[Number(r.image) - 1];
         if (!it || typeof r.text !== "string") continue; // missing: that line is read whole instead
         const opts = cleanOptions(r.options);
         if (opts.length) options[it.line][it.pos] = opts;
@@ -1006,6 +1011,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
         sure[it.line][it.pos] = r.sure !== false;
       }
       if (batch.every((it) => texts[it.line][it.pos] !== null)) break;
+      ask = batch.filter((it) => texts[it.line][it.pos] === null);
     } catch (e) {
       console.warn("Word-by-word step failed for some words:", e);
       break;
@@ -1030,6 +1036,7 @@ async function readWordsExactly(bitmap, lines, known, onWords = () => {}, low = 
     return { text: joinWords(texts[i]), unsure, segs };
   });
   result.options = options; // per line, the choices for each word picture (in the pictures' order), or null
+  result.pictures = lines.map((_, i) => (perLine[i] ? items.filter((it) => it.line === i).sort((a, b) => a.pos - b.pos).map((it) => it.box) : null));
   return result;
 }
 
@@ -1683,7 +1690,7 @@ async function checkWordsOnce(docId, pageId, readId) {
   }
   finished = true;
   await writes; // no progress may land after the result
-  if (byWord.options) checkOptions.set(pageId, { readId, byLine: new Map(lines.map((l, i) => [lineBoxKey(l), byWord.options[i]]).filter(([, o]) => o)) });
+  if (byWord.options) checkOptions.set(pageId, { readId, byLine: new Map(lines.map((l, i) => [lineBoxKey(l), { boxes: byWord.pictures[i], options: byWord.options[i] }]).filter(([, e]) => e.boxes && e.options)) });
   // Wherever the two readings differ the word is highlighted, with the other reading one click away.
   // The word-by-word reading replaces a word only when it found a real word (in the word list):
   // when the line reading isn't one, or both are real words that differ (a word made up from the
@@ -2684,13 +2691,15 @@ async function fetchWordOptionsOnce(docId, pageId, { onlyFlagged = false } = {})
   let givenAny = false;
   const items = [], perLine = page.lines.map((l, i) => {
     if (l.top == null) return null;
-    let words = null; try { words = segmentWords(bitmap, l); } catch {}
+    // The word check's own pictures of this line, with the choices that came with them: used as they
+    // are, so the same pictures aren't cut again and sent a second time; only pictures without
+    // choices are asked for. (Lines the check didn't cut are cut here, as before.)
+    const given = pre?.get(lineBoxKey(l));
+    let words = given?.boxes || null;
+    if (!words) try { words = segmentWords(bitmap, l); } catch {}
     if (!words) return null;
     let send = words.map(() => true);
-    // Choices that came with the word check for this line's pictures (cut the same way) are used as
-    // they are; only pictures without them are asked for.
-    const given = pre?.get(lineBoxKey(l));
-    const have = given && given.length === words.length ? given : null;
+    const have = given ? given.options : null;
     if (have) givenAny = true;
     if (onlyFlagged) {
       // Prepared ahead only for the highlighted words (the ones to check); any other word gets its
