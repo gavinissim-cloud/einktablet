@@ -530,6 +530,105 @@ function levelPage(src) {
 }
 
 /**
+ * Where the writing is in a photo, in pixels {x, y, w, h}, or null for the whole picture. A phone
+ * photo often shows the table or cloth around the page, and the page has empty space, its printed
+ * lines, a margin line and punch holes: lines found there are read by Gemini (paid, and junk text)
+ * and every line's picture takes in the edges. First the paper (the bright, smooth part, as one
+ * piece), then the writing on it: clearly dark ink, without long thin strokes (printed lines).
+ */
+function writingArea(src) {
+  const scale = Math.min(1, 500 / Math.max(src.width, src.height));
+  const W = Math.max(1, Math.round(src.width * scale)), H = Math.max(1, Math.round(src.height * scale));
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(src, 0, 0, W, H);
+  const px = g.getImageData(0, 0, W, H).data, gray = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) gray[i] = px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114;
+  // Paper: smooth (a table, cloth or wood has texture; light on a page changes only slowly) and not
+  // dark. Its texture is measured over a small patch, so that ink and printed lines on it, and a
+  // shadow across it, hardly count.
+  const tex = new Float32Array(W * H);
+  for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) { const i = y * W + x; tex[i] = Math.abs(gray[i + 1] - gray[i - 1]) + Math.abs(gray[i + W] - gray[i - W]); }
+  const I = new Float64Array((W + 1) * (H + 1));
+  for (let y = 0; y < H; y++) { let row = 0; for (let x = 0; x < W; x++) { row += tex[y * W + x]; I[(y + 1) * (W + 1) + x + 1] = I[y * (W + 1) + x + 1] + row; } }
+  const R = 4, patch = (x, y) => { const a = Math.max(0, x - R), b = Math.max(0, y - R), c2 = Math.min(W, x + R + 1), d = Math.min(H, y + R + 1); return (I[d * (W + 1) + c2] - I[b * (W + 1) + c2] - I[d * (W + 1) + a] + I[b * (W + 1) + a]) / ((c2 - a) * (d - b)); };
+  const tones = Array.from(gray).sort((a, b) => a - b), light = tones[Math.floor(tones.length * 0.9)];
+  // Rough and smooth parts of a photo apart (Otsu's threshold on the patches' texture).
+  const tv = []; for (let y = 0; y < H; y += 3) for (let x = 0; x < W; x += 3) tv.push(Math.min(63, patch(x, y)) | 0);
+  const th = new Array(64).fill(0); for (const v of tv) th[v]++;
+  let ts = 0; for (let t = 0; t < 64; t++) ts += t * th[t];
+  let tsB = 0, twB = 0, tBest = 0, tThr = 8;
+  for (let t = 0; t < 64; t++) { twB += th[t]; if (!twB) continue; const wF = tv.length - twB; if (!wF) break; tsB += t * th[t]; const v = twB * wF * (tsB / twB - (ts - tsB) / wF) ** 2; if (v > tBest) { tBest = v; tThr = t; } }
+  const bright = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const i = y * W + x; bright[i] = patch(x, y) <= tThr && gray[i] > light * 0.6 ? 1 : 0; }
+  // The paper: the columns, then the rows (within those columns), that are mostly bright and smooth.
+  // Thin printed lines, ink and punch holes hardly change that; cloth, wood and shadow do.
+  // (averaged over a few rows or columns: on lined paper, rows of printed line and rows between
+  // them take turns being rough and smooth)
+  const avg = (a, k) => a.map((_, i) => { let s = 0, n = 0; for (let d = -k; d <= k; d++) if (a[i + d] !== undefined) { s += a[i + d]; n++; } return s / n; });
+  const longestRun = (frac, lim) => { let s = -1, bs = 0, be = -1; for (let k = 0; k <= frac.length; k++) { if (k < frac.length && frac[k] >= lim) { if (s < 0) s = k; } else if (s >= 0) { if (k - 1 - s > be - bs) { bs = s; be = k - 1; } s = -1; } } return be >= bs ? [bs, be] : null; };
+  const colF = new Array(W).fill(0);
+  for (let x = 0; x < W; x++) { let n = 0; for (let y = 0; y < H; y++) n += bright[y * W + x]; colF[x] = n / H; }
+  colF.splice(0, W, ...avg(colF, Math.round(W * 0.01)));
+  // (a column or row of table or cloth is smooth in under 15% of it; of paper in over 35%, even where
+  // it is written on, ink and printed lines being texture too. A page filling the picture: all of it)
+  const PAPER = 0.25, cr = longestRun(colF, PAPER);
+  if (!cr) return null;
+  const rowF = new Array(H).fill(0);
+  for (let y = 0; y < H; y++) { let n = 0; for (let x = cr[0]; x <= cr[1]; x++) n += bright[y * W + x]; rowF[y] = n / (cr[1] - cr[0] + 1); }
+  rowF.splice(0, H, ...avg(rowF, Math.round(H * 0.025)));
+  const rr = longestRun(rowF, PAPER);
+  if (!rr) return null;
+  const paper = { x0: cr[0], x1: cr[1], y0: rr[0], y1: rr[1] }, most = (cr[1] - cr[0] + 1) * (rr[1] - rr[0] + 1);
+  if (!paper || most < W * H * 0.15) return null; // no clear page: the whole picture, as before
+  const m = Math.round(Math.min(W, H) * 0.01); // a little in from the paper's edge (its shadow)
+  const px0 = paper.x0 + m, px1 = paper.x1 - m, py0 = paper.y0 + m, py1 = paper.y1 - m;
+  if (px1 - px0 < W * 0.2 || py1 - py0 < H * 0.2) return null;
+  // The writing on the paper: pen ink, clearly darker than the paper.
+  const vals = []; for (let y = py0; y <= py1; y += 2) for (let x = px0; x <= px1; x += 2) vals.push(gray[y * W + x]);
+  vals.sort((a, b) => a - b);
+  const dark = vals[Math.floor(vals.length * 0.005)], paperV = vals[Math.floor(vals.length * 0.5)];
+  const inkThr = dark + (paperV - dark) * 0.5;
+  const ink = new Uint8Array(W * H);
+  for (let y = py0; y <= py1; y++) for (let x = px0; x <= px1; x++) if (gray[y * W + x] < inkThr) ink[y * W + x] = 1;
+  for (let y = py0; y <= py1; y++) for (let x = px0; x <= px1;) { // printed lines: long thin strokes across
+    if (!ink[y * W + x]) { x++; continue; }
+    const s = x; while (x <= px1 && ink[y * W + x]) x++;
+    if (x - s > W * 0.12) for (let k = s; k < x; k++) ink[y * W + k] = 0;
+  }
+  for (let x = px0; x <= px1; x++) for (let y = py0; y <= py1;) { // a margin line: a long thin stroke down
+    if (!ink[y * W + x]) { y++; continue; }
+    const s = y; while (y <= py1 && ink[y * W + x]) y++;
+    if (y - s > H * 0.12) for (let k = s; k < y; k++) ink[k * W + x] = 0;
+  }
+  const rows = new Array(H).fill(0), cols = new Array(W).fill(0); let total = 0;
+  for (let y = py0; y <= py1; y++) for (let x = px0; x <= px1; x++) if (ink[y * W + x]) { rows[y]++; cols[x]++; total++; }
+  if (total < 50) return null;
+  // Where the ink is, without the last specks at its edges (dust, a stray dot).
+  const span = (a, lo, hi) => { let acc = 0, s = lo, e = hi; for (let k = lo; k <= hi; k++) { acc += a[k]; if (acc > total * 0.002) { s = k; break; } } acc = 0; for (let k = hi; k >= lo; k--) { acc += a[k]; if (acc > total * 0.002) { e = k; break; } } return [s, e]; };
+  const [wy0, wy1] = span(rows, py0, py1), [wx0, wx1] = span(cols, px0, px1);
+  const padY = Math.round(H * 0.05), padX = Math.round(W * 0.03); // about a line's room around the writing (the line finder needs some blank paper around it)
+  const x = Math.max(px0, wx0 - padX), y = Math.max(py0, wy0 - padY), x2 = Math.min(px1, wx1 + padX), y2 = Math.min(py1, wy1 + padY);
+  if (x2 - x < W * 0.1 || y2 - y < H * 0.03) return null;
+  // Little to cut away (a scan, a photo taken close): the whole picture, as before (cutting changes
+  // the line finder's measure of the spacing a little, and gains nothing there).
+  if ((x2 - x) * (y2 - y) > W * H * 0.85) return null;
+  return { x: x / scale, y: y / scale, w: (x2 - x) / scale, h: (y2 - y) / scale };
+}
+/** The lines of writing, found only where the writing is (see writingArea), as 0–1000 boxes of the whole picture. */
+function findLinesInWriting(src) {
+  const a = writingArea(src);
+  if (!a) return findLines(src);
+  const c = document.createElement("canvas"); c.width = Math.round(a.w); c.height = Math.round(a.h);
+  c.getContext("2d").drawImage(src, a.x, a.y, a.w, a.h, 0, 0, c.width, c.height);
+  const lines = findLines(c);
+  if (!lines) return null;
+  return lines.map((l) => ({ ...l,
+    top: ((a.y + (l.top / 1000) * a.h) / src.height) * 1000, bottom: ((a.y + (l.bottom / 1000) * a.h) / src.height) * 1000,
+    left: ((a.x + (l.left / 1000) * a.w) / src.width) * 1000, right: ((a.x + (l.right / 1000) * a.w) / src.width) * 1000 }));
+}
+
+/**
  * The lines of writing on a (level) page, top to bottom, as 0–1000 boxes; null
  * when the page doesn't look like lines of writing (then Gemini finds them).
  * Works without blank space between lines: it finds the regular spacing of the
@@ -1598,7 +1697,7 @@ async function readPage(doc, page, onStep) {
   const known = await learnedParts(writer, page.id, readMode() === "careful" ? EXAMPLES : WORD_EXAMPLES);
   onStep(1);
   let boxes = null;
-  try { boxes = findLines(bitmap); } catch (e) { console.warn("Couldn't find the lines here:", e); }
+  try { boxes = findLinesInWriting(bitmap); } catch (e) { console.warn("Couldn't find the lines here:", e); }
   let lines = null;
   if (boxes?.length) {
     onStep(1, boxes.map((b) => ({ ...b, text: "", unclear: [] })));
