@@ -1,4 +1,4 @@
-import { start, makePage, tagCrops, installFake, settled, checker, dbDump } from "./harness.mjs";
+import { start, makePage, tagCrops, installFake, settled, allReady, checker, dbDump } from "./harness.mjs";
 const [S, FILE] = process.argv.slice(2);
 const { browser, page, errors } = await start(FILE);
 const { check, done } = checker();
@@ -22,7 +22,7 @@ const stats = await installFake(page, truth);
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", `${S}/e2e/words.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "T"); await page.click(".dialog button[type=submit]");
-await settled(page);
+await allReady(page, stats); // the background steps are over (the word choices that come with the check redraw the page)
 const ed = page.locator(".row .line-edit").first();
 check("line read", (await ed.innerText()) === TEXT[0], await ed.innerText());
 // click a plain (not highlighted) word: the second "זה" (5th word); click near its middle

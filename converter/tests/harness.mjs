@@ -191,7 +191,8 @@ export const dbDump = (page) => page.evaluate(async () => ({ docs: await getAll(
 
 /** Made-up words in the line reading (the word-by-word check must catch them). */
 export const corruptLines = (text) => {
-  if (text.startsWith("באשתו")) return "כשנאנס וחייב בתשלומי׳ כאילו הגיע זמן דאז של זה";
+  // One word made up from the sentence (the word check catches it: it changes a line only where it keeps most of it).
+  if (text.startsWith("באשתו")) return text.replace("באשתו", "כשנאנס");
   if (text.startsWith("שלום")) return text.replace("לכולם,", "לכולם");
   return text;
 };

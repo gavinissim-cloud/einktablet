@@ -1735,8 +1735,7 @@ async function checkWordsOnce(docId, pageId, readId) {
     for (const w of words) if (w.includes("□")) flagged.add(w);
     return { text: words.join(" "), flagged, alts };
   };
-  // The check changes a line only when it keeps most of it (CHECK_KEEP of its words), or when the line
-  // was clearly cut right (see cutRight). Where it would
+  // The check changes a line only when it keeps most of it (CHECK_KEEP of its words). Where it would
   // change more, the line was almost always cut into the wrong pieces, and on real handwriting its
   // changes there broke more correct words than they fixed (on the ivrit.ai benchmark: 162 broken,
   // 92 fixed; where it kept 80% or more: 18 broken, 90 fixed). There the line stays as read, and
@@ -1744,15 +1743,15 @@ async function checkWordsOnce(docId, pageId, readId) {
   const onlySuggest = (line, e, merged) => {
     const rd = line.ai.split(/\s+/).filter(Boolean), out = merged.text.split(/\s+/).filter(Boolean);
     if (!rd.length) return merged;
-    const kept = alignWords(out, rd).filter((x) => x.same).reduce((n, x) => n + x.b.length, 0);
-    // …or when the line was cut right: about one picture per word of the reading (one more or less:
-    // a word made up or left out), and almost every picture read as a real word (a picture of half a
-    // word, or of two, seldom is one). Then the check is trusted even where it changes much (a
-    // sentence made up from the meaning).
-    const pics = (e.pics || e.segs?.map((x) => x.text) || []).filter((t) => t != null);
-    const realPics = pics.filter((t) => t.split(/\s+/).filter(Boolean).every((w) => real(w))).length;
-    const cutRight = pics.length && Math.abs(pics.length - rd.length) <= 1 && realPics >= pics.length * 0.8;
-    if (kept >= rd.length * CHECK_KEEP || cutRight) return merged;
+    // Words kept. In a line with English the check also puts words back in the order they stand on the
+    // page and moves marks with them: there only the words themselves count, not their order or marks.
+    const bare = (w) => w.replace(/[^\u05d0-\u05eaA-Za-z0-9□]/g, "");
+    let kept;
+    if (e.pics) { const left = new Map(); for (const w of out.map(bare)) left.set(w, (left.get(w) || 0) + 1); kept = rd.map(bare).filter((w) => left.get(w) > 0 && left.set(w, left.get(w) - 1)).length; }
+    else kept = alignWords(out, rd).filter((x) => x.same).reduce((n, x) => n + x.b.length, 0);
+    // (Trusting it also where the line seemed cut right, about one picture per word and most read as
+    // real words, was tried: on the benchmark those lines got 21 words broken and none fixed.)
+    if (kept >= rd.length * CHECK_KEEP) return merged;
     const flagged = new Set(), alts = [];
     if (e.pics) { // a line with English, its pictures in their order on the page: only highlighted
       const has = new Set(out);

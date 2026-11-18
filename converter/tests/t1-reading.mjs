@@ -17,18 +17,15 @@ const got = await page.locator(".row .line-edit").evaluateAll((e) => e.map((x) =
 const flags = await page.locator(".row").evaluateAll((rows) => rows.map((r) => r.querySelector(".choices")?.textContent || ""));
 check("editable quickly (one round of line requests)", editableAfter < 8 && stats.page === 0, `${editableAfter}s, page requests ${stats.page}`);
 check("lines read in parallel groups", stats.lines >= 2, JSON.stringify(stats));
-check("first the line reading shows (with the made-up words)", first[3].startsWith("כשנאנס"), first[3]);
-// Line 4: a made-up real word (כשנאנס) is replaced by the letter-by-letter reading (באשתו); where the
-// letter-by-letter reading isn't a real word (the writer's own spelling במזנותיה), the line reading stays,
-// highlighted, with the writer's spelling one click away.
-const expected = TRUTH.map((t, i) => (i === 3 ? t.replace("במזנותיה", "בתשלומי׳") : t));
+check("first the line reading shows (with the made-up word)", first[3].startsWith("כשנאנס"), first[3]);
+// Line 4: a made-up real word (כשנאנס) is replaced by the letter-by-letter reading (באשתו); the writer's
+// own spelling (במזנותיה, not a dictionary word) stays as written.
+const expected = TRUTH;
 expected.forEach((t, i) => check(`after the word check, line ${i + 1} as expected`, got[i] === t, `got «${got[i]}»`));
 const m3 = await marksOf(page, 3), m1 = await marksOf(page, 1);
-check("made-up words highlighted in the text", m3.includes("באשתו") && m3.includes("בתשלומי׳"), JSON.stringify(m3));
+check("the replaced made-up word is highlighted", m3.includes("באשתו"), JSON.stringify(m3));
 const c1 = await choicesOf(page, 3, "באשתו");
 check("clicking a word shows its other reading", c1.includes("כשנאנס") && c1.includes("✓") && c1.length <= 6, JSON.stringify(c1));
-const c2 = await choicesOf(page, 3, "בתשלומי׳");
-check("the writer's own spelling is one click away", c2.includes("במזנותיה"), JSON.stringify(c2));
 check("missing comma highlighted", m1.includes("לכולם,"), JSON.stringify(m1));
 const all = [];
 for (const w of m3) all.push(await choicesOf(page, 3, w));

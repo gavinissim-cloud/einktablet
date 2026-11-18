@@ -19,7 +19,7 @@ await page.locator(".popover button", { hasText: "כשנאנס" }).click();
 let t = await texts();
 check("choice replaced only that word", t[3] === line4.replace("באשתו", "כשנאנס"), t[3]);
 // 2. ✓ keeps a word and removes its highlight
-await page.locator(".row").nth(3).locator(".line-edit mark", { hasText: "היגיע" }).click();
+await page.locator(".row").nth(3).locator(".line-edit mark", { hasText: "במזנותיה" }).click();
 await page.locator(".popover button.keep").click();
 check("✓ keeps the word and clears its highlight", !(await marksOf(page, 3)).includes("היגיע") && (await texts())[3].includes("היגיע"));
 check("a real word only the line reading had is kept", (await texts())[4].endsWith("נוסף"), (await texts())[4]);
