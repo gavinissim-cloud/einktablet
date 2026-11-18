@@ -9,7 +9,7 @@ const TEXT = ["שלום לכולם היום נלמד על ההיסטוריה ש�
 const truth = await page.evaluate((lines) => {
   const W = 2000, H = 500, c = document.createElement("canvas"); c.width = W; c.height = H;
   const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, W, H);
-  x.strokeStyle = "#88a"; x.lineWidth = 4; x.beginPath(); x.moveTo(0, 262); x.lineTo(W, 262); x.stroke(); // the paper's printed line
+  x.strokeStyle = "#88a"; x.lineWidth = 4; x.beginPath(); x.moveTo(0, 268); x.lineTo(W, 250); x.stroke(); // the paper's printed line, slanting a little
   x.fillStyle = "#123"; x.font = "64px DejaVu Sans"; x.direction = "rtl"; x.textAlign = "right";
   const out = [];
   lines.forEach((text) => {
@@ -43,7 +43,9 @@ const outlined = async (n) => {
   await page.waitForTimeout(500);
   return page.locator(".word-box").first().evaluate((b) => (b.hidden ? null : { right: parseFloat(b.style.right), width: parseFloat(b.style.width) }));
 };
-const pic = truth[0], W = 2000, h = (pic.bottom - pic.top) / 1000 * 500, x0 = pic.left / 1000 * W - h * 0.05, x1 = pic.right / 1000 * W + h * 0.05;
+// (measured on the line's picture as the converter cut it: its own box of the line)
+const box = await page.evaluate(() => state.doc.pages[0].lines[0]);
+const pic = truth[0], W = 2000, h = (box.bottom - box.top) / 1000 * 500, x0 = box.left / 1000 * W - h * 0.05, x1 = box.right / 1000 * W + h * 0.05;
 for (const n of [1, 4, 6]) {
   const spot = await outlined(n), w = pic.words[n];
   const trueRight = 100 * (1 - (w.right / 1000 * W - x0) / (x1 - x0)), trueWidth = 100 * ((w.right - w.left) / 1000 * W) / (x1 - x0);

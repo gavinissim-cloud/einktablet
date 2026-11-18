@@ -1727,6 +1727,7 @@ async function readPage(doc, page, onStep) {
       if (MIXED) for (const r of read) { r.text = hebMarksIn(noForeign(r.text)); r.unclear = r.unclear.map((w) => hebMarksIn(noForeign(w))); }
       lines = boxes.map((b, i) => ({ ...b, text: read[i].text, unclear: read[i].unclear.flatMap((w) => w.split(/\s+/)), ...(read[i].text ? {} : { empty: true }), ...(read[i].dir ? { dir: read[i].dir } : {}) }));
       for (const l of lines) for (const w of l.text.split(/\s+/)) if (w.includes("□") && !l.unclear.includes(w)) l.unclear.push(w);
+      dropRepeatedLines(bitmap, lines);
     }
     // Otherwise (some lines couldn't be read at all) Gemini reads the whole page instead.
   }
@@ -2686,17 +2687,20 @@ function spotByShare(bitmap, line, words, index) {
   }
   const col = new Array(cw).fill(0);
   for (let x = 0; x < cw; x++) for (let y = 0; y < ch; y++) col[x] += ink[y * cw + x];
+  // A printed line that slants isn't one long stroke in any row, so it is still there: but it is
+  // thin (a few pixels in a column), letters are not. Columns with no more than that are empty.
+  const thin = Math.max(3, Math.round(ch * 0.07));
   let l = 0, r = cw - 1;
-  while (l < cw && col[l] < 2) l++;
-  while (r > l && col[r] < 2) r--;
+  while (l < cw && col[l] <= thin) l++;
+  while (r > l && col[r] <= thin) r--;
   if (r - l < 10) return null;
   const ww = words.map(writtenWidth), tot = ww.reduce((a, b) => a + b, 0);
   // The gaps in the ink (columns with almost none), with their widths: a space between words is
   // usually wider than one between letters.
   const gaps = [];
   for (let x = l; x <= r;) {
-    if (col[x] > 1) { x++; continue; }
-    const s = x; while (x <= r && col[x] <= 1) x++;
+    if (col[x] > thin) { x++; continue; }
+    const s = x; while (x <= r && col[x] <= thin) x++;
     gaps.push({ mid: (s + x - 1) / 2, width: x - s });
   }
   const borders = [r]; let acc = 0; // right to left
@@ -2718,6 +2722,44 @@ function spotByShare(bitmap, line, words, index) {
   const right = borders[index], left = borders[index + 1];
   const toPage = (v) => line.left + (v / scale / W) * 1000;
   return { top: line.top, bottom: line.bottom, left: toPage(left), right: toPage(right) };
+}
+
+/**
+ * How wide the writing on a line is, in page units (0–1000): its columns with clearly dark ink
+ * (thin printed lines not counted). A line of words covers much of the page's width; a drawing, a
+ * punch hole or a stray mark only a little, however dark.
+ */
+function lineInk(bitmap, box) {
+  const W = bitmap.width, H = bitmap.height;
+  const x0 = (box.left / 1000) * W, x1 = (box.right / 1000) * W, y0 = (box.top / 1000) * H, y1 = (box.bottom / 1000) * H;
+  if (y1 - y0 < 4 || x1 - x0 < 4) return 0;
+  const ch = 40, cw = Math.max(1, Math.min(4000, Math.round(((x1 - x0) * ch) / (y1 - y0))));
+  const c = document.createElement("canvas"); c.width = cw; c.height = ch;
+  const g = c.getContext("2d", { willReadFrequently: true }); g.drawImage(bitmap, x0, y0, x1 - x0, y1 - y0, 0, 0, cw, ch);
+  const px = g.getImageData(0, 0, cw, ch).data, gray = new Float32Array(cw * ch);
+  for (let i = 0; i < cw * ch; i++) gray[i] = px[i * 4] * 0.299 + px[i * 4 + 1] * 0.587 + px[i * 4 + 2] * 0.114;
+  const sorted = Array.from(gray).sort((a, b) => a - b), paper = sorted[Math.floor(sorted.length * 0.5)];
+  let n = 0;
+  for (let x = 0; x < cw; x++) { let k = 0; for (let y = 0; y < ch; y++) if (gray[y * cw + x] < paper * 0.7) k++; if (k > 3) n++; }
+  return (n / cw) * (box.right - box.left);
+}
+/**
+ * Two lines next to each other read as the same words: Gemini gave one line's reading for the picture
+ * of another (it happens when a "line" holds no writing, such as a drawing at the top of a page).
+ * Handwritten lines are hardly ever the same twice in a row, so the reading stays on the line whose
+ * picture has the writing (much more ink), and the other is left empty (shown with Remove line).
+ */
+function dropRepeatedLines(bitmap, lines) {
+  const key = (t) => t.replace(/[^\u05d0-\u05eaA-Za-z0-9]/g, "");
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const a = lines[i], b = lines[i + 1];
+    if (!a.text || !b.text || key(a.text).length < 8 || key(a.text) !== key(b.text)) continue;
+    let ia = 0, ib = 0; try { ia = lineInk(bitmap, a); ib = lineInk(bitmap, b); } catch { continue; }
+    const empty = ia < ib * 0.5 ? a : ib < ia * 0.5 ? b : null;
+    if (!empty) continue; // both have writing: perhaps really written twice
+    console.warn("The same reading for two lines; kept on the one with the writing:", empty.text);
+    empty.text = ""; empty.unclear = []; empty.empty = true;
+  }
 }
 
 /** How wide a written word is, roughly, in letters (marks and narrow letters count less). */
