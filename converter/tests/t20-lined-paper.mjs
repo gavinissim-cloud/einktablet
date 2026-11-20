@@ -55,6 +55,15 @@ for (const n of [1, 4, 6]) {
 }
 // (the word check puts «נלמד» back, highlighted; its choices must be readings of its picture alone,
 // not of a piece of the line holding two words, such as «היום נלמד»)
+// After editing (the first two words deleted), a word is still outlined where it is in the handwriting.
+await ed.evaluate((el) => { el.focus(); el.textContent = el.textContent.replace(/^\S+\s+\S+\s+/, ""); el.dispatchEvent(new Event("input", { bubbles: true })); });
+await page.waitForTimeout(300);
+{
+  const spot = await outlined(2), w = pic.words[4]; // «על»: now the 3rd word of the text, the 5th of the handwriting
+  const trueRight = 100 * (1 - (w.right / 1000 * W - x0) / (x1 - x0));
+  check("after two words are deleted, «על» is still outlined where it is written", spot && Math.abs(spot.right - trueRight) < 4, JSON.stringify({ spot, trueRight: +trueRight.toFixed(1) }));
+}
+await page.locator("#docTitle").click(); await page.waitForTimeout(800);
 const c = await choicesOf(page, 0, "נלמד");
 check("a highlighted word's choices are read from the picture of that word", (c.includes("נלמדה") || c.includes("ונלמד")) && !c.some((x) => x.includes(" ")), JSON.stringify(c));
 check("no page errors", errors.length === 0, errors.join("\n"));

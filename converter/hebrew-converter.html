@@ -2646,6 +2646,21 @@ async function wordSpot(page, line, index, count, text) {
   const span = x1 - x0;
   return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span, box };
 }
+/** Word number `index` of `text`, as the matching word of `reading` (the line as read): {text, index}. */
+function inReading(text, reading, index) {
+  const cur = text.split(/\s+/).filter(Boolean), orig = (reading || "").split(/\s+/).filter(Boolean);
+  if (!orig.length || cur.join(" ") === orig.join(" ")) return { text, index };
+  let i = 0, j = 0;
+  for (const part of alignWords(cur, orig)) {
+    if (index < i + part.a.length) {
+      if (!part.b.length) return { text: orig.join(" "), index: Math.min(j, orig.length - 1) }; // added: where it was put in
+      const k = Math.min(part.b.length - 1, Math.floor(((index - i) * part.b.length) / part.a.length));
+      return { text: orig.join(" "), index: j + k };
+    }
+    i += part.a.length; j += part.b.length;
+  }
+  return { text, index };
+}
 /**
  * Where word number `index` of `text` (a line's words, as typed) is in the page, as a 0–1000 box:
  * the outline shown while it is edited, and the picture its choices are read from (the same place).
@@ -2654,6 +2669,11 @@ function wordBox(bitmap, pageLines, line, text, index) {
   let boxes = null;
   try { boxes = segmentWords(bitmap, line); } catch {}
   if (!boxes?.length) return null;
+  // The place of a word is found in the line as it was read from the handwriting: after the person
+  // deletes, adds or changes words, word number `index` of the text is no longer the same word of the
+  // handwriting. Each word of the text is matched to the reading's words; a changed word takes the
+  // place of the word it replaced, an added one the place where it was put in.
+  ({ text, index } = inReading(text, line.ai, index));
   let words = text.split(/\s+/).filter(Boolean), at = index;
   if (MIXED) {
     // The word pictures stand right to left on the page; English words in reading order don't.
@@ -3022,8 +3042,13 @@ function preferredWords(except) {
   const out = new Set(preferCache.set); out.delete(except);
   return out;
 }
-/** Up to 5 other readings for one word: the check's reading, abbreviations, Gemini's options, real words one letter away. */
-function optionsFor(line, word) {
+/**
+ * Up to 5 other readings for one word: how the person corrected it before, the check's reading,
+ * abbreviations, Gemini's readings of the word's own picture. Real words spelled like the word on
+ * screen (look-alike letters) only when Gemini has no reading of the picture and isn't reading it
+ * (`waiting`): they are variations of what is typed, not readings of what is written.
+ */
+function optionsFor(line, word, { waiting = false } = {}) {
   const out = [];
   const mem = writerMemory(state.writer), wp = wordParts(word) || (MIXED ? englishParts(word) : null);
   const remembered = fixOf(mem, word) || (wp && fixOf(mem, wp.core) ? { to: wp.pre + fixOf(mem, wp.core).to + wp.post } : null);
@@ -3047,7 +3072,7 @@ function optionsFor(line, word) {
   // word's own picture (it is a reading of a piece of the line, often not this word).
   for (const a of line.alts || []) if (a.word === word && a.loose) add(a.alt, "the word-by-word reading");
   // The writer's own words and the words of this document are preferred.
-  for (const w of suggestVisual(word, 5, preferredWords(word))) add(w, "a real word with look-alike letters");
+  if (!gem.length && !waiting) for (const w of suggestVisual(word, 5, preferredWords(word))) add(w, "a real word with look-alike letters");
   return out;
 }
 
@@ -3115,7 +3140,7 @@ async function openWordMenu(page, line, row, img, at, { review = false } = {}) {
   // The choices (and ✓), drawn again when Gemini's readings of the word arrive.
   const choices = document.createElement("span"); choices.className = "choices-box";
   const fill = (waiting) => {
-    const opts = optionsFor(line, word);
+    const opts = optionsFor(line, word, { waiting });
     choices.replaceChildren();
     for (const o of opts) {
       const b = document.createElement("button");
@@ -3131,7 +3156,7 @@ async function openWordMenu(page, line, row, img, at, { review = false } = {}) {
       keep.onclick = (e) => { e.stopPropagation(); settle(null); };
       choices.append(keep);
     }
-    if (waiting) { const w = document.createElement("span"); w.className = "waiting"; w.textContent = "…"; w.title = "Gemini is reading this word's picture"; choices.append(w); }
+    if (waiting) { const w = document.createElement("span"); w.className = "waiting"; w.textContent = "reading the handwriting…"; w.title = "Gemini is reading this word's picture"; choices.append(w); }
   };
   // No readings from Gemini for this word yet: asked now (one small request), shown when they come.
   const ask = !line.options?.[word] && !!getKey();
