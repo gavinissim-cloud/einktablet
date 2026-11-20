@@ -171,13 +171,18 @@ export const corrupt = (fake, truth) => {
   return fake;
 };
 
-export async function start(FILE, { writer = "Tester" } = {}) {
+export async function start(FILE, { writer = "Tester", wordCheck = true } = {}) {
   const { browser, ctx } = await launch();
   const page = await ctx.newPage();
+  // Most tests are about the word check: on every page (the converter's default is off, with a
+  // "Check every word" button per page; tests/t22-check-button.mjs).
+
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.stack));
   page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
   await page.goto("file://" + FILE);
+  // (set once the page is open: the converter reads it only when a page is read)
+  if (wordCheck) await page.evaluate(() => { const k = (/english/.test(location.pathname) ? "he-en:" : "") + "word_check"; if (!localStorage.getItem(k)) localStorage.setItem(k, "on"); });
   return { browser, ctx, page, errors };
 }
 

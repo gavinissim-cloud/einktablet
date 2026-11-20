@@ -28,6 +28,7 @@ await page.waitForFunction(() => document.querySelector("#modelPick")?.options.l
 await page.selectOption("#modelPick", "gemini-flash-latest");
 await page.click(".dialog button[type=submit]");
 await page.click(".dialog button[type=submit]");
+await page.waitForTimeout(500); // (the test browser can lose settings saved just before a reload of a file:// page)
 await page.reload();
 await tagCrops(page);
 // paste an image

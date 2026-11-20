@@ -205,6 +205,10 @@ function readMode() { try { return LS.getItem("read_mode") === "careful" ? "care
 function setReadMode(m) { try { LS.setItem("read_mode", m); } catch {} }
 // Gemini's 5 readings of every word, prepared in the background after a page is read.
 function autoWordOptions() { try { return LS.getItem("auto_options") !== "off"; } catch { return true; } }
+// The word check (every word read again on its own) is most of a page's price: about 28¢ of 40¢ on a
+// dense page. It runs when the person asks for it on a page ("Check every word"), or on every page
+// when they choose so in Settings.
+function autoWordCheck() { try { return LS.getItem("word_check") === "on"; } catch { return false; } }
 try {
   if (LS.getItem("settings_version") !== "2") {
     LS.removeItem("gemini_model"); // earlier versions chose the slow model by default
@@ -2048,19 +2052,27 @@ async function runJob({ docId, pageId }) {
   try {
     const readId = uid(), started = Date.now();
     pageCost.delete(pageId); // a new reading: counted from zero
-    await updatePage(docId, pageId, { status: "working", step: 0, draft: null, words: null, checking: null, error: null, readId, readSeconds: null });
+    await updatePage(docId, pageId, { status: "working", step: 0, draft: null, words: null, checking: null, error: null, readId, readSeconds: null, wordChecked: false });
     const lines = await readPage(doc, page, (step, draft) => updatePage(docId, pageId, { step, ...(draft ? { draft } : {}) }));
-    await updatePage(docId, pageId, { status: "done", lines, draft: null, step: 0, checking: { done: 0, total: 0 }, readSeconds: Math.round((Date.now() - started) / 1000) });
-    // The page is ready to edit; the word check adds its highlights in the background.
-    checkWords(docId, pageId, readId)
-      .catch((e) => { console.warn("Word check failed:", e); return true; })
-      .then((current) => current !== false && autoWordOptions() && fetchWordOptions(docId, pageId, { onlyFlagged: true }))
-      .finally(() => { window.__autoOptionsDone = (window.__autoOptionsDone || 0) + 1; }) // (for the tests: the background steps of a reading are over)
-      .catch((e) => console.warn("Word options failed:", e));
+    const auto = autoWordCheck();
+    await updatePage(docId, pageId, { status: "done", lines, draft: null, step: 0, checking: auto ? { done: 0, total: 0 } : null, wordChecked: auto, readSeconds: Math.round((Date.now() - started) / 1000) });
+    // The page is ready to edit. The word check, if it runs on every page, adds its highlights in the
+    // background; otherwise a word's choices are read when it is clicked.
+    if (auto) runWordCheck(docId, pageId, readId);
+    else window.__autoOptionsDone = (window.__autoOptionsDone || 0) + 1; // (for the tests: nothing more runs after the reading)
   } catch (e) {
     console.error(e);
     await updatePage(docId, pageId, { status: "error", draft: null, checking: null, error: e.message || String(e) });
   }
+}
+
+/** The word check of a page, then the choices of the words it highlighted (in the background). */
+function runWordCheck(docId, pageId, readId) {
+  return checkWords(docId, pageId, readId)
+    .catch((e) => { console.warn("Word check failed:", e); return true; })
+    .then((current) => current !== false && autoWordOptions() && fetchWordOptions(docId, pageId, { onlyFlagged: true }))
+    .finally(() => { window.__autoOptionsDone = (window.__autoOptionsDone || 0) + 1; }) // (for the tests: the background steps of a reading are over)
+    .catch((e) => console.warn("Word options failed:", e));
 }
 
 // ---------- Learning from corrections ----------
@@ -2377,6 +2389,18 @@ async function renderPage(page) {
     go.title = "Go through the highlighted words one by one: Enter if the word is right (or type the right word, then Enter), Tab to skip, Esc to stop";
     go.onclick = () => { const first = document.getElementById("page-" + page.id)?.querySelector(".row:not(.draft-row)"); if (first) reviewFrom(first, 0); };
     head.append(go);
+  }
+  if (page.status === "done" && !page.optionsProgress && !page.checking && !page.wordChecked && page.lines.length) {
+    // The word check on this page only, when the person wants it (it is most of a page's price).
+    const check = document.createElement("button"); check.className = "secondary check-every"; check.textContent = "Check every word";
+    check.title = "Gemini reads every word of this page again on its own, so a word made up from the sentence shows up (about three times the price of reading the page)";
+    check.onclick = async () => {
+      check.disabled = true;
+      await flushSave();
+      await updatePage(state.doc.id, page.id, { checking: { done: 0, total: 0 }, wordChecked: true });
+      runWordCheck(state.doc.id, page.id, page.readId);
+    };
+    head.append(check);
   }
   if (page.status === "done" && !page.optionsProgress && !page.checking) {
     const more = document.createElement("button"); more.className = "secondary"; more.textContent = "More word options";
@@ -3463,6 +3487,7 @@ $("#settingsBtn").onclick = async () => {
     <p><b>Reading</b></p>
     <p><label><input type="radio" name="readMode" value="fast"> <b>Fast</b> (recommended): every line read at once with Gemini Flash; a page takes seconds.</label></p>
     <p><label><input type="radio" name="readMode" value="careful"> <b>Most careful</b>: the strongest Pro model, thinking deeply; slower and costs more, for very hard pages.</label></p>
+    <p><label><input type="checkbox" id="wordCheck"> Check every word of every page automatically: Gemini reads each word again on its own, so a word made up from the sentence shows up. About three times the price of reading a page (a dense page: about 40¢ instead of 5¢); without it, use "Check every word" on the pages that need it.</label></p>
     <p><label><input type="checkbox" id="autoOptions"> Prepare word choices ahead for the highlighted words: after a page is read, Gemini gives its 5 best readings of each highlighted word in the background (any other word gets them when you click it; "More word options" prepares them for every word)</label></p>
     <details><summary class="muted">Choose a specific model (advanced)</summary>
     <p><select id="modelPick" style="width:100%"><option>Loading the models your key can use…</option></select></p></details>
@@ -3474,6 +3499,7 @@ $("#settingsBtn").onclick = async () => {
   const current = chosenModel();
   wrap.querySelector(`input[name=readMode][value=${readMode()}]`).checked = true;
   wrap.querySelector("#autoOptions").checked = autoWordOptions();
+  wrap.querySelector("#wordCheck").checked = autoWordCheck();
   listModels().then((models) => {
     pick.innerHTML = "";
     pick.add(new Option("Automatic, by the choice above (recommended)", AUTO, false, current === AUTO));
@@ -3494,6 +3520,7 @@ $("#settingsBtn").onclick = async () => {
     if (k) setKey(k);
     setReadMode(wrap.querySelector("input[name=readMode]:checked")?.value || "fast");
     try { LS.setItem("auto_options", wrap.querySelector("#autoOptions").checked ? "on" : "off"); } catch {}
+    try { LS.setItem("word_check", wrap.querySelector("#wordCheck").checked ? "on" : "off"); } catch {}
     if (pick.value && !pick.value.startsWith("Loading")) { setModel(pick.value); autoModel = null; }
     wrap.remove();
     pickBestModel().then(() => notify(`Saved. Pages will be read ${readMode() === "careful" ? "carefully" : "fast"}, with ${getModel()}.`));
