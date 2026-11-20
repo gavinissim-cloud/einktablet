@@ -21,6 +21,9 @@ const marks = await marksOf(page, 2);
 check("the words the check reads differently are highlighted", ["נוסדה", "לפני", "יותר"].every((w) => marks.includes(w)), JSON.stringify(marks));
 const c = await choicesOf(page, 2, "נוסדה");
 check("…with the check's reading among the choices", c.includes("נוסע"), JSON.stringify(c));
+// Gemini's readings of the word's own picture (here «ונוסדה», «נוסדהה») come first: the check's reading
+// on a line it cut wrongly is of a piece of the line, often not this word.
+check("…after Gemini's readings of the word's own picture", c.indexOf("ונוסדה") >= 0 && c.indexOf("ונוסדה") < c.indexOf("נוסע"), JSON.stringify(c));
 check("no page errors", errors.length === 0, errors.join("\n"));
 await browser.close();
 process.exit(done() ? 0 : 1);

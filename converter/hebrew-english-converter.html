@@ -1863,8 +1863,9 @@ async function checkWordsOnce(docId, pageId, readId) {
       if (part.same || !part.b.length) continue;
       part.b.forEach((w) => flagged.add(w));
       const litPhrase = part.a.join(" ");
-      if (part.a.length === part.b.length) part.b.forEach((w, k) => { if (part.a[k] !== w) alts.push({ word: w, alt: part.a[k], check: true }); });
-      else if (part.b.length <= 2 && part.a.length && part.a.length <= 2) alts.push({ word: part.b.join(" "), alt: litPhrase, check: true });
+      // (loose: read from a line cut into the wrong pieces, so offered after Gemini's readings of the word itself)
+      if (part.a.length === part.b.length) part.b.forEach((w, k) => { if (part.a[k] !== w) alts.push({ word: w, alt: part.a[k], check: true, loose: true }); });
+      else if (part.b.length <= 2 && part.a.length && part.a.length <= 2) alts.push({ word: part.b.join(" "), alt: litPhrase, check: true, loose: true });
     }
     for (const w of rd) if (w.includes("□")) flagged.add(w);
     return { text: line.ai, flagged, alts };
@@ -2637,25 +2638,32 @@ function pageBitmap(page) {
 async function wordSpot(page, line, index, count, text) {
   if (line.top == null) return null;
   const bitmap = await pageBitmap(page);
-  let boxes = null;
-  try { boxes = segmentWords(bitmap, line); } catch {}
-  if (!boxes?.length) return null;
+  const box = wordBox(bitmap, page.lines, line, text, index);
+  if (!box) return null;
   // The picture shown is cropLine(bitmap, line): the same margins as there.
   const W = bitmap.width, H = bitmap.height, h = ((line.bottom - line.top) / 1000) * H;
   const x0 = Math.max(0, (line.left / 1000) * W - h * 0.05), x1 = Math.min(W, (line.right / 1000) * W + h * 0.05);
   const span = x1 - x0;
+  return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span, box };
+}
+/**
+ * Where word number `index` of `text` (a line's words, as typed) is in the page, as a 0–1000 box:
+ * the outline shown while it is edited, and the picture its choices are read from (the same place).
+ */
+function wordBox(bitmap, pageLines, line, text, index) {
+  let boxes = null;
+  try { boxes = segmentWords(bitmap, line); } catch {}
+  if (!boxes?.length) return null;
   let words = text.split(/\s+/).filter(Boolean), at = index;
   if (MIXED) {
     // The word pictures stand right to left on the page; English words in reading order don't.
-    const order = placeOrder(words, lineDirOn(page.lines, { ...line, text }));
+    const order = placeOrder(words, lineDirOn(pageLines, { ...line, text }));
     words = order.map((i) => words[i]); at = order.indexOf(index);
   }
   // Groups of ink one for one with the words: the word's own group. Otherwise (groups joined by the
   // paper's printed lines, words written close together, letters far apart) the word's place is
   // estimated by how wide each word is written and each border moved to the nearest gap in the ink.
-  const box = boxes.length === words.length ? boxes[at] : spotByShare(bitmap, line, words, at) || matchWordToBoxes(boxes, words, at);
-  if (!box) return null;
-  return { left: ((box.left / 1000) * W - x0) / span, right: ((box.right / 1000) * W - x0) / span, box };
+  return boxes.length === words.length ? boxes[at] : spotByShare(bitmap, line, words, at) || matchWordToBoxes(boxes, words, at);
 }
 
 /**
@@ -2933,31 +2941,35 @@ async function fetchWordOptionsOnce(docId, pageId, { onlyFlagged = false } = {})
   const known = await learnedParts(writer, page.id, WORD_EXAMPLES);
   const keyOf = (l) => `${l.top},${l.bottom},${l.left},${l.right}|${l.text}`;
   const fromCheck = checkOptions.get(pageId), pre = fromCheck?.readId === page.readId ? fromCheck.byLine : null;
-  let givenAny = false;
-  const items = [], perLine = page.lines.map((l, i) => {
-    if (l.top == null) return null;
-    // The word check's own pictures of this line, with the choices that came with them: used as they
-    // are, so the same pictures aren't cut again and sent a second time; only pictures without
-    // choices are asked for. (Lines the check didn't cut are cut here, as before.)
+  // Each word's choices are read from the picture of that word: where it stands in the line, found
+  // the same way as its outline while it is edited (so the choices are always of the word outlined).
+  // The choices that came with the word check are used only where it cut the line into one picture
+  // per word (then its pictures are the words); elsewhere its pictures may hold half a word, or two,
+  // and their readings have nothing to do with the word.
+  const items = [], optionsByLine = new Map();
+  page.lines.forEach((l) => {
+    if (l.top == null || !l.text) return;
+    const tokens = l.text.split(/\s+/).filter(Boolean);
+    const flagged = new Set((l.unclear || []).filter((u) => tokens.includes(u)));
     const given = pre?.get(lineBoxKey(l));
-    let words = given?.boxes || null;
-    if (!words) try { words = segmentWords(bitmap, l); } catch {}
-    if (!words) return null;
-    let send = words.map(() => true);
-    const have = given ? given.options : null;
-    if (have) givenAny = true;
-    if (onlyFlagged) {
-      // Prepared ahead only for the highlighted words (the ones to check); any other word gets its
-      // choices when it is clicked. Where pictures and words don't match one for one, the whole line.
-      const flagged = new Set((l.unclear || []).filter((u) => l.text.split(/\s+/).includes(u)));
-      if (!flagged.size) return words.map((_, pos) => have?.[pos] || null);
-      let tokens = l.text.split(/\s+/).filter(Boolean);
-      if (MIXED) tokens = placeOrder(tokens, lineDirOn(page.lines, l)).map((k) => tokens[k]);
-      if (tokens.length === words.length) send = tokens.map((t) => flagged.has(t));
+    let givenFor = null;
+    if (given?.options && given.boxes?.length === tokens.length) {
+      const order = MIXED ? placeOrder(tokens, lineDirOn(page.lines, l)) : tokens.map((_, k) => k); // picture k shows word order[k]
+      givenFor = new Array(tokens.length); order.forEach((ti, k) => { givenFor[ti] = given.options[k]; });
     }
-    words.forEach((box, pos) => { if (send[pos] && !have?.[pos]?.length) items.push({ line: i, pos, box }); });
-    return words.map((_, pos) => have?.[pos] || null);
+    const map = {};
+    tokens.forEach((t, k) => {
+      if (map[t]) return; // the same word earlier in the line
+      if (givenFor?.[k]?.length) { map[t] = givenFor[k]; return; }
+      // Prepared ahead only for the highlighted words (the ones to check); any other word gets its
+      // choices when it is clicked ("More word options": every word).
+      if (onlyFlagged && !flagged.has(t)) return;
+      let box = null; try { box = wordBox(bitmap, page.lines, l, l.text, k); } catch {}
+      if (box) items.push({ map, word: t, box });
+    });
+    optionsByLine.set(keyOf(l), map);
   });
+  const givenAny = [...optionsByLine.values()].some((m) => Object.keys(m).length);
   if (onlyFlagged && !items.length && !givenAny) return true; // nothing highlighted: nothing to prepare (and nothing was shown)
   const total = items.length;
   let done = 0, finished = false, writes = Promise.resolve();
@@ -2975,30 +2987,12 @@ async function fetchWordOptionsOnce(docId, pageId, { onlyFlagged = false } = {})
       const res = await askJson(parts, OPTIONS_SCHEMA, WORD_THINKING, true, pageId);
       for (const r of res.words || []) {
         const it = batch[Number(r.image) - 1];
-        if (it && Array.isArray(r.options)) perLine[it.line][it.pos] = r.options.filter((o) => typeof o === "string" && o.trim() && !(MIXED && hasForeign(o))).map(hebMarksIn).map((o) => o.trim().replace(/\s+/g, " ")).slice(0, 5);
+        const opts = cleanOptions(r.options);
+        if (it && opts.length) it.map[it.word] = opts;
       }
     } catch (e) { console.warn("Word options failed for some words:", e); }
     done += batch.length; progress();
   }));
-  // Match the pictures' options to the words of the text (they line up word for word where both agree).
-  const optionsByLine = new Map();
-  page.lines.forEach((l, i) => {
-    const segs = perLine[i];
-    if (!segs) return;
-    let tokens = l.text.split(/\s+/).filter(Boolean);
-    if (MIXED) tokens = placeOrder(tokens, lineDirOn(page.lines, l)).map((i) => tokens[i]); // in the pictures' order (right to left on the page)
-    const map = {};
-    const first = segs.map((o) => o?.[0] || "");
-    if (segs.length === tokens.length) tokens.forEach((t, k) => { if (segs[k]?.length) map[t] = segs[k]; });
-    else {
-      let ai = 0;
-      for (const part of alignWords(first, tokens)) {
-        if (part.a.length === part.b.length) part.b.forEach((t, k) => { const o = segs[ai + k]; if (o?.length) map[t] = o; });
-        ai += part.a.length;
-      }
-    }
-    optionsByLine.set(keyOf(l), map);
-  });
   const apply = (l) => { const m = optionsByLine.get(keyOf(l)); if (m) l.options = { ...(l.options || {}), ...m }; };
   finished = true;
   await writes;
@@ -3036,16 +3030,22 @@ function optionsFor(line, word) {
   const add = (w, why) => { if (w !== undefined && w !== word && !out.some((o) => o.text === w) && out.length < 5) out.push({ text: w, why }); };
   if (remembered) add(remembered.to, "how you corrected this before");
   const rank = (a) => (a.memory ? -1 : a.check ? 0 : a.abbrev ? 1 : a.picked ? 2 : 3);
-  for (const a of [...(line.alts || [])].sort((x, y) => rank(x) - rank(y))) if (a.word === word && (a.check || a.abbrev || a.memory)) add(a.alt, a.memory ? "how you corrected this before" : a.check ? "the word-by-word reading" : "abbreviation");
+  for (const a of [...(line.alts || [])].sort((x, y) => rank(x) - rank(y))) if (a.word === word && !a.loose && (a.check || a.abbrev || a.memory)) add(a.alt, a.memory ? "how you corrected this before" : a.check ? "the word-by-word reading" : "abbreviation");
   // Gemini's readings of the word's picture first (real words before the rest), then the
   // check's reading and abbreviations, then real words with look-alike letters.
   const gem = line.options?.[word] || [];
   const real = (w) => !lexicon?.size || isKnownWord(w);
+  // one place kept for the check's reading of a wrongly cut line, after them
+  const loose = (line.alts || []).filter((a) => a.word === word && a.loose && a.alt && a.alt !== word && !out.some((o) => o.text === a.alt));
+  const addGem = (w, why) => { if (out.length < 5 - (loose.length && !gem.includes(loose[0].alt) ? 1 : 0)) add(w, why); };
   if (MIXED) {
     // Only real words (or Gemini's own first reading), never a word mixing the two alphabets.
     const mine = gem.filter((w) => !(hasHebrew(w) && hasLatin(w)));
-    for (const w of [...mine.filter(real), ...mine.slice(0, 1).filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
-  } else for (const w of [...gem.filter(real), ...gem.filter((w) => !real(w))]) add(w, "how Gemini reads this word's handwriting");
+    for (const w of [...mine.filter(real), ...mine.slice(0, 1).filter((w) => !real(w))]) addGem(w, "how Gemini reads this word's handwriting");
+  } else for (const w of [...gem.filter(real), ...gem.filter((w) => !real(w))]) addGem(w, "how Gemini reads this word's handwriting");
+  // The check's reading where it cut the line into the wrong pieces: after Gemini's readings of the
+  // word's own picture (it is a reading of a piece of the line, often not this word).
+  for (const a of line.alts || []) if (a.word === word && a.loose) add(a.alt, "the word-by-word reading");
   // The writer's own words and the words of this document are preferred.
   for (const w of suggestVisual(word, 5, preferredWords(word))) add(w, "a real word with look-alike letters");
   return out;

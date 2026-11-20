@@ -1,6 +1,6 @@
 // On lined paper (the printed line runs through every word, so the line seems one piece of ink),
 // a clicked word is still outlined where it is in the handwriting, not the whole line.
-import { start, tagCrops, installFake, allReady, checker } from "./harness.mjs";
+import { start, tagCrops, installFake, allReady, checker, choicesOf } from "./harness.mjs";
 import fs from "node:fs";
 const [S, FILE] = process.argv.slice(2);
 const { browser, page, errors } = await start(FILE);
@@ -22,7 +22,9 @@ const truth = await page.evaluate((lines) => {
 }, TEXT);
 fs.writeFileSync(`${S}/e2e/lined.png`, Buffer.from((await page.evaluate(() => window.__png)).split(",")[1], "base64"));
 await tagCrops(page);
-const stats = await installFake(page, truth);
+// «נלמד» misread as «נמלד» (not a word: highlighted); the fake reader's choices for a picture are
+// the word in it, «…ה» and «ו…», so the choices show which picture they were read from.
+const stats = await installFake(page, truth, { lineText: (t) => t.replace("נלמד", "נמלד"), wordOptions: true, wordText: (t) => (t === "נלמד" ? "נמלד" : t) });
 await page.fill("#keyInput", "AQ.k"); await page.click("#keySave");
 await page.setInputFiles("#fileInput", `${S}/e2e/lined.png`);
 await page.waitForSelector(".dialog input"); await page.fill(".dialog input", "T"); await page.click(".dialog button[type=submit]");
@@ -51,6 +53,10 @@ for (const n of [1, 4, 6]) {
   const trueRight = 100 * (1 - (w.right / 1000 * W - x0) / (x1 - x0)), trueWidth = 100 * ((w.right - w.left) / 1000 * W) / (x1 - x0);
   check(`word ${n + 1} («${w.text}») is outlined where it is, not the whole line`, spot && Math.abs(spot.right - trueRight) < 4 && Math.abs(spot.width - trueWidth) < 6, JSON.stringify({ spot, trueRight: +trueRight.toFixed(1), trueWidth: +trueWidth.toFixed(1) }));
 }
+// (the word check puts «נלמד» back, highlighted; its choices must be readings of its picture alone,
+// not of a piece of the line holding two words, such as «היום נלמד»)
+const c = await choicesOf(page, 0, "נלמד");
+check("a highlighted word's choices are read from the picture of that word", (c.includes("נלמדה") || c.includes("ונלמד")) && !c.some((x) => x.includes(" ")), JSON.stringify(c));
 check("no page errors", errors.length === 0, errors.join("\n"));
 await browser.close();
 process.exit(done() ? 0 : 1);
